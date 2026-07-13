@@ -1,0 +1,48 @@
+{
+  "entities": {
+    "ClinicalConversation": {
+      "title": "ClinicalConversation",
+      "description": "Represents a transcribed clinical session encounter and its extracted entities.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique session ID" },
+        "title": { "type": "string", "description": "The description or title of the encounter" },
+        "createdAt": { "type": "string", "description": "The timestamp of creation in ISO-8601 format" },
+        "rawTranscript": { "type": "string", "description": "The raw string of conversation transcript" },
+        "hasAudio": { "type": "boolean", "description": "Whether an audio recording is associated" },
+        "status": { "type": "string", "enum": ["draft", "processing", "annotated", "failed"], "description": "Current status of the annotation workflow" },
+        "encounterType": { "type": "string", "enum": ["dialogue", "note"], "description": "Format of the clinical encounter" },
+        "userId": { "type": "string", "description": "The Firebase Auth UID of the owner" },
+        "isShared": { "type": "boolean", "description": "Whether this session is shared for cloning" },
+        "sharedFromId": { "type": "string", "description": "If cloned, the original session ID" }
+      },
+      "required": ["id", "title", "createdAt", "rawTranscript", "hasAudio", "status"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "Represents custom AI settings (Bring Your Own Model) for speech transcription and clinical annotations.",
+      "type": "object",
+      "properties": {
+        "transcription": {
+          "type": "object",
+          "description": "Provider, model, API key, and base URL configuration for audio transcription and diarization"
+        },
+        "annotation": {
+          "type": "object",
+          "description": "Provider, model, API key, and base URL configuration for clinical entity recognition"
+        }
+      },
+      "required": ["transcription", "annotation"]
+    }
+  },
+  "firestore": {
+    "/clinical_conversations/{conversationId}": {
+      "schema": "ClinicalConversation",
+      "description": "The main collection of clinical conversations and structured annotations."
+    },
+    "/user_settings/{userId}": {
+      "schema": "UserSettings",
+      "description": "Custom model and credential configurations mapped per-user."
+    }
+  }
+}

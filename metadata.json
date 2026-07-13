@@ -1,0 +1,6 @@
+{
+  "name": "Clinical Conversation Annotator",
+  "description": "Annotate medical conversations with audio/transcripts, tag speakers, extract clinical entities (symptoms, meds, tasks), and generate an interactive entity-relation knowledge graph.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

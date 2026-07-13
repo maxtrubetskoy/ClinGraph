@@ -1,0 +1,44 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Catch-all default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    match /clinical_conversations/{conversationId} {
+      allow get: if isValidId(conversationId) && (
+        (resource != null && resource.data.isShared == true) ||
+        (resource != null && isOwner(resource.data.userId))
+      );
+
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() && isValidId(conversationId) && 
+                    request.resource.data.userId == request.auth.uid;
+
+      allow update: if isSignedIn() && isValidId(conversationId) && 
+                    isOwner(resource.data.userId) && 
+                    request.resource.data.userId == request.auth.uid;
+
+      allow delete: if isValidId(conversationId) && 
+                    isOwner(resource.data.userId);
+    }
+
+    match /user_settings/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+  }
+}
