@@ -1,27 +1,471 @@
 import React, { useState, useEffect } from 'react';
-import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement } from '../types';
-import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings } from 'lucide-react';
+import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention } from '../types';
+import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers } from 'lucide-react';
 
 interface ClinicalNotesViewProps {
   clinicalNotes?: ClinicalCategory;
   entities: Entity[];
   relations: Relation[];
-  onUpdateNotes: (updatedNotes: ClinicalCategory, updatedEntities: Entity[], updatedRelations?: Relation[]) => void;
+  mentions?: Mention[];
+  onUpdateNotes: (updatedNotes: ClinicalCategory, updatedEntities: Entity[], updatedRelations?: Relation[], updatedMentions?: Mention[]) => void;
   selectedEntityId?: string | null;
   onSelectEntity: (id: string | null) => void;
+  selectedMentionId?: string | null;
+  onSelectMention?: (id: string | null) => void;
   isReadOnly?: boolean;
+  segments?: any[];
 }
 
 export default function ClinicalNotesView({
   clinicalNotes = { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] },
   entities,
   relations = [],
+  mentions = [],
   onUpdateNotes,
   selectedEntityId,
   onSelectEntity,
-  isReadOnly = false
+  selectedMentionId = null,
+  onSelectMention,
+  isReadOnly = false,
+  segments = []
 }: ClinicalNotesViewProps) {
-  const [editingIndex, setEditingIndex] = useState<{ category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements'; index: number } | null>(null);
+  const [editingIndex, setEditingIndex] = useState<{ category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements' | 'support'; index: number } | null>(null);
+  const [correctingSpeakerMentionId, setCorrectingSpeakerMentionId] = useState<string | null>(null);
+
+  // Clear Annotations Confirmation State
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  const renderEntityConflictsAndSummary = (entityId: string) => {
+    const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
+    if (entityMentions.length === 0) return null;
+
+    // 1. Gather all functions
+    const functions = entityMentions.map(m => m.function || 'asserted');
+    const funcCounts: { [key: string]: number } = {};
+    functions.forEach(f => { funcCounts[f] = (funcCounts[f] || 0) + 1; });
+    const funcSummary = Object.entries(funcCounts)
+      .map(([f, count]) => `${count} ${f === 'explanatory' ? 'general/explanatory' : f}`)
+      .join(', ');
+
+    // 2. Gather temporalities
+    const temporalities = entityMentions.map(m => m.temporality || 'current');
+    const tempCounts: { [key: string]: number } = {};
+    temporalities.forEach(t => { tempCounts[t] = (tempCounts[t] || 0) + 1; });
+    const hasTempConflict = Object.keys(tempCounts).length > 1;
+    const tempSummary = Object.entries(tempCounts)
+      .map(([t, count]) => `${count} ${t}`)
+      .join(', ');
+
+    // 3. Gather polarities
+    const polarities = entityMentions.map(m => m.polarity || 'positive');
+    const polCounts: { [key: string]: number } = {};
+    polarities.forEach(p => { polCounts[p] = (polCounts[p] || 0) + 1; });
+    const hasPolConflict = Object.keys(polCounts).length > 1;
+    const polSummary = Object.entries(polCounts)
+      .map(([p, count]) => `${count} ${p}`)
+      .join(', ');
+
+    // 4. Gather certainties
+    const certainties = entityMentions.map(m => m.certainty || 'certain');
+    const certCounts: { [key: string]: number } = {};
+    certainties.forEach(c => { certCounts[c] = (certCounts[c] || 0) + 1; });
+    const hasCertConflict = Object.keys(certCounts).length > 1;
+    const certSummary = Object.entries(certCounts)
+      .map(([c, count]) => `${count} ${c}`)
+      .join(', ');
+
+    const hasAnyConflict = hasTempConflict || hasPolConflict || hasCertConflict;
+
+    return (
+      <div className="mt-2 p-2 bg-slate-50 border border-slate-200 rounded-lg text-[10px] space-y-1">
+        <div className="flex items-center justify-between font-medium text-slate-500">
+          <div className="flex items-center gap-1 flex-wrap">
+            <span className="font-bold text-indigo-600 font-mono">{entityMentions.length} mentions</span>
+            <span>·</span>
+            <span className="text-slate-600">{funcSummary}</span>
+          </div>
+          {hasAnyConflict && (
+            <span className="text-[9px] bg-amber-50 text-amber-700 font-bold px-1.5 py-0.5 rounded flex items-center gap-1 border border-amber-200">
+              <span className="w-1 h-1 rounded-full bg-amber-500 animate-ping"></span>
+              Conflict detected
+            </span>
+          )}
+        </div>
+        
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 text-slate-400 font-mono text-[9px] pt-1 border-t border-slate-100">
+          <div>
+            <span className="text-slate-500 font-semibold">Temporality:</span>{' '}
+            <span className={hasTempConflict ? 'text-amber-600 font-bold' : 'text-slate-600'}>
+              {hasTempConflict ? tempSummary : (temporalities[0] || 'current')}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-semibold">Polarity:</span>{' '}
+            <span className={hasPolConflict ? 'text-rose-600 font-bold' : 'text-slate-600'}>
+              {hasPolConflict ? polSummary : (polarities[0] || 'positive')}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-500 font-semibold">Certainty:</span>{' '}
+            <span className={hasCertConflict ? 'text-purple-600 font-bold' : 'text-slate-600'}>
+              {hasCertConflict ? certSummary : (certainties[0] || 'certain')}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderMentionsSubWindow = (entityId: string) => {
+    const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
+    
+    if (entityMentions.length === 0) {
+      return (
+        <div className="mt-3 pt-3 border-t border-slate-100 text-[11px] text-slate-400 italic">
+          No explicit dialogue or document mentions mapped.
+        </div>
+      );
+    }
+
+    return (
+      <div className="mt-3 pt-3 border-t border-slate-100 space-y-3 animate-fadeIn">
+        <div className="text-[10px] font-bold text-slate-400 uppercase font-mono tracking-wider flex items-center justify-between">
+          <span>Mentions ({entityMentions.length})</span>
+          <span className="text-[9px] text-indigo-500 font-medium">Click a mention card to trace in transcript</span>
+        </div>
+        
+        <div className="space-y-2.5">
+          {entityMentions.map((mention, mIdx) => {
+            const isMentionSelected = selectedMentionId === mention.id;
+            const segment = segments?.find((s, idx) => idx === mention.textSpan.lineIndex);
+            const derivedSpeaker = segment ? segment.speaker.toLowerCase() : 'patient';
+            const speakerDisplay = mention.speaker || derivedSpeaker;
+            const isSpeakerCorrected = mention.speaker && mention.speaker !== derivedSpeaker;
+            const isCorrectingSpeaker = correctingSpeakerMentionId === mention.id;
+            const functionDisplay = mention.function || 'asserted';
+
+            const isExceptionPolarity = mention.polarity && mention.polarity !== 'positive';
+            const isExceptionCertainty = mention.certainty && mention.certainty !== 'certain';
+            const isExceptionTemporality = mention.temporality && mention.temporality !== 'current';
+            const isExceptionExperiencer = mention.experiencer && mention.experiencer !== 'patient';
+
+            const handleAttributeChange = (field: 'speaker' | 'polarity' | 'certainty' | 'temporality' | 'experiencer' | 'function', value: string) => {
+              if (isReadOnly) return;
+              const updatedMentions = (mentions || []).map(m => {
+                if (m.id === mention.id) {
+                  return { ...m, [field]: value };
+                }
+                return m;
+              });
+              onUpdateNotes(clinicalNotes, entities, relations, updatedMentions);
+            };
+
+            const handleResetSpeaker = () => {
+              if (isReadOnly) return;
+              const updatedMentions = (mentions || []).map(m => {
+                if (m.id === mention.id) {
+                  const { speaker, ...rest } = m;
+                  return rest;
+                }
+                return m;
+              });
+              onUpdateNotes(clinicalNotes, entities, relations, updatedMentions);
+              setCorrectingSpeakerMentionId(null);
+            };
+
+            return (
+              <div
+                key={mention.id || mIdx}
+                id={`mention-card-${mention.id}`}
+                className={`border rounded-lg p-2.5 space-y-2 transition-all duration-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/10 ${
+                  isMentionSelected
+                    ? 'bg-indigo-50/80 border-indigo-500 ring-2 ring-indigo-100 shadow-sm'
+                    : 'bg-slate-50/80 border-slate-150'
+                }`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (onSelectMention) {
+                    onSelectMention(mention.id === selectedMentionId ? null : mention.id);
+                  }
+                }}
+              >
+                {isMentionSelected ? (
+                  <>
+                    {/* Header with segment reference */}
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="font-mono text-slate-500 bg-slate-200/60 px-1.5 py-0.5 rounded flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                        Segment U-{mention.textSpan.lineIndex}
+                      </span>
+                      <span className="font-semibold italic text-slate-700 max-w-[200px] truncate" title={mention.textSpan.text}>
+                        "{mention.textSpan.text}"
+                      </span>
+                    </div>
+
+                    {/* Speaker Info Bar (Static by default, editable on secondary action) */}
+                    <div className="flex items-center justify-between text-[10px] bg-slate-100/80 px-2 py-1 rounded-md" onClick={e => e.stopPropagation()}>
+                      <div className="flex items-center gap-1.5 text-slate-600">
+                        <span className="font-semibold uppercase tracking-wider text-[8px] text-slate-400 font-mono">Speaker:</span>
+                        {isCorrectingSpeaker ? (
+                          <select
+                            value={mention.speaker || derivedSpeaker}
+                            onChange={(e) => {
+                              handleAttributeChange('speaker', e.target.value);
+                              setCorrectingSpeakerMentionId(null);
+                            }}
+                            className="text-[9px] font-bold bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                          >
+                            <option value="patient">Patient (derived)</option>
+                            <option value="doctor">Doctor</option>
+                            <option value="relative">Relative</option>
+                            <option value="other">Other</option>
+                          </select>
+                        ) : (
+                          <span className="font-bold text-slate-800 capitalize flex items-center gap-1">
+                            {speakerDisplay}
+                            {isSpeakerCorrected && (
+                              <span className="text-[8px] text-indigo-500 font-medium normal-case bg-indigo-50 px-1 py-0.2 rounded font-mono">
+                                (corrected)
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {!isCorrectingSpeaker && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setCorrectingSpeakerMentionId(mention.id);
+                            }}
+                            className="text-[9px] text-indigo-600 hover:text-indigo-800 font-semibold underline cursor-pointer"
+                          >
+                            Correct Speaker
+                          </button>
+                        )}
+                        {isSpeakerCorrected && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleResetSpeaker();
+                            }}
+                            className="text-[9px] text-rose-500 hover:text-rose-700 font-semibold underline cursor-pointer"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Grid of the 5 attributes */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-1.5" onClick={e => e.stopPropagation()}>
+                      {/* Polarity */}
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Polarity</span>
+                        <select
+                          value={mention.polarity || 'positive'}
+                          disabled={isReadOnly}
+                          onChange={(e) => handleAttributeChange('polarity', e.target.value)}
+                          className={`text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                            mention.polarity === 'negative' 
+                              ? 'border-rose-200 text-rose-700 bg-rose-50/10' 
+                              : 'border-slate-200 text-slate-700'
+                          }`}
+                        >
+                          <option value="positive">Positive</option>
+                          <option value="negative">Negative</option>
+                          <option value="neutral">Neutral</option>
+                        </select>
+                      </div>
+
+                      {/* Certainty */}
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Certainty</span>
+                        <select
+                          value={mention.certainty || 'certain'}
+                          disabled={isReadOnly}
+                          onChange={(e) => handleAttributeChange('certainty', e.target.value)}
+                          className={`text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                            mention.certainty !== 'certain' 
+                              ? 'border-amber-200 text-amber-700 bg-amber-50/10' 
+                              : 'border-slate-200 text-slate-700'
+                          }`}
+                        >
+                          <option value="certain">Certain</option>
+                          <option value="uncertain">Uncertain</option>
+                          <option value="hypothetical">Hypothetical</option>
+                        </select>
+                      </div>
+
+                      {/* Temporality */}
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Temporality</span>
+                        <select
+                          value={mention.temporality || 'current'}
+                          disabled={isReadOnly}
+                          onChange={(e) => handleAttributeChange('temporality', e.target.value)}
+                          className={`text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                            mention.temporality !== 'current' 
+                              ? 'border-blue-200 text-blue-700 bg-blue-50/10' 
+                              : 'border-slate-200 text-slate-700'
+                          }`}
+                        >
+                          <option value="current">Current</option>
+                          <option value="past">Past / History</option>
+                          <option value="future">Future</option>
+                        </select>
+                      </div>
+
+                      {/* Experiencer */}
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Experiencer</span>
+                        <select
+                          value={mention.experiencer || 'patient'}
+                          disabled={isReadOnly}
+                          onChange={(e) => handleAttributeChange('experiencer', e.target.value)}
+                          className="text-[9px] font-semibold bg-white border border-slate-200 rounded px-1 py-0.5 text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer"
+                        >
+                          <option value="patient">Patient</option>
+                          <option value="other">Other</option>
+                        </select>
+                      </div>
+
+                      {/* Mention Function */}
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Function</span>
+                        <select
+                          value={mention.function || 'asserted'}
+                          disabled={isReadOnly}
+                          onChange={(e) => handleAttributeChange('function', e.target.value)}
+                          className={`text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                            mention.function === 'questioned'
+                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-bold'
+                              : mention.function === 'hypothetical'
+                              ? 'border-purple-200 text-purple-700 bg-purple-50/10 font-bold'
+                              : mention.function === 'explanatory'
+                              ? 'border-slate-350 text-slate-700 bg-slate-50/10 font-bold'
+                              : 'border-slate-200 text-slate-700'
+                          }`}
+                        >
+                          <option value="asserted">Asserted</option>
+                          <option value="questioned">Questioned</option>
+                          <option value="hypothetical">Hypothetical</option>
+                          <option value="explanatory">General/explanatory</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Apply to All Mentions Action */}
+                    <div className="flex justify-end pt-1" onClick={e => e.stopPropagation()}>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const currentPolarity = mention.polarity || 'positive';
+                          const currentCertainty = mention.certainty || 'certain';
+                          const currentTemporality = mention.temporality || 'current';
+                          const currentExperiencer = mention.experiencer || 'patient';
+                          const currentFunction = mention.function || 'asserted';
+                          const currentSpeaker = mention.speaker;
+
+                          const updatedMentions = (mentions || []).map(m => {
+                            if (m.entityId === mention.entityId) {
+                              return {
+                                ...m,
+                                polarity: currentPolarity,
+                                certainty: currentCertainty,
+                                temporality: currentTemporality,
+                                experiencer: currentExperiencer,
+                                function: currentFunction,
+                                ...(currentSpeaker ? { speaker: currentSpeaker } : {})
+                              };
+                            }
+                            return m;
+                          });
+                          onUpdateNotes(clinicalNotes, entities, relations, updatedMentions);
+                        }}
+                        className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition-colors cursor-pointer"
+                      >
+                        <Layers className="w-2.5 h-2.5" />
+                        Apply these attributes to all {entityMentions.length} mentions
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  /* Collapsed Card view */
+                  <div className="flex items-center justify-between text-xs py-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded-md font-semibold text-[9px]">
+                        U-{mention.textSpan.lineIndex}
+                      </span>
+                      <span className="text-slate-400 font-medium font-sans select-none">·</span>
+                      <span className="text-slate-700 font-bold capitalize text-[10px]">{speakerDisplay}</span>
+                      <span className="text-slate-400 font-medium font-sans select-none">·</span>
+                      <span className={`font-bold capitalize text-[10px] px-1 py-0.2 rounded ${
+                        functionDisplay === 'questioned' ? 'text-amber-600 bg-amber-50' :
+                        functionDisplay === 'hypothetical' ? 'text-purple-600 bg-purple-50' :
+                        functionDisplay === 'explanatory' ? 'text-slate-600 bg-slate-100 font-medium' :
+                        'text-emerald-600 bg-emerald-50'
+                      }`}>
+                        {functionDisplay === 'explanatory' ? 'General/explanatory' : functionDisplay}
+                      </span>
+                      {/* Exception Badges */}
+                      {isExceptionPolarity && (
+                        <span className="text-[8px] bg-rose-50 text-rose-600 border border-rose-100 font-bold px-1 py-0.2 rounded uppercase">
+                          {mention.polarity}
+                        </span>
+                      )}
+                      {isExceptionCertainty && (
+                        <span className="text-[8px] bg-amber-50 text-amber-600 border border-amber-100 font-bold px-1 py-0.2 rounded uppercase">
+                          {mention.certainty}
+                        </span>
+                      )}
+                      {isExceptionTemporality && (
+                        <span className="text-[8px] bg-blue-50 text-blue-600 border border-blue-100 font-bold px-1 py-0.2 rounded uppercase">
+                          {mention.temporality}
+                        </span>
+                      )}
+                      {isExceptionExperiencer && (
+                        <span className="text-[8px] bg-orange-50 text-orange-600 border border-orange-100 font-bold px-1 py-0.2 rounded uppercase">
+                          {mention.experiencer === 'other' ? 'Other Experiencer' : mention.experiencer}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-slate-500 italic max-w-[150px] truncate select-none block" title={mention.textSpan.text}>
+                      "{mention.textSpan.text}"
+                    </span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const handleClearAllAnnotations = () => {
+    const emptyNotes: ClinicalCategory = {
+      symptoms: [],
+      conditions: [],
+      medications: [],
+      followUps: [],
+      measurements: []
+    };
+    onUpdateNotes(emptyNotes, [], []);
+    onSelectEntity(null);
+    setShowClearConfirm(false);
+  };
+
+  useEffect(() => {
+    if (selectedMentionId) {
+      setTimeout(() => {
+        const card = document.getElementById(`mention-card-${selectedMentionId}`);
+        if (card) {
+          card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 100);
+    }
+  }, [selectedMentionId]);
 
   // New Relation States
   const [newRelSource, setNewRelSource] = useState<string>('');
@@ -34,14 +478,41 @@ export default function ClinicalNotesView({
     }
   }, [selectedEntityId]);
 
-  // Auto-synchronize any 'Condition' type entities from the knowledge graph into the structured clinical notes
+  // Auto-synchronize any clinical-type entities from the knowledge graph into the structured clinical notes
   useEffect(() => {
     if (isReadOnly) return;
+
+    let hasChanges = false;
+
+    const currentSymptoms = clinicalNotes.symptoms || [];
+    const missingSymptoms: ClinicalSymptom[] = [];
+
     const currentConditions = clinicalNotes.conditions || [];
     const missingConditions: ClinicalCondition[] = [];
 
+    const currentMedications = clinicalNotes.medications || [];
+    const missingMedications: ClinicalMedication[] = [];
+
+    const currentFollowUps = clinicalNotes.followUps || [];
+    const missingFollowUps: ClinicalFollowUp[] = [];
+
+    const currentMeasurements = clinicalNotes.measurements || [];
+    const missingMeasurements: ClinicalMeasurement[] = [];
+
     entities.forEach(ent => {
-      if (ent.type === 'Condition') {
+      if (ent.type === 'Symptom') {
+        const alreadyExists = currentSymptoms.some(s => s.entityId === ent.id);
+        if (!alreadyExists) {
+          missingSymptoms.push({
+            entityId: ent.id,
+            name: ent.name,
+            severity: 'Unspecified',
+            onset: '',
+            details: ent.description || ''
+          });
+          hasChanges = true;
+        }
+      } else if (ent.type === 'Condition') {
         const alreadyExists = currentConditions.some(c => c.entityId === ent.id);
         if (!alreadyExists) {
           missingConditions.push({
@@ -50,18 +521,67 @@ export default function ClinicalNotesView({
             status: 'Active',
             details: ent.description || ''
           });
+          hasChanges = true;
+        }
+      } else if (ent.type === 'Medication') {
+        const alreadyExists = currentMedications.some(m => m.entityId === ent.id);
+        if (!alreadyExists) {
+          missingMedications.push({
+            entityId: ent.id,
+            name: ent.name,
+            action: 'Discussed',
+            dosage: '',
+            details: ent.description || ''
+          });
+          hasChanges = true;
+        }
+      } else if (ent.type === 'FollowUp') {
+        const alreadyExists = currentFollowUps.some(f => f.entityId === ent.id);
+        if (!alreadyExists) {
+          missingFollowUps.push({
+            entityId: ent.id,
+            task: ent.name,
+            due: 'Unspecified',
+            assignee: 'Patient'
+          });
+          hasChanges = true;
+        }
+      } else if (ent.type === 'Measurement') {
+        const alreadyExists = currentMeasurements.some(m => m.entityId === ent.id);
+        if (!alreadyExists) {
+          missingMeasurements.push({
+            entityId: ent.id,
+            name: ent.name,
+            value: 'Unspecified',
+            status: 'Stable',
+            details: ent.description || ''
+          });
+          hasChanges = true;
         }
       }
     });
 
-    if (missingConditions.length > 0) {
+    if (hasChanges) {
       const updatedNotes = {
         ...clinicalNotes,
-        conditions: [...currentConditions, ...missingConditions]
+        symptoms: [...currentSymptoms, ...missingSymptoms],
+        conditions: [...currentConditions, ...missingConditions],
+        medications: [...currentMedications, ...missingMedications],
+        followUps: [...currentFollowUps, ...missingFollowUps],
+        measurements: [...currentMeasurements, ...missingMeasurements]
       };
       onUpdateNotes(updatedNotes, entities);
     }
-  }, [entities, clinicalNotes.conditions, onUpdateNotes, isReadOnly]);
+  }, [
+    entities,
+    clinicalNotes.symptoms,
+    clinicalNotes.conditions,
+    clinicalNotes.medications,
+    clinicalNotes.followUps,
+    clinicalNotes.measurements,
+    onUpdateNotes,
+    isReadOnly
+  ]);
 
   const handleAddRelation = (e: React.FormEvent) => {
     e.preventDefault();
@@ -96,6 +616,7 @@ export default function ClinicalNotesView({
   const [medForm, setMedForm] = useState<Partial<ClinicalMedication>>({});
   const [folForm, setFolForm] = useState<Partial<ClinicalFollowUp>>({});
   const [measForm, setMeasForm] = useState<Partial<ClinicalMeasurement>>({});
+  const [supportForm, setSupportForm] = useState<Partial<Entity>>({});
 
   const itemRefs = React.useRef<{ [key: string]: HTMLDivElement | null }>({});
 
@@ -609,15 +1130,16 @@ export default function ClinicalNotesView({
     
     // Also remove from general entities array
     const updatedEntities = entities.filter(e => e.id !== entityId);
+    const updatedMentions = mentions.filter(m => m.entityId !== entityId);
 
-    onUpdateNotes(updatedNotes, updatedEntities);
+    onUpdateNotes(updatedNotes, updatedEntities, relations, updatedMentions);
     if (selectedEntityId === entityId) {
       onSelectEntity(null);
     }
   };
 
   // Start Editing
-  const startEdit = (category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements', index: number, item: any) => {
+  const startEdit = (category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements' | 'support', index: number, item: any) => {
     setEditingIndex({ category, index });
     if (category === 'symptoms') {
       setSymForm(item);
@@ -629,6 +1151,8 @@ export default function ClinicalNotesView({
       setFolForm(item);
     } else if (category === 'measurements') {
       setMeasForm(item);
+    } else if (category === 'support') {
+      setSupportForm(item);
     }
   };
 
@@ -640,10 +1164,11 @@ export default function ClinicalNotesView({
     setMedForm({});
     setFolForm({});
     setMeasForm({});
+    setSupportForm({});
   };
 
   // Save Editing
-  const saveEdit = (category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements', index: number) => {
+  const saveEdit = (category: 'symptoms' | 'conditions' | 'medications' | 'followUps' | 'measurements' | 'support', index: number) => {
     const updatedNotes = { ...clinicalNotes };
     const updatedEntities = [...entities];
 
@@ -672,7 +1197,7 @@ export default function ClinicalNotesView({
         updatedEntities[entIdx] = {
           ...updatedEntities[entIdx],
           name: updatedCond.name,
-          description: `Status: ${updatedCond.status || 'Active'}`
+          description: updatedCond.details || 'Condition documented'
         };
       }
     } else if (category === 'medications') {
@@ -716,10 +1241,69 @@ export default function ClinicalNotesView({
           description: `Value: ${updatedMeas.value || 'Unspecified'} | Status: ${updatedMeas.status || 'Stable'}`
         };
       }
+    } else if (category === 'support') {
+      const supportEnts = entities.filter(ent => !['Symptom', 'Condition', 'Medication', 'FollowUp', 'Measurement'].includes(ent.type));
+      const targetEntity = supportEnts[index];
+      if (targetEntity) {
+        const entIdx = updatedEntities.findIndex(e => e.id === targetEntity.id);
+        if (entIdx > -1) {
+          updatedEntities[entIdx] = {
+            ...updatedEntities[entIdx],
+            name: supportForm.name || targetEntity.name,
+            type: supportForm.type || targetEntity.type,
+            description: supportForm.description || targetEntity.description || ''
+          };
+        }
+      }
     }
 
     onUpdateNotes(updatedNotes, updatedEntities);
     cancelEdit();
+  };
+
+  const handleDeleteSupport = (entityId: string) => {
+    const updatedNotes = { ...clinicalNotes };
+    const updatedEntities = entities.filter(e => e.id !== entityId);
+    
+    // Also clean up references in clinicalNotes arrays
+    if (updatedNotes.symptoms) updatedNotes.symptoms = updatedNotes.symptoms.filter(s => s.entityId !== entityId);
+    if (updatedNotes.conditions) updatedNotes.conditions = updatedNotes.conditions.filter(c => c.entityId !== entityId);
+    if (updatedNotes.medications) updatedNotes.medications = updatedNotes.medications.filter(m => m.entityId !== entityId);
+    if (updatedNotes.followUps) updatedNotes.followUps = updatedNotes.followUps.filter(f => f.entityId !== entityId);
+    if (updatedNotes.measurements) updatedNotes.measurements = updatedNotes.measurements.filter(m => m.entityId !== entityId);
+
+    const updatedMentions = mentions.filter(m => m.entityId !== entityId);
+
+    onUpdateNotes(updatedNotes, updatedEntities, relations, updatedMentions);
+    if (selectedEntityId === entityId) {
+      onSelectEntity(null);
+    }
+  };
+
+  const handleAddNewSupportItem = () => {
+    const updatedNotes = { ...clinicalNotes };
+    const updatedEntities = [...entities];
+    const newId = `e_user_${Date.now()}`;
+
+    updatedEntities.push({
+      id: newId,
+      name: 'New Person or Attribute',
+      type: 'Person',
+      description: 'Support person or attribute node'
+    });
+
+    onUpdateNotes(updatedNotes, updatedEntities);
+
+    const supportEnts = updatedEntities.filter(ent => !['Symptom', 'Condition', 'Medication', 'FollowUp', 'Measurement'].includes(ent.type));
+    const newIndex = supportEnts.findIndex(e => e.id === newId);
+    if (newIndex > -1) {
+      setEditingIndex({ category: 'support', index: newIndex });
+      setSupportForm({
+        name: 'New Person or Attribute',
+        type: 'Person',
+        description: 'Support person or attribute node'
+      });
+    }
   };
 
   // Add Item to Category
@@ -812,8 +1396,48 @@ export default function ClinicalNotesView({
     startEdit(category, lastIndex, (updatedNotes[category] as any[])[lastIndex]);
   };
 
+  const supportEnts = entities.filter(ent => !['Symptom', 'Condition', 'Medication', 'FollowUp', 'Measurement'].includes(ent.type));
+
   return (
     <div className="space-y-6">
+      {/* Clinical Workspace Header with Clear All Button */}
+      <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Layers className="w-4.5 h-4.5 text-slate-500" />
+          <span className="text-xs font-semibold text-slate-700 uppercase tracking-wider font-mono">Clinical Workspace</span>
+        </div>
+        {!isReadOnly && (
+          <div className="flex items-center gap-2">
+            {showClearConfirm ? (
+              <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 px-2.5 py-1.5 rounded-lg animate-in fade-in duration-200">
+                <span className="text-[10px] text-rose-700 font-medium">Delete all annotations?</span>
+                <button
+                  onClick={handleClearAllAnnotations}
+                  className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[9px] rounded shadow-sm transition-all cursor-pointer"
+                >
+                  Yes, Clear
+                </button>
+                <button
+                  onClick={() => setShowClearConfirm(false)}
+                  className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-[9px] rounded transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setShowClearConfirm(true)}
+                className="px-2.5 py-1.5 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 text-slate-500 border border-slate-200 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                title="Delete all clinical annotated entities and relationships"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-slate-400 hover:text-rose-500 transition-colors" />
+                <span>Clear All Annotations</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
       {isReadOnly && (
         <>
           <style dangerouslySetInnerHTML={{__html: `
@@ -852,7 +1476,7 @@ export default function ClinicalNotesView({
           </div>
         </div>
         
-        <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between gap-4">
+        <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
           {isMappingAll ? (
             <div className="flex-1 flex items-center gap-3">
               <div className="flex-1 bg-slate-800 rounded-full h-1.5 overflow-hidden">
@@ -933,30 +1557,14 @@ export default function ClinicalNotesView({
                       >
                         {isEditing ? (
                           <div className="space-y-2.5" onClick={e => e.stopPropagation()}>
-                            <div className="grid grid-cols-2 gap-2">
-                              <div>
-                                <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Condition Name</label>
-                                <input
-                                  type="text"
-                                  value={condForm.name || ''}
-                                  onChange={e => setCondForm({ ...condForm, name: e.target.value })}
-                                  className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-orange-400 mt-0.5"
-                                />
-                              </div>
-                              <div>
-                                <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Status</label>
-                                <select
-                                  value={condForm.status || 'Active'}
-                                  onChange={e => setCondForm({ ...condForm, status: e.target.value })}
-                                  className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-orange-400 mt-0.5 bg-white"
-                                >
-                                  <option value="Active">Active</option>
-                                  <option value="Chronic">Chronic</option>
-                                  <option value="History of">History of</option>
-                                  <option value="Differential Diagnosis">Differential Diagnosis</option>
-                                  <option value="Unspecified">Unspecified</option>
-                                </select>
-                              </div>
+                            <div>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Condition Name</label>
+                              <input
+                                type="text"
+                                value={condForm.name || ''}
+                                onChange={e => setCondForm({ ...condForm, name: e.target.value })}
+                                className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-orange-400 mt-0.5"
+                              />
                             </div>
                             <div>
                               <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Additional Details</label>
@@ -987,11 +1595,6 @@ export default function ClinicalNotesView({
                             <div className="flex items-start justify-between">
                               <div>
                                 <h4 className="text-xs font-semibold text-slate-800">{condition.name}</h4>
-                                <div className="flex gap-1.5 mt-1">
-                                  <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-orange-50 text-orange-600">
-                                    {condition.status || 'Active'}
-                                  </span>
-                                </div>
                               </div>
                               <div className="flex gap-1 opacity-0 group-hover:opacity-100 hover:opacity-100 transition-opacity">
                                 <button
@@ -1014,6 +1617,12 @@ export default function ClinicalNotesView({
                               </p>
                             )}
                             {renderUmlsBadges(condition.entityId, condition.name, 'Condition')}
+                            {isSelected && (
+                              <>
+                                {renderEntityConflictsAndSummary(condition.entityId)}
+                                {renderMentionsSubWindow(condition.entityId)}
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1146,6 +1755,12 @@ export default function ClinicalNotesView({
                               </p>
                             )}
                             {renderUmlsBadges(symptom.entityId, symptom.name, 'Symptom')}
+                            {isSelected && (
+                              <>
+                                {renderEntityConflictsAndSummary(symptom.entityId)}
+                                {renderMentionsSubWindow(symptom.entityId)}
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1298,6 +1913,12 @@ export default function ClinicalNotesView({
                         </p>
                       )}
                       {renderUmlsBadges(med.entityId, med.name, 'Medication')}
+                      {isSelected && (
+                        <>
+                          {renderEntityConflictsAndSummary(med.entityId)}
+                          {renderMentionsSubWindow(med.entityId)}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1424,6 +2045,12 @@ export default function ClinicalNotesView({
                           </button>
                         </div>
                       </div>
+                      {isSelected && (
+                        <>
+                          {renderEntityConflictsAndSummary(fol.entityId)}
+                          {renderMentionsSubWindow(fol.entityId)}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1575,6 +2202,160 @@ export default function ClinicalNotesView({
                         </p>
                       )}
                       {renderUmlsBadges(meas.entityId, meas.name, 'Measurement')}
+                      {isSelected && (
+                        <>
+                          {renderEntityConflictsAndSummary(meas.entityId)}
+                          {renderMentionsSubWindow(meas.entityId)}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Clinical Attributes & Support Nodes Section */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+        <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <div className="p-1.5 bg-amber-50 text-amber-600 rounded-lg">
+              <Tags className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-slate-800">Clinical Attributes & Support Nodes</h3>
+              <p className="text-[10px] text-slate-400 mt-0.5">Dosages, Providers, Patients, or other helper terms</p>
+            </div>
+          </div>
+          <button
+            onClick={handleAddNewSupportItem}
+            className="flex items-center gap-1 text-[11px] font-semibold text-amber-600 hover:text-amber-700 bg-amber-50/50 px-2.5 py-1.5 rounded-lg transition-all cursor-pointer"
+          >
+            <Plus className="w-3 h-3" /> Add Attribute
+          </button>
+        </div>
+
+        {supportEnts.length === 0 ? (
+          <p className="text-xs text-slate-400 italic text-center py-4">No additional support attributes documented.</p>
+        ) : (
+          <div className="space-y-2.5">
+            {supportEnts.map((ent, idx) => {
+              const isSelected = selectedEntityId === ent.id;
+              const isEditing = editingIndex?.category === 'support' && editingIndex?.index === idx;
+
+              return (
+                <div
+                  key={ent.id}
+                  ref={el => { itemRefs.current[ent.id] = el; }}
+                  onClick={() => !isEditing && handleItemClick(ent.id)}
+                  className={`border rounded-lg p-3 transition-all relative border-l-4 group ${
+                    isSelected
+                      ? 'border-l-amber-500 border-y-slate-200 border-r-slate-200 bg-amber-50/10 shadow-sm'
+                      : 'border-l-slate-200 border-y-slate-100 border-r-slate-100 bg-slate-50/20'
+                  } ${!isEditing ? 'cursor-pointer' : ''}`}
+                >
+                  {isEditing ? (
+                    <div className="space-y-2.5" onClick={e => e.stopPropagation()}>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Attribute Name</label>
+                          <input
+                            type="text"
+                            value={supportForm.name || ''}
+                            onChange={e => setSupportForm({ ...supportForm, name: e.target.value })}
+                            placeholder="e.g. 50mg, Dr. Smith"
+                            className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-amber-400 mt-0.5"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Entity Type</label>
+                          <select
+                            value={supportForm.type || 'Dosage'}
+                            onChange={e => setSupportForm({ ...supportForm, type: e.target.value as any })}
+                            className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-amber-400 mt-0.5 bg-white"
+                          >
+                            <optgroup label="Support / Attribute Types">
+                              <option value="Person">Person (Patient, Provider, Speaker, etc.)</option>
+                              <option value="Dosage">Dosage</option>
+                              <option value="Patient">Patient (Legacy)</option>
+                              <option value="Doctor">Doctor (Legacy)</option>
+                              <option value="Other">Other</option>
+                            </optgroup>
+                            <optgroup label="Convert to Schema Type (Moves item to top tables)">
+                              <option value="Symptom">Symptom</option>
+                              <option value="Condition">Condition</option>
+                              <option value="Medication">Medication</option>
+                              <option value="FollowUp">Follow-up Task</option>
+                              <option value="Measurement">Measurement / Lab</option>
+                            </optgroup>
+                          </select>
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Description / Notes</label>
+                        <input
+                          type="text"
+                          value={supportForm.description || ''}
+                          onChange={e => setSupportForm({ ...supportForm, description: e.target.value })}
+                          placeholder="Brief context or notes"
+                          className="w-full text-xs border border-slate-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-amber-400 mt-0.5"
+                        />
+                      </div>
+                      <div className="flex justify-end gap-1.5 pt-1">
+                        <button
+                          onClick={cancelEdit}
+                          className="p-1 text-slate-400 hover:text-slate-600 border border-slate-200 rounded hover:bg-slate-50 cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => saveEdit('support', idx)}
+                          className="p-1 bg-amber-500 hover:bg-amber-600 text-white rounded cursor-pointer"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-800">{ent.name}</h4>
+                          <div className="flex gap-1.5 mt-1">
+                            <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">
+                              {ent.type}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); startEdit('support', idx, ent); }}
+                            className="p-1 text-slate-400 hover:text-amber-500 cursor-pointer"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleDeleteSupport(ent.id); }}
+                            className="p-1 text-slate-400 hover:text-rose-500 cursor-pointer"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                      {ent.description && (
+                        <p className="text-[10px] text-slate-500 mt-1.5 border-t border-dashed border-slate-100/80 pt-1">
+                          {ent.description}
+                        </p>
+                      )}
+                      {renderUmlsBadges(ent.id, ent.name, ent.type)}
+                      {isSelected && (
+                        <>
+                          {renderEntityConflictsAndSummary(ent.id)}
+                          {renderMentionsSubWindow(ent.id)}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1637,12 +2418,12 @@ export default function ClinicalNotesView({
                 required
                 className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 bg-white"
               >
-                <optgroup label="Patient Status & Experience">
-                  <option value="EXPERIENCING">EXPERIENCING (Patient &rarr; Symptom)</option>
-                  <option value="TAKING">TAKING (Patient &rarr; Medication)</option>
-                  <option value="AGREED_TO">AGREED_TO (Patient &rarr; FollowUp)</option>
-                  <option value="HAS_MEASUREMENT">HAS_MEASUREMENT (Patient &rarr; Measurement)</option>
-                  <option value="DIAGNOSED_WITH">DIAGNOSED_WITH (Patient &rarr; Condition)</option>
+                <optgroup label="Person Status & Experience">
+                  <option value="EXPERIENCING">EXPERIENCING (Person &rarr; Symptom)</option>
+                  <option value="TAKING">TAKING (Person &rarr; Medication)</option>
+                  <option value="AGREED_TO">AGREED_TO (Person &rarr; FollowUp)</option>
+                  <option value="HAS_MEASUREMENT">HAS_MEASUREMENT (Person &rarr; Measurement)</option>
+                  <option value="DIAGNOSED_WITH">DIAGNOSED_WITH (Person &rarr; Condition)</option>
                 </optgroup>
                 
                 <optgroup label="Clinical Associations">
@@ -1668,22 +2449,22 @@ export default function ClinicalNotesView({
                 </optgroup>
 
                 <optgroup label="Medical Orders & Actions">
-                  <option value="PRESCRIBED">PRESCRIBED (Doctor &rarr; Medication)</option>
-                  <option value="SCHEDULED">SCHEDULED (Doctor &rarr; FollowUp)</option>
-                  <option value="ORDERED_BY">ORDERED_BY (Measurement/Lab &rarr; Doctor)</option>
-                  <option value="COOPERATES_WITH">COOPERATES_WITH (Doctor &rarr; Patient)</option>
+                  <option value="PRESCRIBED">PRESCRIBED (Person/Provider &rarr; Medication)</option>
+                  <option value="SCHEDULED">SCHEDULED (Person/Provider &rarr; FollowUp)</option>
+                  <option value="ORDERED_BY">ORDERED_BY (Measurement/Lab &rarr; Person/Provider)</option>
+                  <option value="COOPERATES_WITH">COOPERATES_WITH (Person &rarr; Person)</option>
                 </optgroup>
 
                 <optgroup label="Care Plan Attribution & Timing">
-                  <option value="PROPOSED_BY">PROPOSED_BY (Condition/Treatment &rarr; Provider)</option>
-                  <option value="DIAGNOSED_BY">DIAGNOSED_BY (Condition &rarr; Doctor)</option>
-                  <option value="PRESCRIBED_BY">PRESCRIBED_BY (Medication &rarr; Doctor)</option>
-                  <option value="SCHEDULED_BY">SCHEDULED_BY (FollowUp &rarr; Doctor)</option>
-                  <option value="CANCELLED_BY">CANCELLED_BY (FollowUp &rarr; Doctor)</option>
-                  <option value="CONSIDERED_BY">CONSIDERED_BY (Condition/Medication &rarr; Doctor)</option>
-                  <option value="DISCONTINUED_BY">DISCONTINUED_BY (Medication &rarr; Doctor)</option>
-                  <option value="MEASURES">MEASURES (Measurement &rarr; Patient)</option>
-                  <option value="MEASURED_BY">MEASURED_BY (Measurement &rarr; Provider/Patient)</option>
+                  <option value="PROPOSED_BY">PROPOSED_BY (Condition/Treatment &rarr; Person/Provider)</option>
+                  <option value="DIAGNOSED_BY">DIAGNOSED_BY (Condition &rarr; Person/Provider)</option>
+                  <option value="PRESCRIBED_BY">PRESCRIBED_BY (Medication &rarr; Person/Provider)</option>
+                  <option value="SCHEDULED_BY">SCHEDULED_BY (FollowUp &rarr; Person/Provider)</option>
+                  <option value="CANCELLED_BY">CANCELLED_BY (FollowUp &rarr; Person/Provider)</option>
+                  <option value="CONSIDERED_BY">CONSIDERED_BY (Condition/Medication &rarr; Person/Provider)</option>
+                  <option value="DISCONTINUED_BY">DISCONTINUED_BY (Medication &rarr; Person/Provider)</option>
+                  <option value="MEASURES">MEASURES (Measurement &rarr; Person)</option>
+                  <option value="MEASURED_BY">MEASURED_BY (Measurement &rarr; Person/Provider)</option>
                 </optgroup>
               </select>
             </div>

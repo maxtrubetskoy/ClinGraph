@@ -13,6 +13,7 @@ interface ConversationEditorProps {
   warningMessage?: string | null;
   encounterType?: 'dialogue' | 'note';
   isReadOnly?: boolean;
+  isServerReady?: boolean;
 }
 
 const DIALOGUE_TEMPLATES = [
@@ -124,7 +125,8 @@ export default function ConversationEditor({
   status,
   warningMessage,
   encounterType = 'dialogue',
-  isReadOnly = false
+  isReadOnly = false,
+  isServerReady = true
 }: ConversationEditorProps) {
   const [selectedTemplateIdx, setSelectedTemplateIdx] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
@@ -300,9 +302,9 @@ export default function ConversationEditor({
               {hasAudio && (
                 <button
                   onClick={onDiarize}
-                  disabled={isDiarizing || status === 'processing'}
+                  disabled={isDiarizing || status === 'processing' || !isServerReady}
                   className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2.5 rounded-lg shadow-sm border transition-all cursor-pointer ${
-                    isDiarizing
+                    isDiarizing || !isServerReady
                       ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed shadow-none'
                       : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200 hover:shadow-md'
                   }`}
@@ -314,6 +316,11 @@ export default function ConversationEditor({
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                       </svg>
                       <span>Diarizing Audio...</span>
+                    </>
+                  ) : !isServerReady ? (
+                    <>
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                      <span>Server Starting...</span>
                     </>
                   ) : (
                     <>
@@ -339,9 +346,9 @@ export default function ConversationEditor({
 
               <button
                 onClick={onAnnotate}
-                disabled={status === 'processing' || isDiarizing || !rawTranscript.trim()}
+                disabled={status === 'processing' || isDiarizing || !rawTranscript.trim() || !isServerReady}
                 className={`flex items-center gap-1.5 text-xs font-semibold px-5 py-2.5 rounded-lg shadow-sm transition-all cursor-pointer ${
-                  status === 'processing' || isDiarizing
+                  status === 'processing' || isDiarizing || !isServerReady
                     ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
                     : !rawTranscript.trim()
                     ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
@@ -355,6 +362,11 @@ export default function ConversationEditor({
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                     </svg>
                     <span>Analyzing Medical Encounters...</span>
+                  </>
+                ) : !isServerReady ? (
+                  <>
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                    <span>Server Starting...</span>
                   </>
                 ) : (
                   <>

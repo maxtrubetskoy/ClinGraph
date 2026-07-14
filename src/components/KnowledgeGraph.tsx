@@ -69,12 +69,16 @@ export default function KnowledgeGraph({
       let x = width / 2;
       let y = height / 2;
 
-      if (entity.type === 'Patient') {
+      if (entity.type === 'Patient' || (entity.type === 'Person' && (entity.name.toLowerCase().includes('patient') || entity.name.toLowerCase().includes('subject')))) {
         x = width / 2;
         y = height / 2;
-      } else if (entity.type === 'Doctor') {
+      } else if (entity.type === 'Doctor' || (entity.type === 'Person' && (entity.name.toLowerCase().includes('doctor') || entity.name.toLowerCase().includes('dr.')))) {
         x = width / 2 - 160;
         y = height / 2 - 80;
+      } else if (entity.type === 'Person') {
+        const angle = (index / (entities.length || 1)) * 2 * Math.PI;
+        x = width / 2 + Math.cos(angle) * 120;
+        y = height / 2 + Math.sin(angle) * 120;
       } else {
         const angle = (index / (entities.length || 1)) * 2 * Math.PI;
         const radius = 200 + Math.random() * 60;
@@ -131,8 +135,8 @@ export default function KnowledgeGraph({
             const distance = Math.sqrt(dx * dx + dy * dy) || 1;
 
             const isSpeakerInvolved = 
-              nodeA.type === 'Patient' || nodeA.type === 'Doctor' || 
-              nodeB.type === 'Patient' || nodeB.type === 'Doctor';
+              nodeA.type === 'Patient' || nodeA.type === 'Doctor' || nodeA.type === 'Person' || 
+              nodeB.type === 'Patient' || nodeB.type === 'Doctor' || nodeB.type === 'Person';
             
             const repulsionRadius = isSpeakerInvolved ? 380 : 280;
             const forceConstant = isSpeakerInvolved ? 220 : 160;
@@ -168,8 +172,8 @@ export default function KnowledgeGraph({
 
             // Desired link length - make speaker-linked edges much longer to spread out concepts
             const isSpeakerInvolved = 
-              sourceNode.type === 'Patient' || sourceNode.type === 'Doctor' || 
-              targetNode.type === 'Patient' || targetNode.type === 'Doctor';
+              sourceNode.type === 'Patient' || sourceNode.type === 'Doctor' || sourceNode.type === 'Person' || 
+              targetNode.type === 'Patient' || targetNode.type === 'Doctor' || targetNode.type === 'Person';
             const desiredLength = isSpeakerInvolved ? 220 : 150;
             const k = 0.04; // Spring constant
             const force = k * (distance - desiredLength);
@@ -274,10 +278,12 @@ export default function KnowledgeGraph({
         prev.map((n, idx) => {
           const angle = (idx / (prev.length || 1)) * 2 * Math.PI;
           let radius = 220;
-          if (n.type === 'Patient') {
+          if (n.type === 'Patient' || (n.type === 'Person' && (n.name.toLowerCase().includes('patient') || n.name.toLowerCase().includes('subject')))) {
             radius = 0;
-          } else if (n.type === 'Doctor') {
+          } else if (n.type === 'Doctor' || (n.type === 'Person' && (n.name.toLowerCase().includes('doctor') || n.name.toLowerCase().includes('dr.')))) {
             radius = 120;
+          } else if (n.type === 'Person') {
+            radius = 160;
           }
           return {
             ...n,
@@ -322,6 +328,13 @@ export default function KnowledgeGraph({
   // Node Color Mapper
   const getNodeColor = (type: EntityType) => {
     switch (type) {
+      case 'Person':
+        return {
+          bg: '#f5f3ff', // violet-50
+          border: '#7c3aed', // violet-600
+          text: '#4c1d95', // violet-950
+          shadow: 'rgba(124, 58, 237, 0.2)'
+        };
       case 'Patient':
         return {
           bg: '#eef2ff', // indigo-50

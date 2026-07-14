@@ -1,13 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { TranscriptSegment, Entity, ClinicalCategory, EntityType } from '../types';
+import { TranscriptSegment, Entity, ClinicalCategory, EntityType, Mention, Relation } from '../types';
 import { MessageSquare, Plus, X, Sparkles, Brain, Info, FileText } from 'lucide-react';
 
 interface RawTranscriptViewProps {
   segments: TranscriptSegment[];
   entities?: Entity[];
+  mentions?: Mention[];
   selectedEntityId?: string | null;
   onSelectEntity?: (id: string | null) => void;
-  onUpdateNotes?: (updatedNotes: ClinicalCategory, updatedEntities: Entity[]) => void;
+  selectedMentionId?: string | null;
+  onSelectMention?: (id: string | null) => void;
+  onUpdateNotes?: (updatedNotes: ClinicalCategory, updatedEntities: Entity[], updatedRelations?: Relation[], updatedMentions?: Mention[]) => void;
   clinicalNotes?: ClinicalCategory;
   encounterType?: 'dialogue' | 'note';
 }
@@ -66,8 +69,11 @@ function getSelectionCharacterOffsetWithin(element: HTMLElement) {
 export default function RawTranscriptView({
   segments,
   entities = [],
+  mentions = [],
   selectedEntityId = null,
   onSelectEntity,
+  selectedMentionId = null,
+  onSelectMention,
   onUpdateNotes,
   clinicalNotes,
   encounterType = 'dialogue'
@@ -82,6 +88,24 @@ export default function RawTranscriptView({
   } | null>(null);
 
   const [newEntityType, setNewEntityType] = useState<EntityType>('Symptom');
+  const [selectedEntityToMap, setSelectedEntityToMap] = useState<string>('__new__');
+
+  // Reset selectedEntityToMap when type changes
+  useEffect(() => {
+    setSelectedEntityToMap('__new__');
+  }, [newEntityType]);
+
+  // Derive mentions from entities for older sessions or default state
+  const derivedMentions: Mention[] = mentions && mentions.length > 0
+    ? mentions
+    : (entities || [])
+        .filter(ent => ent.textSpan && ent.textSpan.lineIndex >= 0)
+        .map(ent => ({
+          id: `m_${ent.id}`,
+          textSpan: ent.textSpan!,
+          entityType: ent.type,
+          entityId: ent.id
+        }));
 
   const enrichedSegments = getSegmentsWithTimestamps(segments);
 
@@ -112,89 +136,127 @@ export default function RawTranscriptView({
 
     const notes = clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] };
     const currentEntities = entities || [];
+    const currentMentions = derivedMentions;
 
-    const newId = `e_user_${Date.now()}`;
-    const newEntity: Entity = {
-      id: newId,
-      name: pendingAnnotation.text,
-      type: newEntityType,
-      description: `${newEntityType} (Annotated manually from dialogue)`,
+    let targetEntityId = selectedEntityToMap;
+    let updatedEntities = [...currentEntities];
+    let updatedNotes = { ...notes };
+
+    if (selectedEntityToMap === '__new__') {
+      targetEntityId = `e_user_${Date.now()}`;
+      const newEntity: Entity = {
+        id: targetEntityId,
+        name: pendingAnnotation.text,
+        type: newEntityType,
+        description: `${newEntityType} (Annotated manually from dialogue)`,
+      };
+      updatedEntities.push(newEntity);
+
+      if (newEntityType === 'Symptom') {
+        const newSymptom = {
+          entityId: targetEntityId,
+          name: pendingAnnotation.text,
+          severity: 'Unspecified',
+          onset: 'Unspecified',
+          details: 'Selected from dialogue'
+        };
+        updatedNotes.symptoms = [...(updatedNotes.symptoms || []), newSymptom];
+      } else if (newEntityType === 'Condition') {
+        const newCond = {
+          entityId: targetEntityId,
+          name: pendingAnnotation.text,
+          status: 'Active',
+          details: 'Selected from dialogue'
+        };
+        updatedNotes.conditions = [...(updatedNotes.conditions || []), newCond];
+      } else if (newEntityType === 'Medication') {
+        const newMed = {
+          entityId: targetEntityId,
+          name: pendingAnnotation.text,
+          action: 'Discussed',
+          dosage: 'Unspecified',
+          details: 'Selected from dialogue'
+        };
+        updatedNotes.medications = [...(updatedNotes.medications || []), newMed];
+      } else if (newEntityType === 'FollowUp') {
+        const newFol = {
+          entityId: targetEntityId,
+          task: pendingAnnotation.text,
+          due: 'Unspecified',
+          assignee: 'Patient'
+        };
+        updatedNotes.followUps = [...(updatedNotes.followUps || []), newFol];
+      } else if (newEntityType === 'Measurement') {
+        const newMeas = {
+          entityId: targetEntityId,
+          name: pendingAnnotation.text,
+          value: 'Unspecified',
+          status: 'Stable',
+          details: 'Selected from dialogue'
+        };
+        updatedNotes.measurements = [...(updatedNotes.measurements || []), newMeas];
+      }
+    }
+
+    const newMentionId = `m_user_${Date.now()}`;
+    const newMention: Mention = {
+      id: newMentionId,
       textSpan: {
         lineIndex: pendingAnnotation.lineIndex,
         startChar: pendingAnnotation.startChar,
         endChar: pendingAnnotation.endChar,
         text: pendingAnnotation.text
-      }
+      },
+      entityType: newEntityType,
+      entityId: targetEntityId
     };
 
-    const updatedEntities = [...currentEntities, newEntity];
-    const updatedNotes = { ...notes };
+    const updatedMentions = [...currentMentions, newMention];
 
-    if (newEntityType === 'Symptom') {
-      const newSymptom = {
-        entityId: newId,
-        name: pendingAnnotation.text,
-        severity: 'Unspecified',
-        onset: 'Unspecified',
-        details: 'Selected from dialogue'
-      };
-      updatedNotes.symptoms = [...(updatedNotes.symptoms || []), newSymptom];
-    } else if (newEntityType === 'Condition') {
-      const newCond = {
-        entityId: newId,
-        name: pendingAnnotation.text,
-        status: 'Active',
-        details: 'Selected from dialogue'
-      };
-      updatedNotes.conditions = [...(updatedNotes.conditions || []), newCond];
-    } else if (newEntityType === 'Medication') {
-      const newMed = {
-        entityId: newId,
-        name: pendingAnnotation.text,
-        action: 'Discussed',
-        dosage: 'Unspecified',
-        details: 'Selected from dialogue'
-      };
-      updatedNotes.medications = [...(updatedNotes.medications || []), newMed];
-    } else if (newEntityType === 'FollowUp') {
-      const newFol = {
-        entityId: newId,
-        task: pendingAnnotation.text,
-        due: 'Unspecified',
-        assignee: 'Patient'
-      };
-      updatedNotes.followUps = [...(updatedNotes.followUps || []), newFol];
-    } else if (newEntityType === 'Measurement') {
-      const newMeas = {
-        entityId: newId,
-        name: pendingAnnotation.text,
-        value: 'Unspecified',
-        status: 'Stable',
-        details: 'Selected from dialogue'
-      };
-      updatedNotes.measurements = [...(updatedNotes.measurements || []), newMeas];
-    }
-
-    onUpdateNotes(updatedNotes, updatedEntities);
+    onUpdateNotes(updatedNotes, updatedEntities, undefined, updatedMentions);
     setPendingAnnotation(null);
-    if (onSelectEntity) {
-      onSelectEntity(newId);
+    setSelectedEntityToMap('__new__');
+    if (onSelectEntity && targetEntityId) {
+      onSelectEntity(targetEntityId);
     }
   };
 
-  // Auto-scroll to highlighted segment when selectedEntityId changes
+  // Auto-scroll to highlighted segment or specific mention when selections change
   useEffect(() => {
-    if (!selectedEntityId || !entities || !containerRef.current) return;
+    if (!containerRef.current) return;
 
-    const selectedEnt = entities.find(e => e.id === selectedEntityId);
-    if (selectedEnt && selectedEnt.textSpan && selectedEnt.textSpan.lineIndex >= 0) {
-      const lineIdx = selectedEnt.textSpan.lineIndex;
-      const element = containerRef.current.querySelector(`[data-segment-idx="${lineIdx}"]`);
+    if (selectedMentionId) {
+      const element = containerRef.current.querySelector(`#mention-${selectedMentionId}`);
       if (element) {
-        element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // Pulse animation effect
+        element.classList.add('ring-4', 'ring-indigo-400', 'ring-offset-1', 'scale-110');
+        const timer = setTimeout(() => {
+          element.classList.remove('ring-4', 'ring-indigo-400', 'ring-offset-1', 'scale-110');
+        }, 2500);
+        return () => clearTimeout(timer);
+      } else {
+        // Fallback: scroll to the segment containing the selected mention
+        const mention = derivedMentions.find(m => m.id === selectedMentionId);
+        if (mention && mention.textSpan && mention.textSpan.lineIndex >= 0) {
+          const lineIdx = mention.textSpan.lineIndex;
+          const element = containerRef.current.querySelector(`[data-segment-idx="${lineIdx}"]`);
+          if (element) {
+            element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }
+      }
+    } else if (selectedEntityId) {
+      const firstMention = derivedMentions.find(m => m.entityId === selectedEntityId);
+      if (firstMention && firstMention.textSpan && firstMention.textSpan.lineIndex >= 0) {
+        const lineIdx = firstMention.textSpan.lineIndex;
+        const element = containerRef.current.querySelector(`[data-segment-idx="${lineIdx}"]`);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
       }
     }
-  }, [selectedEntityId, entities]);
+  }, [selectedEntityId, selectedMentionId, derivedMentions]);
 
   if (!segments || segments.length === 0) {
     return (
@@ -258,14 +320,14 @@ export default function RawTranscriptView({
   };
 
   const renderSegmentText = (segText: string, segIdx: number) => {
-    if (!entities || entities.length === 0) return segText;
+    if (derivedMentions.length === 0) return segText;
 
-    // Filter and realign entities belonging to this segment index
-    const segEntities = entities.filter(ent => 
-      ent.textSpan && 
-      ent.textSpan.lineIndex === segIdx
-    ).map(ent => {
-      const span = ent.textSpan!;
+    // Filter and realign mentions belonging to this segment index
+    const segMentions = derivedMentions.filter(m => 
+      m.textSpan && 
+      m.textSpan.lineIndex === segIdx
+    ).map(m => {
+      const span = m.textSpan!;
       let startChar = span.startChar;
       let endChar = span.endChar;
 
@@ -277,23 +339,23 @@ export default function RawTranscriptView({
       }
 
       return {
-        ...ent,
+        ...m,
         textSpan: {
           ...span,
           startChar,
           endChar
         }
       };
-    }).filter(ent =>
-      ent.textSpan.startChar >= 0 && 
-      ent.textSpan.endChar > ent.textSpan.startChar &&
-      ent.textSpan.startChar <= segText.length
+    }).filter(m =>
+      m.textSpan.startChar >= 0 && 
+      m.textSpan.endChar > m.textSpan.startChar &&
+      m.textSpan.startChar <= segText.length
     );
 
-    if (segEntities.length === 0) return segText;
+    if (segMentions.length === 0) return segText;
 
     // Sort spans to ensure left-to-right processing, avoiding duplicates
-    const sortedEntities = [...segEntities].sort((a, b) => {
+    const sortedMentions = [...segMentions].sort((a, b) => {
       const startA = a.textSpan!.startChar;
       const startB = b.textSpan!.startChar;
       return startA - startB;
@@ -302,9 +364,9 @@ export default function RawTranscriptView({
     const elements: React.ReactNode[] = [];
     let cur = 0;
 
-    for (let i = 0; i < sortedEntities.length; i++) {
-      const ent = sortedEntities[i];
-      const span = ent.textSpan!;
+    for (let i = 0; i < sortedMentions.length; i++) {
+      const mention = sortedMentions[i];
+      const span = mention.textSpan!;
 
       // Skip if there's overlap with previous processed span
       if (span.startChar < cur) continue;
@@ -315,22 +377,37 @@ export default function RawTranscriptView({
       }
 
       // Add highlighted span
-      const isSelected = selectedEntityId === ent.id;
-      const typeColorClass = getEntityTypeColor(ent.type);
+      const isSelected = selectedEntityId === mention.entityId;
+      const isMentionSelected = selectedMentionId === mention.id;
+      const typeColorClass = getEntityTypeColor(mention.entityType);
+
+      // Find canonical entity name if mapped
+      const mappedEntity = entities.find(e => e.id === mention.entityId);
+      const tooltipText = mappedEntity 
+        ? `${mention.entityType}: ${mappedEntity.name} ${mappedEntity.umlsMapping ? '🧬 UMLS Mapped' : ''}`
+        : `${mention.entityType}: "${span.text}" (Unmapped)`;
 
       elements.push(
         <span
-          key={`${ent.id}_span_${i}`}
+          key={`m-highlight-${mention.id}-${i}`}
+          id={`mention-${mention.id}`}
           onClick={(e) => {
             e.stopPropagation();
-            if (onSelectEntity) onSelectEntity(ent.id);
+            if (onSelectEntity && mention.entityId) {
+              onSelectEntity(mention.entityId === selectedEntityId ? null : mention.entityId);
+            }
+            if (onSelectMention) {
+              onSelectMention(mention.id === selectedMentionId ? null : mention.id);
+            }
           }}
           className={`inline-block px-1 py-0.5 mx-0.5 rounded font-medium cursor-pointer transition-all duration-200 border text-[11px] ${
-            isSelected
-              ? 'bg-blue-600 text-white border-blue-700 ring-2 ring-blue-300 scale-105 font-semibold shadow-sm'
-              : `${typeColorClass} hover:brightness-95 hover:scale-102`
+            isMentionSelected
+              ? 'bg-indigo-600 text-white border-indigo-700 ring-2 ring-indigo-400 scale-105 font-bold shadow-md'
+              : isSelected
+                ? 'bg-blue-600 text-white border-blue-700 ring-2 ring-blue-300 scale-105 font-semibold shadow-sm'
+                : `${typeColorClass} hover:brightness-95 hover:scale-102`
           }`}
-          title={`${ent.type}: ${ent.name} - ${ent.description || 'No description'}`}
+          title={tooltipText}
         >
           {segText.substring(span.startChar, span.endChar)}
         </span>
@@ -411,6 +488,28 @@ export default function RawTranscriptView({
               </div>
             </div>
 
+            {/* Clinical Concept Mapping dropdown */}
+            <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-lg space-y-1.5">
+              <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block">Clinical Concept Mapping</label>
+              <select
+                value={selectedEntityToMap}
+                onChange={(e) => setSelectedEntityToMap(e.target.value)}
+                className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium"
+              >
+                <option value="__new__">🆕 Create brand new clinical entity: "{pendingAnnotation.text}"</option>
+                {entities.filter(ent => ent.type === newEntityType).map(ent => (
+                  <option key={ent.id} value={ent.id}>
+                    🔗 Link to existing {ent.type}: {ent.name}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[9px] text-slate-400 leading-normal">
+                {selectedEntityToMap === '__new__' 
+                  ? "This will add a new entry to the clinical tables and register a new canonical entity."
+                  : "This will add a new occurrence (highlight) of this term in the text, but map it to the same row in your clinical notes, avoiding duplicates."}
+              </p>
+            </div>
+
             <div className="flex justify-end gap-1.5 border-t border-blue-100/50 pt-2.5">
               <button
                 onClick={() => setPendingAnnotation(null)}
@@ -433,10 +532,10 @@ export default function RawTranscriptView({
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-4 pr-1.5 scroll-smooth">
         {enrichedSegments.map((seg, idx) => {
           const speakerColor = getSpeakerColorClass(seg.speaker);
-          const isSelectedSegment = selectedEntityId && entities?.some(ent => 
-            ent.id === selectedEntityId && 
-            ent.textSpan && 
-            ent.textSpan.lineIndex === idx
+          const isSelectedSegment = selectedEntityId && derivedMentions.some(m => 
+            m.entityId === selectedEntityId && 
+            m.textSpan && 
+            m.textSpan.lineIndex === idx
           );
 
           return (

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { db, auth } from './firebase';
 import {
   collection,
@@ -18,7 +18,7 @@ import {
   onAuthStateChanged,
   User
 } from 'firebase/auth';
-import { Conversation, ClinicalCategory, Entity } from './types';
+import { Conversation, ClinicalCategory, Entity, Mention, migrateToMentionsSchema } from './types';
 import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './lib/audioDb';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -85,6 +85,12 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'graph' | 'dialogue'>('dialogue');
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
+  const [selectedMentionId, setSelectedMentionId] = useState<string | null>(null);
+  
+  const handleSelectEntity = (id: string | null) => {
+    setSelectedEntityId(id);
+    setSelectedMentionId(null);
+  };
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   
   // Audio state
@@ -101,6 +107,53 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
+  // Backend server readiness status
+  const [serverStatus, setServerStatus] = useState<'checking' | 'ready' | 'loading' | 'error'>('checking');
+
+  // Check backend server readiness
+  useEffect(() => {
+    let active = true;
+    let timeoutId: any;
+
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const data = await res.json();
+            if (data && data.status === 'ready') {
+              if (active) {
+                setServerStatus('ready');
+                // Poll less frequently once ready (15 seconds)
+                timeoutId = setTimeout(checkHealth, 15000);
+                return;
+              }
+            }
+          }
+        }
+        // If response is ok but not JSON (or not ready), server is booting
+        if (active) {
+          setServerStatus('loading');
+          timeoutId = setTimeout(checkHealth, 2500);
+        }
+      } catch (err) {
+        // Fetch failed (server not listening yet)
+        if (active) {
+          setServerStatus('loading');
+          timeoutId = setTimeout(checkHealth, 2500);
+        }
+      }
+    };
+
+    checkHealth();
+
+    return () => {
+      active = false;
+      clearTimeout(timeoutId);
+    };
+  }, []);
+
   // Sharing & Cloning State
   const [sharedSession, setSharedSession] = useState<Conversation | null>(null);
   const [loadingShared, setLoadingShared] = useState(false);
@@ -111,21 +164,21 @@ export default function App() {
 
   // Custom AI Settings (Bring Your Own Model)
   const [userAiConfig, setUserAiConfig] = useState<any>({
-    transcription: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-    annotation: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+    transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+    annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
   });
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [localConfig, setLocalConfig] = useState<any>({
-    transcription: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-    annotation: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+    transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+    annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
   });
 
   // Load User AI settings from Firestore
   useEffect(() => {
     if (!currentUser) {
       setUserAiConfig({
-        transcription: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-        annotation: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+        transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+        annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
       });
       return;
     }
@@ -135,13 +188,13 @@ export default function App() {
       if (docSnap.exists()) {
         const data = docSnap.data();
         setUserAiConfig({
-          transcription: data.transcription || { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-          annotation: data.annotation || { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+          transcription: data.transcription || { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+          annotation: data.annotation || { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
         });
       } else {
         setUserAiConfig({
-          transcription: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-          annotation: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+          transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+          annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
         });
       }
     }, (error) => {
@@ -153,8 +206,8 @@ export default function App() {
 
   const openSettingsModal = () => {
     setLocalConfig(JSON.parse(JSON.stringify(userAiConfig || {
-      transcription: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' },
-      annotation: { provider: 'gemini', model: 'gemini-3.5-flash', apiKey: '', baseUrl: '' }
+      transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+      annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
     })));
     setIsSettingsOpen(true);
   };
@@ -328,7 +381,18 @@ export default function App() {
     }
   }, [activeId, conversations, sharedSession]);
 
-  const activeConversation = conversations.find((c) => c.id === activeId) || (sharedSession?.id === activeId ? sharedSession : null);
+  const activeConversationRaw = conversations.find((c) => c.id === activeId) || (sharedSession?.id === activeId ? sharedSession : null);
+
+  const activeConversation = useMemo(() => {
+    if (!activeConversationRaw) return null;
+    if (!activeConversationRaw.annotation) return activeConversationRaw;
+
+    const migrated = migrateToMentionsSchema(activeConversationRaw.annotation);
+    return {
+      ...activeConversationRaw,
+      annotation: migrated
+    };
+  }, [activeConversationRaw]);
 
   const isReadOnly = !currentUser || activeConversation?.userId !== currentUser.uid;
 
@@ -470,6 +534,10 @@ export default function App() {
         if (rawText.includes('<title>Cookie check</title>') || rawText.includes('Cookie check')) {
           throw new Error(`Third-Party Cookies Blocked: The browser blocked the security sandbox session cookie.\n\n👉 ACTION REQUIRED: Please click the "Open in new tab" button at the top-right of your AI Studio interface to bypass third-party cookie restrictions and run the clinical audio processors safely in a dedicated tab.`);
         }
+        if (rawText.includes('Starting Server...') || rawText.includes('Starting Server') || rawText.includes('starting-screen')) {
+          setServerStatus('loading');
+          throw new Error(`The backend server is still initializing. Please wait a few seconds and try again.`);
+        }
         throw new Error(`Server returned status 200 but content is not JSON:\n${rawText.slice(0, 500)}`);
       }
     } else {
@@ -578,7 +646,7 @@ export default function App() {
         setWarningMessage(result.warning);
       }
 
-      const { title, rawTranscript, transcriptSegments, entities, relations, clinicalNotes } = result.data;
+      const { title, rawTranscript, transcriptSegments, entities, relations, clinicalNotes, mentions } = result.data;
 
       // Check if original transcript was in JSONL format to avoid scrambling it
       const isOriginalJsonl = activeConversation.rawTranscript && 
@@ -614,7 +682,8 @@ export default function App() {
         annotation: {
           entities: entities || [],
           relations: relations || [],
-          clinicalNotes: clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] }
+          clinicalNotes: clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] },
+          mentions: mentions || []
         },
         status: 'annotated'
       }));
@@ -708,7 +777,12 @@ export default function App() {
   };
 
   // Called when user makes manual edits to annotations in ClinicalNotesView
-  const handleUpdateNotes = async (updatedNotes: ClinicalCategory, updatedEntities: Entity[], updatedRelations?: any[]) => {
+  const handleUpdateNotes = async (
+    updatedNotes: ClinicalCategory, 
+    updatedEntities: Entity[], 
+    updatedRelations?: any[], 
+    updatedMentions?: Mention[]
+  ) => {
     if (!activeId || !activeConversation || !activeConversation.annotation) return;
 
     try {
@@ -719,11 +793,32 @@ export default function App() {
         (rel: any) => validEntityIds.has(rel.source) && validEntityIds.has(rel.target)
       );
 
+      // Filter mentions to only keep ones pointing to valid entity IDs
+      const inputMentions = updatedMentions !== undefined 
+        ? updatedMentions 
+        : (activeConversation.annotation.mentions || []);
+
+      // If mentions list is empty and we had entities with textSpan, bootstrap from them
+      let baseMentions = inputMentions;
+      if (baseMentions.length === 0 && updatedEntities.some(e => e.textSpan && e.textSpan.lineIndex >= 0)) {
+        baseMentions = updatedEntities
+          .filter(e => e.textSpan && e.textSpan.lineIndex >= 0)
+          .map(e => ({
+            id: `m_${e.id}`,
+            textSpan: e.textSpan!,
+            entityType: e.type,
+            entityId: e.id
+          }));
+      }
+
+      const filteredMentions = baseMentions.filter((m: any) => validEntityIds.has(m.entityId));
+
       // Deep copy and strip undefined values for Firestore compatibility
       const cleanAnnotation = JSON.parse(JSON.stringify({
         entities: updatedEntities,
         relations: filteredRelations,
-        clinicalNotes: updatedNotes
+        clinicalNotes: updatedNotes,
+        mentions: filteredMentions
       }));
 
       await setDoc(doc(db, 'clinical_conversations', activeId), {
@@ -838,6 +933,29 @@ export default function App() {
           <h1 className="text-sm md:text-base font-semibold tracking-tight text-slate-900">
             ClinGraph <span className="text-slate-400 font-normal">/ Annotator v2.4</span>
           </h1>
+
+          {/* Server Status Indicator */}
+          <div className="flex items-center gap-1.5 ml-3 md:ml-4 px-2 py-0.5 rounded-full bg-slate-50 border border-slate-200/60 font-mono text-[10px] shadow-sm select-none">
+            {serverStatus === 'ready' && (
+              <>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                <span className="text-emerald-700 font-bold hidden sm:inline">Server Ready</span>
+                <span className="text-emerald-700 font-bold sm:hidden">Ready</span>
+              </>
+            )}
+            {(serverStatus === 'loading' || serverStatus === 'checking') && (
+              <>
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping" />
+                <span className="text-amber-700 font-semibold animate-pulse">Initializing...</span>
+              </>
+            )}
+            {serverStatus === 'error' && (
+              <>
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                <span className="text-rose-700 font-bold">Offline</span>
+              </>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-3">
           {currentUser ? (
@@ -1030,6 +1148,7 @@ export default function App() {
                     warningMessage={warningMessage}
                     encounterType={activeConversation.encounterType || 'dialogue'}
                     isReadOnly={isReadOnly}
+                    isServerReady={serverStatus === 'ready'}
                   />
                 </div>
               </div>
@@ -1080,8 +1199,11 @@ export default function App() {
                         <RawTranscriptView
                           segments={activeConversation.transcriptSegments}
                           entities={activeConversation.annotation.entities}
+                          mentions={activeConversation.annotation.mentions || []}
                           selectedEntityId={selectedEntityId}
-                          onSelectEntity={setSelectedEntityId}
+                          onSelectEntity={handleSelectEntity}
+                          selectedMentionId={selectedMentionId}
+                          onSelectMention={setSelectedMentionId}
                           onUpdateNotes={handleUpdateNotes}
                           clinicalNotes={activeConversation.annotation.clinicalNotes}
                           encounterType={activeConversation.encounterType || 'dialogue'}
@@ -1091,7 +1213,7 @@ export default function App() {
                           entities={activeConversation.annotation.entities}
                           relations={activeConversation.annotation.relations}
                           selectedEntityId={selectedEntityId}
-                          onSelectEntity={setSelectedEntityId}
+                          onSelectEntity={handleSelectEntity}
                         />
                       )}
                     </div>
@@ -1105,10 +1227,14 @@ export default function App() {
                         clinicalNotes={activeConversation.annotation.clinicalNotes}
                         entities={activeConversation.annotation.entities}
                         relations={activeConversation.annotation.relations || []}
+                        mentions={activeConversation.annotation.mentions || []}
                         onUpdateNotes={handleUpdateNotes}
                         selectedEntityId={selectedEntityId}
-                        onSelectEntity={setSelectedEntityId}
+                        onSelectEntity={handleSelectEntity}
+                        selectedMentionId={selectedMentionId}
+                        onSelectMention={setSelectedMentionId}
                         isReadOnly={isReadOnly}
+                        segments={activeConversation.transcriptSegments || []}
                       />
                     </div>
                   </div>
@@ -1435,7 +1561,7 @@ export default function App() {
                         onChange={(e) => {
                           const updated = { ...localConfig.transcription, provider: e.target.value };
                           if (e.target.value === 'gemini') {
-                            updated.model = 'gemini-3.5-flash';
+                            updated.model = 'gemini-3.1-flash-lite';
                             updated.baseUrl = '';
                           } else {
                             updated.model = 'whisper-1';
@@ -1459,7 +1585,7 @@ export default function App() {
                           ...localConfig,
                           transcription: { ...localConfig.transcription, model: e.target.value }
                         })}
-                        placeholder={localConfig.transcription.provider === 'gemini' ? 'gemini-3.5-flash' : 'whisper-1'}
+                        placeholder={localConfig.transcription.provider === 'gemini' ? 'gemini-3.1-flash-lite' : 'whisper-1'}
                         className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all font-medium"
                       />
                     </div>
@@ -1518,7 +1644,7 @@ export default function App() {
                         onChange={(e) => {
                           const updated = { ...localConfig.annotation, provider: e.target.value };
                           if (e.target.value === 'gemini') {
-                            updated.model = 'gemini-3.5-flash';
+                            updated.model = 'gemini-3.1-flash-lite';
                             updated.baseUrl = '';
                           } else {
                             updated.model = 'gpt-4o';
@@ -1542,7 +1668,7 @@ export default function App() {
                           ...localConfig,
                           annotation: { ...localConfig.annotation, model: e.target.value }
                         })}
-                        placeholder={localConfig.annotation.provider === 'gemini' ? 'gemini-3.5-flash' : 'gpt-4o'}
+                        placeholder={localConfig.annotation.provider === 'gemini' ? 'gemini-3.1-flash-lite' : 'gpt-4o'}
                         className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all font-medium"
                       />
                     </div>
