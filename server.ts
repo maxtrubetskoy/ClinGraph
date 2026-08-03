@@ -142,16 +142,198 @@ Keep the transcription highly professional and accurate. Do not add any extra te
   };
 }
 
+// Parse clinical note / document text into clean segments (paragraphs or SOAP fields)
+function parseNoteTextToSegments(text: string): { id: string; speaker: string; text: string }[] {
+  if (!text) return [];
+
+  const trimmed = text.trim();
+  
+  // 1. Check if it's a JSON object (e.g. SOAP fields)
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const obj = JSON.parse(trimmed);
+      if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+        return Object.entries(obj).map(([key, val], idx) => {
+          let textVal = "";
+          if (typeof val === 'string') {
+            textVal = val;
+          } else {
+            textVal = JSON.stringify(val, null, 2);
+          }
+          return {
+            id: `seg_${idx + 1}`,
+            speaker: key,
+            text: textVal
+          };
+        });
+      }
+    } catch (e) {
+      // Fallback if parsing fails
+    }
+  }
+
+  // 2. Treat as plain text, split by double newlines to find paragraphs.
+  const paragraphs = trimmed.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  
+  return paragraphs.map((para, idx) => {
+    // Check if paragraph starts with a header like "Subjective:" or "Assessment:"
+    const headerMatch = para.match(/^([A-Za-z0-9\s\-\.\#\:\(\)]+?)\:\s*\n?([\s\S]*)$/);
+    if (headerMatch && headerMatch[1] && headerMatch[1].length < 40 && !headerMatch[1].includes('\n')) {
+      const header = headerMatch[1].trim();
+      const content = headerMatch[2].trim();
+      if (content.length > 0) {
+        return {
+          id: `seg_${idx + 1}`,
+          speaker: header,
+          text: content
+        };
+      }
+    }
+    
+    return {
+      id: `seg_${idx + 1}`,
+      speaker: "Document",
+      text: para
+    };
+  });
+}
+
 // Extract clinical entities from a batch of segments with surrounding context
 async function extractEntitiesForBatch(
   client: GoogleGenAI,
   modelName: string,
   batchSegments: { id: string; speaker: string; text: string }[],
   startIndex: number,
-  allSegments: { id: string; speaker: string; text: string }[]
+  allSegments: { id: string; speaker: string; text: string }[],
+  schemaObj?: any[],
+  encounterType?: string
 ): Promise<any[]> {
   if (!batchSegments || batchSegments.length === 0) {
     return [];
+  }
+
+  // Fallback schema if none provided
+  const activeSchema = (schemaObj && schemaObj.length > 0) ? schemaObj : [
+    {
+      id: 'symptoms',
+      entityType: 'Symptom',
+      displayName: 'Symptoms',
+      typeHint: 'Use for physical signs or clinical symptoms reported by the patient (e.g. Nausea, headache, fever, cough, chest pain). Do NOT use for drug allergies (AllergyIntolerance) or chronic disease diagnoses.',
+      attributes: []
+    },
+    {
+      id: 'conditions',
+      entityType: 'Condition',
+      displayName: 'Disorders & Conditions',
+      typeHint: 'Use for active or past medical diagnoses, diseases, and chronic disorders (e.g. Essential hypertension, Type 2 diabetes) experienced by the patient. Do NOT use for family relative history, standard transient symptoms, or future requested procedures.',
+      attributes: []
+    },
+    {
+      id: 'medications',
+      entityType: 'Medication',
+      displayName: 'Medications',
+      typeHint: 'Use for regular daily prescriptions, active therapeutic medications, or over-the-counter drugs (e.g. Metformin, Lisinopril, Pantoprazole). Do NOT use for active vaccine administrations (Immunizations).',
+      attributes: []
+    },
+    {
+      id: 'followUps',
+      entityType: 'FollowUp',
+      displayName: 'Follow-ups & Plans',
+      typeHint: 'Use for planned future clinical actions, referrals, scheduled diagnostics, or orders (e.g. Ordering an ECG for next week, referral to cardiology). Do NOT use for completed procedures or historical actions.',
+      attributes: []
+    },
+    {
+      id: 'measurements',
+      entityType: 'Measurement',
+      displayName: 'Measurements',
+      typeHint: 'Use for isolated physical measurements, vital sign metrics, or individual lab values (e.g. Blood pressure: 140/90, Heart rate: 72, creatinine: 1.2). Do NOT use for comprehensive lab panels or multi-page summary reports.',
+      attributes: []
+    }
+  ];
+
+  // The allowed types for entity extraction are EXACTLY the category IDs defined in the active schema (such as 'conditions', 'symptoms')
+  const uniqueEntityTypes = new Set<string>();
+  activeSchema.forEach((cat: any) => {
+    if (cat.id) {
+      uniqueEntityTypes.add(cat.id);
+    }
+  });
+
+  // Fallback to standard clinical types (IDs) only if the active schema is completely empty
+  if (uniqueEntityTypes.size === 0) {
+    uniqueEntityTypes.add("conditions");
+    uniqueEntityTypes.add("symptoms");
+    uniqueEntityTypes.add("medications");
+    uniqueEntityTypes.add("followUps");
+    uniqueEntityTypes.add("measurements");
+  }
+
+  // Include standard support types for graph relations (Person and Other)
+  uniqueEntityTypes.add("Person");
+  uniqueEntityTypes.add("Other");
+
+  // Only include Dosage if there is an active category representing medication
+  const hasMedication = activeSchema.some((cat: any) => cat.id === "medications" || cat.id === "fhir_medications" || (cat.entityType || "").toLowerCase() === "medication");
+  if (hasMedication) {
+    uniqueEntityTypes.add("Dosage");
+  }
+
+  const allowedTypes = Array.from(uniqueEntityTypes);
+
+  // Dynamic Guidelines from the Annotation Schema
+  let schemaGuidelines = "";
+  activeSchema.forEach((cat: any) => {
+    const attrHints = cat.attributes && cat.attributes.length > 0
+      ? cat.attributes.map((attr: any) => `${attr.name} (${attr.type}${attr.choices ? `: [${attr.choices.join(', ')}]` : ''})`).join(', ')
+      : "none";
+    const typeHintStr = cat.typeHint ? `\n  Classification Guidance: ${cat.typeHint}` : "";
+    schemaGuidelines += `- Category ID: "${cat.id}" (Matches Entity Type: "${cat.entityType}", Display Name: "${cat.displayName}")${typeHintStr}\n  Supported Attributes: ${attrHints}\n`;
+  });
+
+  const categoryIds = new Set<string>(activeSchema.map((cat: any) => cat.id.toLowerCase()));
+  const hasCondition = activeSchema.some((cat: any) => cat.id === "conditions" || cat.id === "fhir_conditions" || (cat.entityType || "").toLowerCase() === "condition");
+  const hasSymptom = activeSchema.some((cat: any) => cat.id === "symptoms" || cat.id === "fhir_symptoms" || (cat.entityType || "").toLowerCase() === "symptom");
+  const hasMeasurement = activeSchema.some((cat: any) => cat.id === "measurements" || cat.id === "fhir_observations" || (cat.entityType || "").toLowerCase() === "measurement" || (cat.entityType || "").toLowerCase() === "observation");
+  const hasProcedure = activeSchema.some((cat: any) => cat.id === "procedures" || cat.id === "fhir_procedures" || (cat.entityType || "").toLowerCase() === "procedure");
+  const hasFollowUp = activeSchema.some((cat: any) => cat.id === "followUps" || cat.id === "fhir_servicerequests" || (cat.entityType || "").toLowerCase() === "followup" || (cat.entityType || "").toLowerCase() === "servicerequest");
+
+  let antiOverextractionRules = `1. NO GENERIC OR ABSTRACT WORDS: Do NOT extract general, non-specific nouns, adjectives, colloquial filler terms, status descriptions, or abstract words as clinical entities.
+   - NEVER extract generic terms like "klachten" / "klacht" (complaints / complaint), "stabiel" (stable), "stabiele conditie" (stable condition), "ziek" (ill), "problemen" (problems), "beter" (better), "onderzoek" (investigation), or "controle" (check-up / control). These are NOT clinical entities!`;
+
+  if (hasMedication) {
+    antiOverextractionRules += `\n   - NEVER extract generic medication words like "medicijn", "medicatie", "pil", "pills", or "medication" as a Medication entity when no specific drug is named. Only named medicines (e.g., Lisinopril, Metformin) or named therapeutic drug classes should be extracted.`;
+  }
+  antiOverextractionRules += `\n   - Only extract highly specific, clinically actionable terms verbatim.`;
+
+  let ruleIndex = 2;
+  if (hasCondition && (hasSymptom || hasMeasurement)) {
+    antiOverextractionRules += `\n${ruleIndex++}. CONDITION vs. SYMPTOM/OBSERVATION SEPARATION:
+   - ONLY classify formal, established medical diagnoses, diseases, or chronic disorders as a "Condition" (e.g., "hypertension", "diabetes", "polycystic kidney disease").
+   - Functional patient-reported physical complaints, bodily signs, or temporary sensations MUST NOT be classified as "Conditions" on their own. They belong strictly to "Symptoms" or "Observations"/"Measurements" (e.g., "vroege verzadiging" / "early satiety" is a Symptom or Observation, NOT a Condition).
+   - If a complaint, physical finding, or sign is NOT an officially documented disease diagnosis, you MUST map it to "Symptom" or "Measurement"/"Observation", NEVER as a "Condition".`;
+  }
+
+  if (hasProcedure && hasFollowUp) {
+    antiOverextractionRules += `\n${ruleIndex++}. PROCEDURES vs. FUTURE / CONDITIONAL SERVICE REQUESTS:
+   - Identify the timing of any procedure or test mentioned. If a procedure/test has not happened yet, is scheduled, or is planned for the future (e.g., "performing an ECG if symptoms occur" or "will request a kidney biopsy next week"), mark its temporality as "future" and certainty as "hypothetical" or "certain" depending on the context. Ensure it is mapped as a Service Request (FollowUp/ServiceRequest) and NOT as a completed Procedure.`;
+  }
+
+  let specificClassificationRules = "";
+
+  if (categoryIds.has("fhir_medications") && categoryIds.has("fhir_immunizations")) {
+    specificClassificationRules += `* Medications vs. Immunizations: Regular therapeutic drugs or prescriptions (e.g., Pantoprazole, Lisinopril, Metformin, 'maagbeschermer') belong strictly to "Medication" type. ONLY active vaccine administrations (e.g., Influenza vaccine, Covid vaccine, MMR, flu shot) belong to "fhir_immunizations". Do NOT double-map or put medications into immunizations.\n`;
+  }
+  if (categoryIds.has("fhir_conditions") && categoryIds.has("fhir_familyhistory")) {
+    specificClassificationRules += `* Conditions vs. Family Member History: Chronic diseases or acute conditions experienced by the patient themselves belong strictly to "Condition" (mapping to "fhir_conditions"). Illnesses/conditions of biological relatives (e.g. father with PKD, mother with diabetes) belong to "Condition" but must map to "fhir_familyHistory".\n`;
+  }
+  if (categoryIds.has("fhir_procedures") && (categoryIds.has("fhir_servicerequests") || categoryIds.has("followups"))) {
+    specificClassificationRules += `* Procedures vs. ServiceRequests: Completed or currently active medical/surgical actions/therapies (e.g., appendectomy done, chest X-ray taken, kidney biopsy completed) belong strictly to "FollowUp" type mapped to "fhir_procedures". Future ordered/scheduled actions belong to "fhir_serviceRequests" or generic follow-ups.\n`;
+  }
+  if (categoryIds.has("fhir_diagnosticreports") && (categoryIds.has("fhir_observations") || categoryIds.has("measurements"))) {
+    specificClassificationRules += `* Observations vs. DiagnosticReports: Individual vital sign metrics, single laboratory values, or simple measurements (e.g. Blood Pressure: 150/95, Heart Rate: 72, creatinine: 1.2) belong strictly to "Measurement" type mapped to "fhir_observations". Comprehensive multi-value panels or full reports (e.g. CBC, Renal Panel, Electrocardiogram report) belong to "Measurement" mapped to "fhir_diagnosticReports".\n`;
+  }
+  if (categoryIds.has("fhir_allergies") || categoryIds.has("allergies")) {
+    specificClassificationRules += `* Symptoms vs. Allergies: Physical symptoms (e.g., Nausea, Headaches, Pain, Cough, Fever, Vomiting) are NOT allergies. Do NOT map normal clinical symptoms/signs to "fhir_allergies" unless explicitly described as a drug, food, or substance hypersensitivity reaction/allergy (e.g., 'Penicillin allergy', 'peanut allergy'). Normal complaints must map to Symptoms/Conditions.\n`;
   }
 
   // Get up to 2 segments before the batch and 2 segments after the batch for context
@@ -171,8 +353,20 @@ async function extractEntitiesForBatch(
 
   const targetSegmentsStr = batchSegments.map((s, i) => `[Target Segment ${startIndex + i}] [${s.speaker}]: ${s.text}`).join("\n");
 
+  const docType = encounterType === 'note' ? 'clinical note / document' : 'clinical conversation';
   const prompt = `You are an expert clinical annotator specializing in Clinical Entity Extraction.
-Your task is to analyze the TARGET segments from a clinical conversation (which may be in Dutch, English, or another language) and extract any clinical entities (Symptom, Condition, Medication, Dosage, FollowUp, Measurement, Person, Other) mentioned explicitly within them.
+Your task is to analyze the TARGET segments from a ${docType} (which may be in Dutch, English, or another language) and extract any clinical entities mentioned explicitly within them.
+
+The extraction MUST align with our active clinical annotation schema. Here are the categories defined in our schema:
+${schemaGuidelines}
+
+CRITICAL ANTI-OVEREXTRACTION & CLINICAL QUALITY RULES:
+${antiOverextractionRules}
+
+CRITICAL STRUCTURAL & SEMANTIC CLASSIFICATION RULES:
+${specificClassificationRules}
+* Single-Mapping Rule: Do NOT classify a single mention or entity into multiple categories. Assign it to the SINGLE, most specific clinical entity type.
+* Highlight verbatim matches: The 'literalText' field MUST be the EXACT verbatim substring from the segment text (case-sensitive where possible, or exact match) so it can be located via index matching.
 
 We provide preceding and succeeding context segments to help you understand medical references, abbreviations, pronouns, or clinical continuity.
 However, you MUST ONLY extract entities for the TARGET segments themselves. Do NOT extract entities from the Context segments.
@@ -191,10 +385,10 @@ The JSON schema you must output is:
 {
   "entities": [
     {
-      "targetSegmentIndex": 0, // MUST match the index number of the [Target Segment X] (e.g. if the entity is in [Target Segment ${startIndex}], this MUST be ${startIndex})
-      "literalText": "string (the EXACT verbatim word, term, or phrase as it appears literally in the segment text, e.g. 'eiwit in de urine', 'eGFR', 'headaches'). This is critical for highlighting.",
-      "name": "string (the standardized clinical name or concept name, e.g. 'Proteinuria' or 'eGFR' or 'Headache')",
-      "type": "Person | Symptom | Condition | Medication | Dosage | FollowUp | Measurement | Other",
+      "targetSegmentIndex": 0, // MUST match the index number of the [Target Segment X] where this entity is located (e.g. if in [Target Segment ${startIndex}], this MUST be ${startIndex})
+      "literalText": "string (the EXACT verbatim word, term, or phrase as it appears literally in the segment text. This is critical for highlighting.)",
+      "name": "string (the standardized clinical name, e.g. 'Proteinuria' or 'eGFR' or 'Headache')",
+      "type": "string (MUST be one of: ${allowedTypes.join(' | ')} - match this directly to the active schema's category ID where this clinical entity belongs. E.g. 'conditions', 'symptoms'. Standard helper entities like doctor or patient belong to 'Person')",
       "description": "string (brief clinical context or details)",
       "speaker": "string (MUST be one of: 'patient', 'doctor', 'relative', 'other')",
       "polarity": "string (MUST be one of: 'positive', 'negative', 'neutral')",
@@ -209,10 +403,8 @@ The JSON schema you must output is:
 Guidelines:
 1. ONLY extract entities mentioned or directly referenced in the TARGET segments.
 2. 'targetSegmentIndex' must be the exact index of the Target Segment where the entity is located (e.g. if the target segment is '[Target Segment ${startIndex}]', targetSegmentIndex MUST be ${startIndex}).
-3. 'literalText' MUST be a verbatim substring from the segment text in its original language, exactly as written or spoken, so it can be located via indexOf.
-4. Use 'Measurement' type for any clinical values, vital signs, or lab metrics (e.g., blood pressure, heart rate, creatinine).
-5. Identify any humans/speakers discussed (Doctor, Patient, Relative, Spouse, Child, Assistant, etc.) under the unified 'Person' type.
-6. If no clinical entities are mentioned in the TARGET segments, return an empty array for "entities".`;
+3. 'literalText' MUST be a verbatim substring from the segment text in its original language.
+4. If no clinical entities are mentioned in the TARGET segments, return an empty array for "entities".`;
 
   try {
     const response = await withTimeout(
@@ -234,7 +426,7 @@ Guidelines:
                     name: { type: "STRING" },
                     type: {
                       type: "STRING",
-                      enum: ["Person", "Patient", "Doctor", "Symptom", "Condition", "Medication", "Dosage", "FollowUp", "Measurement", "Other"]
+                      enum: allowedTypes
                     },
                     description: { type: "STRING" },
                     speaker: { type: "STRING", enum: ["patient", "doctor", "relative", "other"] },
@@ -348,7 +540,16 @@ async function startServer() {
 
   // API endpoint for annotation and transcription
   app.post("/api/annotate", upload.single("audio"), async (req, res) => {
-    const { transcript, transcriptSegments, audioBase64, audioMimeType, aiConfig } = req.body;
+    const { transcript, transcriptSegments, audioBase64, audioMimeType, aiConfig, annotationSchema, encounterType } = req.body;
+
+    let schemaObj: any[] = [];
+    if (annotationSchema) {
+      try {
+        schemaObj = typeof annotationSchema === "string" ? JSON.parse(annotationSchema) : annotationSchema;
+      } catch (e) {
+        console.warn("Failed to parse annotationSchema in annotate route:", e);
+      }
+    }
 
     let userAiConfig: any = null;
     if (aiConfig) {
@@ -636,34 +837,38 @@ Guidelines for High-Fidelity & Exhaustive Clinical Annotation:
         }
       }
 
-      // Fallback: if segments are empty but we have transcript text, reconstruct segments by lines
+      // Fallback: if segments are empty but we have transcript text, reconstruct segments by lines/paragraphs
       if ((!parsedSegments || parsedSegments.length === 0) && transcript) {
-        const lines = transcript.split('\n').filter((l: string) => l.trim().length > 0);
-        parsedSegments = lines.map((line: string, idx: number) => {
-          try {
-            if (line.trim().startsWith('{') && line.trim().endsWith('}')) {
-              const parsed = JSON.parse(line.trim());
+        if (encounterType === "note") {
+          parsedSegments = parseNoteTextToSegments(transcript);
+        } else {
+          const lines = transcript.split('\n').filter((l: string) => l.trim().length > 0);
+          parsedSegments = lines.map((line: string, idx: number) => {
+            try {
+              if (line.trim().startsWith('{') && line.trim().endsWith('}')) {
+                const parsed = JSON.parse(line.trim());
+                return {
+                  id: `seg_${idx + 1}`,
+                  speaker: parsed.speaker || "Unknown",
+                  text: parsed.text || ""
+                };
+              }
+            } catch (e) {}
+            const colonIdx = line.indexOf(':');
+            if (colonIdx > -1) {
               return {
                 id: `seg_${idx + 1}`,
-                speaker: parsed.speaker || "Unknown",
-                text: parsed.text || ""
+                speaker: line.substring(0, colonIdx).trim(),
+                text: line.substring(colonIdx + 1).trim()
               };
             }
-          } catch (e) {}
-          const colonIdx = line.indexOf(':');
-          if (colonIdx > -1) {
             return {
               id: `seg_${idx + 1}`,
-              speaker: line.substring(0, colonIdx).trim(),
-              text: line.substring(colonIdx + 1).trim()
+              speaker: "Unknown",
+              text: line.trim()
             };
-          }
-          return {
-            id: `seg_${idx + 1}`,
-            speaker: "Unknown",
-            text: line.trim()
-          };
-        });
+          });
+        }
       }
 
       // If we STILL have no segments, we cannot proceed with annotation
@@ -685,7 +890,7 @@ Guidelines for High-Fidelity & Exhaustive Clinical Annotation:
       try {
         const tasks = batches.map((batch, idx) => {
           const startIndex = batchStartIndices[idx];
-          return () => extractEntitiesForBatch(client, useGeminiModel, batch, startIndex, parsedSegments);
+          return () => extractEntitiesForBatch(client, useGeminiModel, batch, startIndex, parsedSegments, schemaObj, encounterType);
         });
 
         // Limit to 4 concurrent batch calls to stay highly responsive and prevent rate limiting
@@ -702,31 +907,122 @@ Guidelines for High-Fidelity & Exhaustive Clinical Annotation:
         });
       }
 
-      // Group extracted entities into canonical, unique entities based on Name + Type (case-insensitive)
+      // Group extracted entities into canonical, unique entities based on Name + Type OR Literal Text + Type (case-insensitive)
       const canonicalEntities: any[] = [];
-      const entityMap = new Map<string, string>(); // name_type -> entityId
-
-      let entityIdCounter = 1;
+      const mentions: any[] = [];
+      
+      // We will group the entities into clusters
+      const clusters: any[][] = [];
+      
       for (const ent of allExtracted) {
-        const key = `${ent.name.toLowerCase().trim()}_${ent.type.toLowerCase().trim()}`;
-        if (!entityMap.has(key)) {
-          const canonicalId = `e${entityIdCounter++}`;
-          entityMap.set(key, canonicalId);
-          canonicalEntities.push({
-            id: canonicalId,
-            name: ent.name,
-            type: ent.type,
-            description: ent.description || `${ent.type} mentioned in conversation`
-          });
+        if (!ent || !ent.name) continue;
+        
+        const entType = (ent.type || "").toLowerCase().trim();
+        const entName = (ent.name || "").toLowerCase().trim();
+        const entLiteral = (ent.textSpan?.text || ent.name || "").toLowerCase().trim();
+        
+        let foundClusterIndex = -1;
+        for (let i = 0; i < clusters.length; i++) {
+          const cluster = clusters[i];
+          const firstInCluster = cluster[0];
+          const clusterType = (firstInCluster.type || "").toLowerCase().trim();
+          
+          if (entType === clusterType) {
+            // Check if any entity in this cluster matches by Name, or matches by exact Literal Text, or close plurals/variations
+            const matches = cluster.some(c => {
+              const cName = (c.name || "").toLowerCase().trim();
+              const cLiteral = (c.textSpan?.text || c.name || "").toLowerCase().trim();
+              
+              const nameMatch = cName === entName;
+              const literalMatch = entLiteral && cLiteral && entLiteral === cLiteral;
+              
+              // Simple check for common plurals (Dutch/English)
+              const pluralMatch = (entLiteral && cLiteral) && (
+                entLiteral === cLiteral + 's' || cLiteral === entLiteral + 's' ||
+                entLiteral === cLiteral + 'en' || cLiteral === entLiteral + 'en'
+              );
+              
+              return nameMatch || literalMatch || pluralMatch;
+            });
+            
+            if (matches) {
+              foundClusterIndex = i;
+              break;
+            }
+          }
+        }
+        
+        if (foundClusterIndex >= 0) {
+          clusters[foundClusterIndex].push(ent);
+        } else {
+          clusters.push([ent]);
         }
       }
 
+      // Now map each cluster to a canonical Entity ID
+      const clusterToEntityId = new Map<number, string>();
+      const rawEntityToCanonicalId = new Map<any, string>();
+      
+      let entityIdCounter = 1;
+      
+      // Helper function to score name specificity to select the best canonical name
+      function getNameSpecificityScore(nameStr: string): number {
+        const n = nameStr.toLowerCase().trim();
+        // Lowest score for ultra-generic placeholder terms
+        if (["medication", "medicatie", "medicijn", "pil", "pills", "pills/tablets", "symptom", "symptoom", "complaint", "klacht", "observation", "observatie", "measurement", "meting"].includes(n)) {
+          return 0;
+        }
+        return n.length;
+      }
+      
+      clusters.forEach((cluster, idx) => {
+        const canonicalId = `e${entityIdCounter++}`;
+        clusterToEntityId.set(idx, canonicalId);
+        
+        // Find the best name in the cluster (highest specificity score)
+        let bestName = cluster[0].name;
+        let highestScore = getNameSpecificityScore(bestName);
+        
+        for (const ent of cluster) {
+          const score = getNameSpecificityScore(ent.name);
+          if (score > highestScore) {
+            highestScore = score;
+            bestName = ent.name;
+          }
+        }
+        
+        // Find the best description (longest description)
+        let bestDesc = "";
+        for (const ent of cluster) {
+          if (ent.description && ent.description.length > bestDesc.length) {
+            bestDesc = ent.description;
+          }
+        }
+        if (!bestDesc) {
+          bestDesc = `${cluster[0].type} mentioned in conversation`;
+        }
+        
+        // UMLS mappings can be compiled or taken from the cluster
+        const umlsMapping = cluster.find(ent => ent.umlsMapping)?.umlsMapping || null;
+        
+        canonicalEntities.push({
+          id: canonicalId,
+          name: bestName,
+          type: cluster[0].type,
+          description: bestDesc,
+          ...(umlsMapping ? { umlsMapping } : {})
+        });
+        
+        // Map all raw entity objects in this cluster to this canonical ID
+        cluster.forEach(ent => {
+          rawEntityToCanonicalId.set(ent, canonicalId);
+        });
+      });
+
       // Generate the mentions array pointing to the single canonical entities
-      const mentions: any[] = [];
       let mentionIdCounter = 1;
       for (const ent of allExtracted) {
-        const key = `${ent.name.toLowerCase().trim()}_${ent.type.toLowerCase().trim()}`;
-        const canonicalId = entityMap.get(key);
+        const canonicalId = rawEntityToCanonicalId.get(ent);
         if (canonicalId && ent.textSpan && ent.textSpan.lineIndex >= 0) {
           mentions.push({
             id: `m${mentionIdCounter++}`,
@@ -746,6 +1042,128 @@ Guidelines for High-Fidelity & Exhaustive Clinical Annotation:
       // Construct a clean full-context transcript representation for Step 2
       const fullTranscriptText = parsedSegments.map((seg, idx) => `[Segment ${idx}] [${seg.speaker}]: ${seg.text}`).join('\n');
 
+      // Resolve active schema to use (either passed schemaObj or fallback defaults)
+      const activeSchema = (schemaObj && schemaObj.length > 0) ? schemaObj : [
+        {
+          id: 'symptoms',
+          entityType: 'Symptom',
+          displayName: 'Symptoms',
+          typeHint: 'Use for physical signs or clinical symptoms reported by the patient (e.g. Nausea, headache, fever, cough, chest pain). Do NOT use for drug allergies (AllergyIntolerance) or chronic disease diagnoses.',
+          attributes: [
+            { name: 'name', type: 'text', hint: 'The physical symptom or sign' },
+            { name: 'severity', type: 'select', choices: ['Mild', 'Moderate', 'Severe', 'Unspecified'], hint: 'The intensity of the symptom' },
+            { name: 'onset', type: 'text', hint: 'When the symptom started or duration' },
+            { name: 'details', type: 'text', hint: 'Additional characterization of the symptom' }
+          ]
+        },
+        {
+          id: 'conditions',
+          entityType: 'Condition',
+          displayName: 'Disorders & Conditions',
+          typeHint: 'Use ONLY for formal, established medical diagnoses, diseases, and chronic disorders (e.g. Essential hypertension, Type 2 diabetes) experienced by the patient. Do NOT use for family relative history, standard transient symptoms, or future requested procedures.',
+          attributes: [
+            { name: 'name', type: 'text', hint: 'The medical name of the condition or disease' },
+            { name: 'status', type: 'select', choices: ['Active', 'Chronic', 'History of', 'Differential Diagnosis', 'Unspecified'], hint: 'Clinical status or presence' },
+            { name: 'details', type: 'text', hint: 'Additional context, specifications, or notes' }
+          ]
+        },
+        {
+          id: 'medications',
+          entityType: 'Medication',
+          displayName: 'Prescribed Medications',
+          typeHint: 'Use for regular daily prescriptions, active therapeutic medications, or over-the-counter drugs (e.g. Metformin, Lisinopril, Pantoprazole). Do NOT use for active vaccine administrations (Immunizations).',
+          attributes: [
+            { name: 'name', type: 'text', hint: 'Brand or generic drug name' },
+            { name: 'action', type: 'select', choices: ['Start', 'Stop', 'Change Dosage', 'Continue', 'Discussed'], hint: 'Status or action of the prescription' },
+            { name: 'dosage', type: 'text', hint: 'Dosage amount and frequency' },
+            { name: 'details', type: 'text', hint: 'Special instructions or side effects' }
+          ]
+        },
+        {
+          id: 'followUps',
+          entityType: 'FollowUp',
+          displayName: 'Follow-ups & Plans',
+          typeHint: 'Use for planned future clinical actions, referrals, scheduled diagnostics, or orders (e.g. Ordering an ECG for next week, referral to cardiology). Do NOT use for completed procedures or historical actions.',
+          attributes: [
+            { name: 'task', type: 'text', hint: 'Description of the follow-up or referral' },
+            { name: 'due', type: 'text', hint: 'Due date or timeline' },
+            { name: 'assignee', type: 'text', hint: 'Responsible person (e.g. Patient, Doctor)' }
+          ]
+        },
+        {
+          id: 'measurements',
+          entityType: 'Measurement',
+          displayName: 'Measurements',
+          typeHint: 'Use for isolated physical measurements, vital sign metrics, or individual lab values (e.g. Blood pressure: 140/90, Heart rate: 72, creatinine: 1.2). Do NOT use for comprehensive lab panels or multi-page summary reports.',
+          attributes: [
+            { name: 'name', type: 'text', hint: 'Vital sign or lab test name' },
+            { name: 'value', type: 'text', hint: 'Result or value with units' },
+            { name: 'status', type: 'text', hint: 'Evaluation of the value (e.g. Normal, Elevated, Low, Target)' },
+            { name: 'details', type: 'text', hint: 'Additional context or timestamp of measurement' }
+          ]
+        }
+      ];
+
+      const dynamicSchema: any = {};
+      const defaultNotes: any = {};
+      activeSchema.forEach(cat => {
+        const itemSchema: any = {
+          entityId: `string (MUST match the exact entity ID from entities list of type ${cat.entityType})`
+        };
+        (cat.attributes || []).forEach((attr: any) => {
+          if (attr.type === 'select' && attr.choices && attr.choices.length > 0) {
+            itemSchema[attr.name] = `string (MUST be one of: ${attr.choices.join(' | ')})`;
+          } else if (attr.type === 'boolean') {
+            itemSchema[attr.name] = "boolean (true or false)";
+          } else {
+            itemSchema[attr.name] = `string (${attr.hint || `value for ${attr.displayName}`})`;
+          }
+        });
+        dynamicSchema[cat.id] = [itemSchema];
+        defaultNotes[cat.id] = [];
+      });
+      const clinicalNotesSchemaStr = JSON.stringify(dynamicSchema, null, 2);
+
+      // Build classification rules dynamically based on categories actually present in activeSchema
+      const dynamicRules: string[] = [];
+      dynamicRules.push("Single-Mapping Rule: Do NOT map a single extracted entity to multiple categories in clinicalNotes. Each entity MUST belong in exactly one most-specific category.");
+
+      const activeCategoryIds = new Set<string>(activeSchema.map(cat => cat.id.toLowerCase()));
+
+      if (activeCategoryIds.has("fhir_allergies") || activeCategoryIds.has("allergies")) {
+        dynamicRules.push("Symptoms vs. Allergies: Standard physical or clinical symptoms (e.g., Nausea, headache, pain) are NOT allergies. Do NOT place standard symptoms in AllergyIntolerance categories. Only place true allergic reactions or hypersensitivities to foods, substances, or drugs there.");
+      }
+      if (activeCategoryIds.has("fhir_medications") && activeCategoryIds.has("fhir_immunizations")) {
+        dynamicRules.push("Medications vs. Immunizations: Regular therapeutic drugs or prescriptions belong strictly to medications. Only place active vaccine administrations (e.g., flu shot, Covid shot) in immunizations.");
+      }
+      if (activeCategoryIds.has("fhir_servicerequests") || activeCategoryIds.has("followups") || activeCategoryIds.has("followups")) {
+        dynamicRules.push("Service Requests & Follow-ups: Map future planned orders, referrals, scheduled diagnostics, or planned clinical actions strictly to follow-ups or service requests.");
+      }
+      if (activeCategoryIds.has("fhir_procedures") || activeCategoryIds.has("procedures")) {
+        dynamicRules.push("Procedures: Map only completed, historical, or active medical/surgical/diagnostic procedures to procedures. If not done yet, it is a follow-up or service request.");
+      }
+      if (activeCategoryIds.has("fhir_conditions") && activeCategoryIds.has("fhir_familyhistory")) {
+        dynamicRules.push("Patient Diagnoses vs. Family Member History: Only map the patient's own active/chronic diseases to conditions. Biological relative diseases/history belong strictly to family history.");
+      }
+      if (activeCategoryIds.has("fhir_symptoms") || activeCategoryIds.has("symptoms")) {
+        dynamicRules.push("Symptoms: Map subjective patient-reported symptoms or temporary somatic complaints (nausea, headache, early satiety / 'vroege verzadiging', fatigue) strictly to symptoms.");
+      }
+      if (activeCategoryIds.has("fhir_observations") || activeCategoryIds.has("measurements")) {
+        dynamicRules.push("Measurements/Observations: Map objective, quantitative vital signs, laboratory values, or anatomical measurements (Blood Pressure, Heart Rate, creatinine, eGFR, kidney size) strictly to measurements.");
+      }
+      if (activeCategoryIds.has("conditions") || activeCategoryIds.has("fhir_conditions")) {
+        dynamicRules.push("Conditions: Only map formal medical diagnoses (e.g., Polycystic kidney disease, Type 2 diabetes) to conditions. Do NOT put standard symptoms or measurements here.");
+      }
+
+      // Add each category's custom LLM guidelines if defined
+      activeSchema.forEach(cat => {
+        if (cat.typeHint) {
+          dynamicRules.push(`Category "${cat.id}" (${cat.displayName}): ${cat.typeHint}`);
+        }
+      });
+
+      const classificationRulesStr = dynamicRules.map((rule, idx) => `   - ${rule}`).join("\n");
+
       const step2Prompt = `You are an expert clinical annotator specializing in medical knowledge graph generation and clinical summaries.
 Given the full clinical conversation context AND the list of clinical entities extracted, your task is to generate a descriptive title of the medical encounter, construct a detailed relationship graph (relations), and compile the structured clinical notes.
 
@@ -761,20 +1179,20 @@ The JSON schema you must output is:
       "type": "UPPERCASE relation (e.g. DIAGNOSED_WITH, PRESCRIBED, TREATS, EXPERIENCING, SCHEDULED, HAS_DOSAGE, DOSAGE_FOR, HAS_MEASUREMENT, MEASURES, ASSOCIATED_WITH, TAKING, AGREED_TO)"
     }
   ],
-  "clinicalNotes": {
-    "symptoms": [{"entityId": "e1", "name": "Symptom name", "severity": "Mild|Moderate|Severe|Unspecified", "onset": "start time", "details": "context"}],
-    "conditions": [{"entityId": "e2", "name": "Condition name", "status": "Active|Chronic|History of|Differential Diagnosis|Unspecified", "details": "context"}],
-    "medications": [{"entityId": "e3", "name": "Medication name", "action": "Start|Stop|Change Dosage|Continue|Discussed", "dosage": "dosage description", "details": "context"}],
-    "followUps": [{"entityId": "e4", "task": "task", "due": "timeline", "assignee": "Patient|Doctor"}],
-    "measurements": [{"entityId": "e5", "name": "Measurement name", "value": "value", "status": "evaluation", "details": "context"}]
-  }
+  "clinicalNotes": ${clinicalNotesSchemaStr}
 }
 
 Guidelines:
-1. Connect every Dosage entity to its corresponding Medication entity using HAS_DOSAGE or DOSAGE_FOR.
+1. Connect every Dosage entity to its corresponding medication entity using HAS_DOSAGE or DOSAGE_FOR.
 2. Connect Patient to symptoms/conditions (EXPERIENCING) and medications (TAKING).
 3. Connect vital signs/measurements to patients (HAS_MEASUREMENT) and conditions (ASSOCIATED_WITH).
-4. Ensure all clinical notes items have the exact matching entityId from the provided entities list.`;
+4. Ensure all clinical notes items have the exact matching entityId from the provided entities list.
+5. CRITICAL CATEGORY TYPE RESPECT: Each entity in the provided 'Extracted entities list' has a 'type' property that matches the exact active schema category ID. You MUST honor this 'type' when compiling the 'clinicalNotes' object:
+   - If an entity's 'type' is 'conditions' (or 'fhir_conditions'), its details MUST only be placed under clinicalNotes.conditions (or clinicalNotes.fhir_conditions), NEVER under symptoms/observations.
+   - If an entity's 'type' is 'symptoms' (or 'fhir_symptoms'), its details MUST only be placed under clinicalNotes.symptoms (or clinicalNotes.fhir_symptoms), NEVER under conditions.
+   - Do NOT override or change the assignment of entities to categories contrary to their 'type' property.
+6. SEMANTIC CLASSIFICATION & SINGLE-MAPPING RULES (CRITICAL):
+${classificationRulesStr}`;
 
       console.log(`Step 2: Generating Title, Relations, and Clinical Notes using ${useGeminiModel}...`);
       const step2Contents = [
@@ -815,13 +1233,7 @@ Guidelines:
       const step2Data = cleanAndParseJson(step2Text);
       const extractedTitle = step2Data.title || "Annotated Clinical Session";
       const relations = step2Data.relations || [];
-      const clinicalNotes = step2Data.clinicalNotes || {
-        symptoms: [],
-        conditions: [],
-        medications: [],
-        followUps: [],
-        measurements: []
-      };
+      const clinicalNotes = step2Data.clinicalNotes || defaultNotes;
 
       const finalParsedData = {
         title: extractedTitle,

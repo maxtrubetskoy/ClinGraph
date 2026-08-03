@@ -18,7 +18,7 @@ import {
   onAuthStateChanged,
   User
 } from 'firebase/auth';
-import { Conversation, ClinicalCategory, Entity, Mention, migrateToMentionsSchema } from './types';
+import { Conversation, ClinicalCategory, Entity, Mention, migrateToMentionsSchema, SessionGroup, SessionGroupSettings, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, areSchemasIdentical } from './types';
 import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './lib/audioDb';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -31,7 +31,7 @@ import ClinicalNotesView from './components/ClinicalNotesView';
 import RawTranscriptView from './components/RawTranscriptView';
 
 // Icons
-import { Sparkles, Brain, MessageSquare, Shield, HelpCircle, PanelLeftClose, PanelLeftOpen, X, FileText, Check, Share2, LogOut, LogIn, Copy, ExternalLink, ShieldAlert, Key } from 'lucide-react';
+import { Sparkles, Brain, MessageSquare, Shield, HelpCircle, PanelLeftClose, PanelLeftOpen, X, FileText, Check, Share2, LogOut, LogIn, Copy, ExternalLink, ShieldAlert, Key, Folder, FolderPlus } from 'lucide-react';
 
 enum OperationType {
   CREATE = 'create',
@@ -83,6 +83,8 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'graph' | 'dialogue'>('dialogue');
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedMentionId, setSelectedMentionId] = useState<string | null>(null);
@@ -102,6 +104,7 @@ export default function App() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [newSessionTitle, setNewSessionTitle] = useState('');
   const [newSessionType, setNewSessionType] = useState<'dialogue' | 'note'>('dialogue');
+  const [selectedGroupIdForCreation, setSelectedGroupIdForCreation] = useState<string | null>(null);
 
   // Account Management & User Authentication
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -319,6 +322,97 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser, activeId]);
 
+  // Real-time listener for user-specific session groups
+  useEffect(() => {
+    if (!currentUser) {
+      setSessionGroups([]);
+      return;
+    }
+
+    const sessionGroupsCollection = collection(db, 'session_groups');
+    const q = query(sessionGroupsCollection, where('userId', '==', currentUser.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: SessionGroup[] = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() } as SessionGroup);
+      });
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setSessionGroups(list);
+    }, (error) => {
+      console.error("Firestore loading session groups error:", error);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser]);
+
+  // Session group CRUD handlers
+  const handleCreateGroup = async (name: string) => {
+    if (!currentUser) return;
+    const newGroupId = `group_${Date.now()}`;
+    const newGroup: SessionGroup = {
+      id: newGroupId,
+      name,
+      createdAt: new Date().toISOString(),
+      userId: currentUser.uid,
+      settings: {
+        description: '',
+        encounterTemplate: 'standard',
+        preferredModel: 'gemini-3.5-flash',
+        clinicalTaxonomy: 'all'
+      }
+    };
+    try {
+      await setDoc(doc(db, 'session_groups', newGroupId), newGroup);
+    } catch (err) {
+      console.error("Error creating session group:", err);
+    }
+  };
+
+  const handleUpdateGroup = async (id: string, name: string, settings: any) => {
+    if (!currentUser) return;
+    try {
+      await setDoc(doc(db, 'session_groups', id), {
+        name,
+        settings
+      }, { merge: true });
+
+      // Keep sharedGroupData in sync for any shared sessions belonging to this group
+      const sharedSessionsInGroup = conversations.filter(c => c.groupId === id && c.isShared);
+      for (const session of sharedSessionsInGroup) {
+        await setDoc(doc(db, 'clinical_conversations', session.id), {
+          sharedGroupData: {
+            id,
+            name,
+            settings
+          }
+        }, { merge: true });
+      }
+    } catch (err) {
+      console.error("Error updating session group:", err);
+    }
+  };
+
+  const handleDeleteGroup = async (id: string) => {
+    if (!currentUser) return;
+    try {
+      await deleteDoc(doc(db, 'session_groups', id));
+      
+      // Update any sessions belonging to this group to remove the group association
+      const sessionsInGroup = conversations.filter(c => c.groupId === id);
+      for (const session of sessionsInGroup) {
+        await setDoc(doc(db, 'clinical_conversations', session.id), {
+          groupId: null
+        }, { merge: true });
+      }
+      
+      if (activeGroupId === id) {
+        setActiveGroupId(null);
+      }
+    } catch (err) {
+      console.error("Error deleting session group:", err);
+    }
+  };
+
   // Clone a shared session to the current user's local workspace
   const handleCloneShared = async () => {
     if (!currentUser || !sharedSession) return;
@@ -334,6 +428,75 @@ export default function App() {
       return `${title} (v2)`;
     };
 
+    // Determine shared group info
+    const sharedGroupInfo = sharedSession.sharedGroupData || (
+      sharedSession.groupId ? sessionGroups.find(g => g.id === sharedSession.groupId) : null
+    );
+
+    let targetGroupId: string | null = null;
+    let targetSharedGroupData: any = null;
+
+    if (sharedGroupInfo) {
+      const sharedSchema = sharedGroupInfo.settings?.annotationSchema;
+
+      // Check if user already has an exactly identical group (exact schema match)
+      // 1. First preference: group with matching name AND exact schema match
+      let matchingGroup = sessionGroups.find(g => {
+        return (
+          g.name.toLowerCase().trim() === (sharedGroupInfo.name || '').toLowerCase().trim() &&
+          areSchemasIdentical(g.settings?.annotationSchema, sharedSchema)
+        );
+      });
+
+      // 2. Second preference: any group with exact schema match
+      if (!matchingGroup) {
+        matchingGroup = sessionGroups.find(g => {
+          return areSchemasIdentical(g.settings?.annotationSchema, sharedSchema);
+        });
+      }
+
+      if (matchingGroup) {
+        // Exact schema match exists: add session to that existing group
+        targetGroupId = matchingGroup.id;
+        targetSharedGroupData = {
+          id: matchingGroup.id,
+          name: matchingGroup.name,
+          settings: matchingGroup.settings || {}
+        };
+      } else {
+        // No exact schema match: create a new group with the shared settings & schema
+        const newGroupId = `group_${Date.now()}`;
+        const newGroupName = sharedGroupInfo.name || 'Shared Annotations Group';
+        const newGroupSettings: SessionGroupSettings = {
+          description: sharedGroupInfo.settings?.description || '',
+          encounterTemplate: sharedGroupInfo.settings?.encounterTemplate || 'standard',
+          preferredModel: sharedGroupInfo.settings?.preferredModel || 'gemini-3.5-flash',
+          clinicalTaxonomy: sharedGroupInfo.settings?.clinicalTaxonomy || 'all',
+          annotationSchema: normalizeAnnotationSchema(sharedGroupInfo.settings?.annotationSchema || DEFAULT_ANNOTATION_SCHEMA)
+        };
+
+        const newGroup: SessionGroup = {
+          id: newGroupId,
+          name: newGroupName,
+          createdAt: new Date().toISOString(),
+          userId: currentUser.uid,
+          settings: newGroupSettings
+        };
+
+        try {
+          await setDoc(doc(db, 'session_groups', newGroupId), newGroup);
+          targetGroupId = newGroupId;
+          targetSharedGroupData = {
+            id: newGroupId,
+            name: newGroupName,
+            settings: newGroupSettings
+          };
+        } catch (err) {
+          console.error('Error creating group for cloned session:', err);
+        }
+      }
+    }
+
     const newId = `session_${Date.now()}`;
     const clonedSession: Conversation = {
       ...sharedSession,
@@ -342,6 +505,8 @@ export default function App() {
       userId: currentUser.uid,
       isShared: false, // Clone of a shared session is private by default
       sharedFromId: sharedSession.id,
+      groupId: targetGroupId || undefined,
+      sharedGroupData: targetSharedGroupData || undefined,
       createdAt: new Date().toISOString()
     };
 
@@ -394,10 +559,26 @@ export default function App() {
     };
   }, [activeConversationRaw]);
 
+  const activeGroup = useMemo(() => {
+    if (!activeConversation) return null;
+    const userGroup = sessionGroups.find(g => g.id === activeConversation.groupId);
+    if (userGroup) return userGroup;
+    if (activeConversation.sharedGroupData) {
+      return {
+        id: activeConversation.sharedGroupData.id || activeConversation.groupId || 'shared_group',
+        name: activeConversation.sharedGroupData.name,
+        createdAt: '',
+        userId: activeConversation.userId || '',
+        settings: activeConversation.sharedGroupData.settings
+      } as SessionGroup;
+    }
+    return null;
+  }, [activeConversation, sessionGroups]);
+
   const isReadOnly = !currentUser || activeConversation?.userId !== currentUser.uid;
 
   // Create a new blank draft clinical session
-  const handleCreateNew = async (title?: string, type: 'dialogue' | 'note' = 'dialogue') => {
+  const handleCreateNew = async (title?: string, type: 'dialogue' | 'note' = 'dialogue', groupId?: string) => {
     if (!currentUser) return;
     const newId = `session_${Date.now()}`;
     const defaultTitle = (title && title.trim()) || (type === 'note' ? 'Draft Clinical Note' : 'Draft Dialogue Encounter');
@@ -410,7 +591,8 @@ export default function App() {
       hasAudio: false,
       status: 'draft',
       encounterType: type,
-      userId: currentUser.uid
+      userId: currentUser.uid,
+      groupId: groupId || null
     };
 
     try {
@@ -437,31 +619,94 @@ export default function App() {
     }
   };
 
+  const parseNoteTextToSegments = (text: string): { id: string; speaker: string; text: string }[] => {
+    if (!text) return [];
+
+    const trimmed = text.trim();
+    
+    // 1. Check if it's a JSON object (e.g. SOAP fields)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+          return Object.entries(obj).map(([key, val], idx) => {
+            let textVal = "";
+            if (typeof val === 'string') {
+              textVal = val;
+            } else {
+              textVal = JSON.stringify(val, null, 2);
+            }
+            return {
+              id: `seg_${idx + 1}`,
+              speaker: key,
+              text: textVal
+            };
+          });
+        }
+      } catch (e) {
+        // Fallback to plain text if JSON parsing fails
+      }
+    }
+
+    // 2. Treat as plain text, split by double newlines to find paragraphs.
+    const paragraphs = trimmed.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+    
+    return paragraphs.map((para, idx) => {
+      // Check if paragraph starts with a header like "Subjective:" or "Assessment:"
+      const headerMatch = para.match(/^([A-Za-z0-9\s\-\.\#\:\(\)]+?)\:\s*\n?([\s\S]*)$/);
+      if (headerMatch && headerMatch[1] && headerMatch[1].length < 40 && !headerMatch[1].includes('\n')) {
+        const header = headerMatch[1].trim();
+        const content = headerMatch[2].trim();
+        if (content.length > 0) {
+          return {
+            id: `seg_${idx + 1}`,
+            speaker: header,
+            text: content
+          };
+        }
+      }
+      
+      return {
+        id: `seg_${idx + 1}`,
+        speaker: "Document",
+        text: para
+      };
+    });
+  };
+
   // Update raw transcript text
   const handleTranscriptChange = async (text: string) => {
     if (!activeId) return;
     try {
+      const isNote = activeConversation?.encounterType === 'note';
       let segments: any[] = [];
-      let isValidJsonl = false;
-      try {
-        const lines = text.trim().split("\n");
-        if (lines.length > 0 && lines[0].trim().startsWith("{") && lines[0].trim().endsWith("}")) {
-          segments = lines.map((line, idx) => {
-            const parsed = JSON.parse(line);
-            return {
-              id: `seg_${idx + 1}`,
-              speaker: parsed.speaker || "Unknown",
-              text: parsed.text || ""
-            };
-          });
-          isValidJsonl = true;
+      let shouldUpdateSegments = false;
+
+      if (isNote) {
+        segments = parseNoteTextToSegments(text);
+        shouldUpdateSegments = true;
+      } else {
+        // Dialogue JSONL parsing
+        try {
+          const lines = text.trim().split("\n");
+          if (lines.length > 0 && lines[0].trim().startsWith("{") && lines[0].trim().endsWith("}")) {
+            segments = lines.map((line, idx) => {
+              const parsed = JSON.parse(line);
+              return {
+                id: `seg_${idx + 1}`,
+                speaker: parsed.speaker || "Unknown",
+                text: parsed.text || ""
+              };
+            });
+            shouldUpdateSegments = true;
+          }
+        } catch (e) {
+          // Not fully valid JSONL or syntax error while typing, which is fine
         }
-      } catch (e) {
-        // Not fully valid JSONL or syntax error while typing, which is fine
       }
 
       const updateData: any = { rawTranscript: text };
-      if (isValidJsonl && segments.length > 0) {
+      if (shouldUpdateSegments && segments.length > 0) {
         updateData.transcriptSegments = segments;
       }
 
@@ -600,6 +845,7 @@ export default function App() {
 
     try {
       let response;
+      const schemaToPass = normalizeAnnotationSchema(activeGroup?.settings?.annotationSchema || DEFAULT_ANNOTATION_SCHEMA);
       if (activeConversation.audioLocalId) {
         const blob = await getAudioBlob(activeConversation.audioLocalId);
         if (blob) {
@@ -608,6 +854,8 @@ export default function App() {
           formData.append('audioMimeType', blob.type);
           formData.append('transcript', activeConversation.rawTranscript || '');
           formData.append('transcriptSegments', JSON.stringify(activeConversation.transcriptSegments || []));
+          formData.append('annotationSchema', JSON.stringify(schemaToPass));
+          formData.append('encounterType', activeConversation.encounterType || 'dialogue');
           if (userAiConfig) {
             formData.append('aiConfig', JSON.stringify(userAiConfig));
           }
@@ -630,7 +878,9 @@ export default function App() {
             transcriptSegments: activeConversation.transcriptSegments || [],
             audioBase64: '',
             audioMimeType: '',
-            aiConfig: userAiConfig ? JSON.stringify(userAiConfig) : null
+            annotationSchema: schemaToPass,
+            aiConfig: userAiConfig ? JSON.stringify(userAiConfig) : null,
+            encounterType: activeConversation.encounterType || 'dialogue'
           })
         });
       }
@@ -1026,11 +1276,18 @@ export default function App() {
                   selectedId={activeId}
                   onSelect={setActiveId}
                   onDelete={handleDelete}
-                  onCreateNew={() => {
+                  onCreateNew={(groupId) => {
                     setNewSessionTitle('');
                     setNewSessionType('dialogue');
+                    setSelectedGroupIdForCreation(groupId || null);
                     setIsCreateModalOpen(true);
                   }}
+                  sessionGroups={sessionGroups}
+                  activeGroupId={activeGroupId}
+                  onSelectGroup={setActiveGroupId}
+                  onCreateGroup={handleCreateGroup}
+                  onUpdateGroup={handleUpdateGroup}
+                  onDeleteGroup={handleDeleteGroup}
                 />
               </div>
             </motion.div>
@@ -1045,11 +1302,18 @@ export default function App() {
               selectedId={activeId}
               onSelect={setActiveId}
               onDelete={handleDelete}
-              onCreateNew={() => {
+              onCreateNew={(groupId) => {
                 setNewSessionTitle('');
                 setNewSessionType('dialogue');
+                setSelectedGroupIdForCreation(groupId || null);
                 setIsCreateModalOpen(true);
               }}
+              sessionGroups={sessionGroups}
+              activeGroupId={activeGroupId}
+              onSelectGroup={setActiveGroupId}
+              onCreateGroup={handleCreateGroup}
+              onUpdateGroup={handleUpdateGroup}
+              onDeleteGroup={handleDeleteGroup}
             />
           </div>
         )}
@@ -1065,15 +1329,62 @@ export default function App() {
                     <h2 className="text-lg font-bold text-slate-900">
                       {activeConversation.title || 'Untitled Session'}
                     </h2>
-                    <p className="text-xs text-slate-400 mt-1 flex items-center gap-1">
-                      <span>Status:</span>
-                      <span className={`font-semibold capitalize ${
-                        activeConversation.status === 'annotated' ? 'text-green-500' :
-                        activeConversation.status === 'processing' ? 'text-amber-500' : 'text-slate-500'
-                      }`}>
-                        {activeConversation.status}
-                      </span>
-                    </p>
+                    <div className="flex flex-wrap items-center gap-y-1.5 gap-x-4 mt-1">
+                      <p className="text-xs text-slate-400 flex items-center gap-1">
+                        <span>Status:</span>
+                        <span className={`font-semibold capitalize ${
+                          activeConversation.status === 'annotated' ? 'text-green-500' :
+                          activeConversation.status === 'processing' ? 'text-amber-500' : 'text-slate-500'
+                        }`}>
+                          {activeConversation.status}
+                        </span>
+                      </p>
+
+                      {/* Group Assignment Dropdown */}
+                      {!isReadOnly ? (
+                        <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                          <Folder className="w-3.5 h-3.5 text-amber-500" />
+                          <span>Group:</span>
+                          <select
+                            value={activeConversation.groupId || ''}
+                            onChange={async (e) => {
+                              const selectedVal = e.target.value;
+                              const targetGroupId = selectedVal === '' ? null : selectedVal;
+                              const targetGroup = sessionGroups.find(g => g.id === targetGroupId);
+                              try {
+                                const updateData: any = { groupId: targetGroupId };
+                                if (activeConversation.isShared) {
+                                  updateData.sharedGroupData = targetGroup ? {
+                                    id: targetGroup.id,
+                                    name: targetGroup.name,
+                                    settings: targetGroup.settings || {}
+                                  } : null;
+                                }
+                                await setDoc(doc(db, 'clinical_conversations', activeConversation.id), updateData, { merge: true });
+                              } catch (err) {
+                                console.error('Error assigning group:', err);
+                              }
+                            }}
+                            className="bg-slate-100 hover:bg-slate-200 border border-slate-200/60 rounded px-2 py-0.5 font-bold text-slate-700 focus:outline-none cursor-pointer text-[11px] transition-colors"
+                          >
+                            <option value="">No Group / Unassigned</option>
+                            {sessionGroups.map(g => (
+                              <option key={g.id} value={g.id}>{g.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : (
+                        (activeGroup || activeConversation.groupId || activeConversation.sharedGroupData) && (
+                          <div className="flex items-center gap-1 text-xs text-slate-400">
+                            <Folder className="w-3.5 h-3.5 text-amber-500" />
+                            <span>Group:</span>
+                            <span className="font-semibold text-slate-600">
+                              {activeGroup?.name || activeConversation.sharedGroupData?.name || 'Annotations Group'}
+                            </span>
+                          </div>
+                        )
+                      )}
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -1101,10 +1412,17 @@ export default function App() {
                     ) : (
                       <button
                         onClick={async () => {
-                          // Mark shared in Firestore
+                          const groupForSession = sessionGroups.find(g => g.id === activeConversation.groupId) || activeGroup;
+                          const sharedGroupData = groupForSession ? {
+                            id: groupForSession.id,
+                            name: groupForSession.name,
+                            settings: groupForSession.settings || {}
+                          } : null;
+
                           try {
                             await setDoc(doc(db, 'clinical_conversations', activeConversation.id), {
-                              isShared: true
+                              isShared: true,
+                              sharedGroupData: sharedGroupData
                             }, { merge: true });
                             
                             // Generate link
@@ -1235,6 +1553,8 @@ export default function App() {
                         onSelectMention={setSelectedMentionId}
                         isReadOnly={isReadOnly}
                         segments={activeConversation.transcriptSegments || []}
+                        annotationSchema={activeGroup?.settings?.annotationSchema}
+                        encounterType={activeConversation.encounterType || 'dialogue'}
                       />
                     </div>
                   </div>
@@ -1406,8 +1726,9 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
-                    handleCreateNew(newSessionTitle, newSessionType);
+                    handleCreateNew(newSessionTitle, newSessionType, selectedGroupIdForCreation || undefined);
                     setIsCreateModalOpen(false);
+                    setSelectedGroupIdForCreation(null);
                   }}
                   className={`px-4 py-2 text-xs font-semibold text-white rounded-lg shadow-sm cursor-pointer transition-colors ${
                     newSessionType === 'note'

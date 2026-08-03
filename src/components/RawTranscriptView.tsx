@@ -531,13 +531,56 @@ export default function RawTranscriptView({
 
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-4 pr-1.5 scroll-smooth">
         {enrichedSegments.map((seg, idx) => {
-          const speakerColor = getSpeakerColorClass(seg.speaker);
           const isSelectedSegment = selectedEntityId && derivedMentions.some(m => 
             m.entityId === selectedEntityId && 
             m.textSpan && 
             m.textSpan.lineIndex === idx
           );
 
+          if (encounterType === 'note') {
+            // Document section layout for notes (first-class clinical documents)
+            const showHeader = seg.speaker && 
+              seg.speaker !== 'Document' && 
+              seg.speaker !== 'Unknown' && 
+              seg.speaker !== 'Speaker' &&
+              seg.speaker.trim() !== '';
+
+            return (
+              <div
+                key={seg.id}
+                data-segment-idx={idx}
+                className={`transition-all duration-300 p-4 rounded-xl border border-transparent ${
+                  isSelectedSegment 
+                    ? 'bg-indigo-50/40 border-indigo-200 shadow-sm ring-1 ring-indigo-100' 
+                    : 'hover:bg-slate-50/50'
+                }`}
+              >
+                {showHeader ? (
+                  <div className="flex items-center gap-2 mb-2 select-none border-b border-slate-100 pb-1.5">
+                    <span className="text-xs font-bold uppercase tracking-wider text-indigo-700">
+                      {seg.speaker}
+                    </span>
+                    <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-mono font-medium">
+                      Section {idx + 1}
+                    </span>
+                  </div>
+                ) : (
+                  <div className="text-[9px] text-slate-400 font-mono mb-1.5 select-none">
+                    Paragraph {idx + 1}
+                  </div>
+                )}
+                <div 
+                  className="text-[13px] leading-relaxed text-slate-750 select-text cursor-text font-serif"
+                  onMouseUp={(e) => handleTextSelection(e, idx)}
+                >
+                  {renderSegmentText(seg.text, idx)}
+                </div>
+              </div>
+            );
+          }
+
+          // Dialogue conversational layout
+          const speakerColor = getSpeakerColorClass(seg.speaker);
           return (
             <div
               key={seg.id}

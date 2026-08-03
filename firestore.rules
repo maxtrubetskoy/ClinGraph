@@ -37,6 +37,17 @@ service cloud.firestore {
                     isOwner(resource.data.userId);
     }
 
+    match /session_groups/{groupId} {
+      allow get: if isValidId(groupId) && isOwner(resource.data.userId);
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(groupId) && 
+                    request.resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(groupId) && 
+                    isOwner(resource.data.userId) && 
+                    request.resource.data.userId == request.auth.uid;
+      allow delete: if isValidId(groupId) && isOwner(resource.data.userId);
+    }
+
     match /user_settings/{userId} {
       allow read, write: if isOwner(userId);
     }

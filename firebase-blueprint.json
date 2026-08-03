@@ -14,9 +14,26 @@
         "encounterType": { "type": "string", "enum": ["dialogue", "note"], "description": "Format of the clinical encounter" },
         "userId": { "type": "string", "description": "The Firebase Auth UID of the owner" },
         "isShared": { "type": "boolean", "description": "Whether this session is shared for cloning" },
-        "sharedFromId": { "type": "string", "description": "If cloned, the original session ID" }
+        "sharedFromId": { "type": "string", "description": "If cloned, the original session ID" },
+        "groupId": { "type": "string", "description": "The ID of the session group this session belongs to (optional)" }
       },
       "required": ["id", "title", "createdAt", "rawTranscript", "hasAudio", "status"]
+    },
+    "SessionGroup": {
+      "title": "SessionGroup",
+      "description": "Represents a folder or category of clinical sessions that can share common settings.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique session group ID" },
+        "name": { "type": "string", "description": "The name of the session group" },
+        "createdAt": { "type": "string", "description": "The timestamp of creation in ISO-8601 format" },
+        "userId": { "type": "string", "description": "The Firebase Auth UID of the owner" },
+        "settings": {
+          "type": "object",
+          "description": "Shared settings for sessions in this group (for future expansion)"
+        }
+      },
+      "required": ["id", "name", "createdAt", "userId"]
     },
     "UserSettings": {
       "title": "UserSettings",
@@ -39,6 +56,10 @@
     "/clinical_conversations/{conversationId}": {
       "schema": "ClinicalConversation",
       "description": "The main collection of clinical conversations and structured annotations."
+    },
+    "/session_groups/{groupId}": {
+      "schema": "SessionGroup",
+      "description": "Folders or organizational groups for clinical sessions."
     },
     "/user_settings/{userId}": {
       "schema": "UserSettings",
