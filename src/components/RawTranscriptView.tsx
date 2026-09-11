@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { TranscriptSegment, Entity, ClinicalCategory, EntityType, Mention, Relation } from '../types';
-import { MessageSquare, Plus, X, Sparkles, Brain, Info, FileText } from 'lucide-react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
+import { TranscriptSegment, Entity, ClinicalCategory, EntityType, Mention, Relation, AnnotationCategory, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
+import { MessageSquare, Plus, X, Sparkles, Brain, Info, FileText, Trash2, Scissors, ChevronDown, UserCheck } from 'lucide-react';
+import { calculateGlobalWordSpan } from '../utils/wordAnchoring';
 
 interface RawTranscriptViewProps {
   segments: TranscriptSegment[];
@@ -13,6 +14,9 @@ interface RawTranscriptViewProps {
   onUpdateNotes?: (updatedNotes: ClinicalCategory, updatedEntities: Entity[], updatedRelations?: Relation[], updatedMentions?: Mention[]) => void;
   clinicalNotes?: ClinicalCategory;
   encounterType?: 'dialogue' | 'note';
+  annotationSchema?: AnnotationCategory[];
+  onSplitUtterance?: (segmentIndex: number, splitCharOffset: number, newSpeaker: string) => void;
+  onChangeSpeaker?: (segmentIndex: number, newSpeaker: string) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -76,9 +80,17 @@ export default function RawTranscriptView({
   onSelectMention,
   onUpdateNotes,
   clinicalNotes,
-  encounterType = 'dialogue'
+  encounterType = 'dialogue',
+  annotationSchema,
+  onSplitUtterance,
+  onChangeSpeaker
 }: RawTranscriptViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const activeSchema = useMemo(() => {
+    const base = annotationSchema && annotationSchema.length > 0 ? annotationSchema : DEFAULT_ANNOTATION_SCHEMA;
+    return normalizeAnnotationSchema(base);
+  }, [annotationSchema]);
 
   const [pendingAnnotation, setPendingAnnotation] = useState<{
     lineIndex: number;
@@ -87,25 +99,97 @@ export default function RawTranscriptView({
     text: string;
   } | null>(null);
 
-  const [newEntityType, setNewEntityType] = useState<EntityType>('Symptom');
-  const [selectedEntityToMap, setSelectedEntityToMap] = useState<string>('__new__');
+  const [annotationMode, setAnnotationMode] = useState<'annotate' | 'split'>('annotate');
+  const [splitSpeaker, setSplitSpeaker] = useState<string>('Patient');
 
-  // Reset selectedEntityToMap when type changes
+  const [selectedCategoryId, setSelectedCategoryId] = useState<string>(() => {
+    return activeSchema[0]?.id || 'symptoms';
+  });
+  const [selectedEntityToMap, setSelectedEntityToMap] = useState<string>('__new__');
+  const [annotationSupportedAttribute, setAnnotationSupportedAttribute] = useState<string>('');
+
+  // Smart prefill for supported attribute when a text span is selected (e.g. "145" -> "value", "moderate" -> "severity")
+  useEffect(() => {
+    if (pendingAnnotation) {
+      const trimmed = pendingAnnotation.text.trim().toLowerCase();
+      if (/^(\d+(\/\d+)?(\.\d+)?|\b\d+\s*(mmhg|bpm|%)\b)/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('value');
+      } else if (/\b\d+\s*(mg|mcg|g|ml|tablets?|pills?|units?)\b/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('dosage');
+      } else if (/\b(mild|moderate|severe|sharp|dull|intense|slight|extreme)\b/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('severity');
+      } else if (/\b(active|resolved|chronic|refuted|absent|denied|confirmed)\b/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('status');
+      } else if (/\b(daily|bid|tid|qid|prn|twice|once|every\s+\w+)\b/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('frequency');
+      } else if (/\b(yesterday|days?|weeks?|months?|years?|ago|since|started)\b/i.test(trimmed)) {
+        setAnnotationSupportedAttribute('onset');
+      } else {
+        setAnnotationSupportedAttribute('');
+      }
+    } else {
+      setAnnotationSupportedAttribute('');
+    }
+  }, [pendingAnnotation]);
+
+  // Synchronize selectedCategoryId if activeSchema changes
+  useEffect(() => {
+    if (activeSchema.length > 0 && !activeSchema.some(c => c.id === selectedCategoryId)) {
+      setSelectedCategoryId(activeSchema[0].id);
+    }
+  }, [activeSchema, selectedCategoryId]);
+
+  const selectedCategory = useMemo(() => {
+    return activeSchema.find(c => c.id === selectedCategoryId) || activeSchema[0];
+  }, [activeSchema, selectedCategoryId]);
+
+  const availableCategoryAttributes = useMemo(() => {
+    const attrs = new Set<string>();
+    if (selectedCategory?.attributes) {
+      selectedCategory.attributes.forEach(a => attrs.add(a.name));
+    }
+    ['value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'].forEach(a => attrs.add(a));
+    return Array.from(attrs);
+  }, [selectedCategory]);
+
+  // Reset selectedEntityToMap when category changes
   useEffect(() => {
     setSelectedEntityToMap('__new__');
-  }, [newEntityType]);
+  }, [selectedCategoryId]);
+
+  // Eligible existing entities matching the selected category
+  const eligibleEntitiesForCategory = useMemo(() => {
+    if (!selectedCategory) return entities;
+    return entities.filter(ent => {
+      const entTypeLower = (ent.type || '').toLowerCase();
+      const catIdLower = (selectedCategory.id || '').toLowerCase();
+      const catDisplayNameLower = (selectedCategory.displayName || '').toLowerCase();
+      const catEntityTypeLower = (selectedCategory.entityType || '').toLowerCase();
+
+      return (
+        entTypeLower === catIdLower ||
+        entTypeLower === catDisplayNameLower ||
+        entTypeLower === catEntityTypeLower ||
+        entTypeLower.includes(catEntityTypeLower) ||
+        catEntityTypeLower.includes(entTypeLower)
+      );
+    });
+  }, [entities, selectedCategory]);
 
   // Derive mentions from entities for older sessions or default state
-  const derivedMentions: Mention[] = mentions && mentions.length > 0
-    ? mentions
-    : (entities || [])
-        .filter(ent => ent.textSpan && ent.textSpan.lineIndex >= 0)
-        .map(ent => ({
-          id: `m_${ent.id}`,
-          textSpan: ent.textSpan!,
-          entityType: ent.type,
-          entityId: ent.id
-        }));
+  const derivedMentions: Mention[] = useMemo(() => {
+    if (mentions && mentions.length > 0) {
+      return mentions;
+    }
+    return (entities || [])
+      .filter(ent => ent.textSpan && ent.textSpan.lineIndex >= 0)
+      .map(ent => ({
+        id: `m_${ent.id}`,
+        textSpan: ent.textSpan!,
+        entityType: ent.type,
+        entityId: ent.id
+      }));
+  }, [mentions, entities]);
 
   const enrichedSegments = getSegmentsWithTimestamps(segments);
 
@@ -122,6 +206,13 @@ export default function RawTranscriptView({
     const offsets = getSelectionCharacterOffsetWithin(container);
 
     if (offsets.start >= 0 && offsets.end > offsets.start) {
+      const seg = enrichedSegments[lineIndex];
+      const currentSpeaker = (seg?.speaker || '').toLowerCase();
+      const defaultOpposite = currentSpeaker.includes('doc') || currentSpeaker.includes('dr') || currentSpeaker.includes('physician')
+        ? 'Patient'
+        : 'Doctor';
+      setSplitSpeaker(defaultOpposite);
+      setAnnotationMode('annotate');
       setPendingAnnotation({
         lineIndex,
         startChar: offsets.start,
@@ -140,90 +231,162 @@ export default function RawTranscriptView({
 
     let targetEntityId = selectedEntityToMap;
     let updatedEntities = [...currentEntities];
-    let updatedNotes = { ...notes };
+    let updatedNotes: Record<string, any> = { ...notes };
+
+    const targetCat = selectedCategory || activeSchema[0];
+    const catId = targetCat ? targetCat.id : 'symptoms';
+    const catEntityType = targetCat ? targetCat.entityType : 'Symptom';
+    const primaryAttr = getPrimaryAttribute(targetCat);
 
     if (selectedEntityToMap === '__new__') {
       targetEntityId = `e_user_${Date.now()}`;
+      
+      const newItem: Record<string, any> = { entityId: targetEntityId };
+      if (targetCat && targetCat.attributes && targetCat.attributes.length > 0) {
+        targetCat.attributes.forEach(attr => {
+          if (attr.name === primaryAttr.name || attr.name === 'name' || attr.name === 'task' || attr.name === 'title') {
+            newItem[attr.name] = pendingAnnotation.text;
+          } else if (attr.type === 'select') {
+            const unassignedChoice = attr.choices?.find(c => c.toLowerCase() === 'unassigned');
+            newItem[attr.name] = unassignedChoice || (attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'unassigned');
+          } else if (attr.type === 'boolean') {
+            newItem[attr.name] = false;
+          } else {
+            newItem[attr.name] = attr.name.toLowerCase().includes('status') ? 'unassigned' : '';
+          }
+        });
+      } else {
+        newItem.name = pendingAnnotation.text;
+        newItem.details = 'Selected from dialogue';
+      }
+      newItem[primaryAttr.name] = pendingAnnotation.text;
+      newItem.name = pendingAnnotation.text;
+
+      if (!updatedNotes[catId]) {
+        updatedNotes[catId] = [];
+      }
+      updatedNotes[catId] = [...(updatedNotes[catId] as any[]), newItem];
+
+      const detailsParts = targetCat?.attributes
+        ?.filter(attr => attr.name !== primaryAttr.name && attr.name !== 'name' && attr.name !== 'task' && attr.name !== 'title' && newItem[attr.name])
+        ?.map(attr => `${attr.name}: ${newItem[attr.name]}`)
+        ?.filter(Boolean) || [];
+
+      const targetSeg = enrichedSegments[pendingAnnotation.lineIndex];
+      const wordSpan = calculateGlobalWordSpan(
+        enrichedSegments,
+        pendingAnnotation.lineIndex,
+        pendingAnnotation.startChar,
+        pendingAnnotation.endChar
+      );
+
       const newEntity: Entity = {
         id: targetEntityId,
         name: pendingAnnotation.text,
-        type: newEntityType,
-        description: `${newEntityType} (Annotated manually from dialogue)`,
+        type: catEntityType,
+        description: detailsParts.join(' | ') || `${targetCat?.displayName || catEntityType} (Annotated manually from dialogue)`,
+        textSpan: {
+          lineIndex: pendingAnnotation.lineIndex,
+          startChar: pendingAnnotation.startChar,
+          endChar: pendingAnnotation.endChar,
+          text: pendingAnnotation.text,
+          segmentId: targetSeg?.id,
+          speaker: targetSeg?.speaker,
+          globalStartWord: wordSpan?.globalStartWord,
+          globalEndWord: wordSpan?.globalEndWord
+        }
       };
       updatedEntities.push(newEntity);
-
-      if (newEntityType === 'Symptom') {
-        const newSymptom = {
-          entityId: targetEntityId,
-          name: pendingAnnotation.text,
-          severity: 'Unspecified',
-          onset: 'Unspecified',
-          details: 'Selected from dialogue'
-        };
-        updatedNotes.symptoms = [...(updatedNotes.symptoms || []), newSymptom];
-      } else if (newEntityType === 'Condition') {
-        const newCond = {
-          entityId: targetEntityId,
-          name: pendingAnnotation.text,
-          status: 'Active',
-          details: 'Selected from dialogue'
-        };
-        updatedNotes.conditions = [...(updatedNotes.conditions || []), newCond];
-      } else if (newEntityType === 'Medication') {
-        const newMed = {
-          entityId: targetEntityId,
-          name: pendingAnnotation.text,
-          action: 'Discussed',
-          dosage: 'Unspecified',
-          details: 'Selected from dialogue'
-        };
-        updatedNotes.medications = [...(updatedNotes.medications || []), newMed];
-      } else if (newEntityType === 'FollowUp') {
-        const newFol = {
-          entityId: targetEntityId,
-          task: pendingAnnotation.text,
-          due: 'Unspecified',
-          assignee: 'Patient'
-        };
-        updatedNotes.followUps = [...(updatedNotes.followUps || []), newFol];
-      } else if (newEntityType === 'Measurement') {
-        const newMeas = {
-          entityId: targetEntityId,
-          name: pendingAnnotation.text,
-          value: 'Unspecified',
-          status: 'Stable',
-          details: 'Selected from dialogue'
-        };
-        updatedNotes.measurements = [...(updatedNotes.measurements || []), newMeas];
-      }
     }
+
+    const targetSeg = enrichedSegments[pendingAnnotation.lineIndex];
+    const wordSpan = calculateGlobalWordSpan(
+      enrichedSegments,
+      pendingAnnotation.lineIndex,
+      pendingAnnotation.startChar,
+      pendingAnnotation.endChar
+    );
 
     const newMentionId = `m_user_${Date.now()}`;
     const newMention: Mention = {
       id: newMentionId,
+      segmentId: targetSeg?.id,
+      globalStartWord: wordSpan?.globalStartWord,
+      globalEndWord: wordSpan?.globalEndWord,
       textSpan: {
         lineIndex: pendingAnnotation.lineIndex,
         startChar: pendingAnnotation.startChar,
         endChar: pendingAnnotation.endChar,
-        text: pendingAnnotation.text
+        text: pendingAnnotation.text,
+        segmentId: targetSeg?.id,
+        speaker: targetSeg?.speaker,
+        globalStartWord: wordSpan?.globalStartWord,
+        globalEndWord: wordSpan?.globalEndWord
       },
-      entityType: newEntityType,
-      entityId: targetEntityId
+      speaker: targetSeg?.speaker || 'unassigned',
+      entityType: catEntityType,
+      entityId: targetEntityId,
+      polarity: 'unassigned',
+      certainty: 'unassigned',
+      temporality: 'unassigned',
+      experiencer: 'unassigned',
+      function: 'unassigned',
+      supportedAttribute: annotationSupportedAttribute.trim() || undefined
     };
 
     const updatedMentions = [...currentMentions, newMention];
 
-    onUpdateNotes(updatedNotes, updatedEntities, undefined, updatedMentions);
+    // Explicitly flag to NEVER auto-scroll away to older mentions when adding a mention
+    skipAutoScrollRef.current = true;
+
+    onUpdateNotes(updatedNotes as ClinicalCategory, updatedEntities, undefined, updatedMentions);
     setPendingAnnotation(null);
+    setAnnotationSupportedAttribute('');
     setSelectedEntityToMap('__new__');
+    if (onSelectMention) {
+      onSelectMention(newMentionId);
+    }
     if (onSelectEntity && targetEntityId) {
       onSelectEntity(targetEntityId);
     }
   };
 
-  // Auto-scroll to highlighted segment or specific mention when selections change
+  const skipAutoScrollRef = useRef<boolean>(false);
+  const prevSelectionRef = useRef<{ entityId: string | null; mentionId: string | null }>({
+    entityId: null,
+    mentionId: null
+  });
+
+  // Auto-scroll to highlighted segment or specific mention ONLY when selections explicitly change
   useEffect(() => {
     if (!containerRef.current) return;
+
+    // If a mention was just added by the user, do NOT scroll away to older mentions!
+    if (skipAutoScrollRef.current) {
+      skipAutoScrollRef.current = false;
+      prevSelectionRef.current = {
+        entityId: selectedEntityId,
+        mentionId: selectedMentionId
+      };
+      return;
+    }
+
+    const selectionChanged =
+      prevSelectionRef.current.entityId !== selectedEntityId ||
+      prevSelectionRef.current.mentionId !== selectedMentionId;
+
+    prevSelectionRef.current = {
+      entityId: selectedEntityId,
+      mentionId: selectedMentionId
+    };
+
+    // If selection did not change or no selection is active, or if user is interacting with an input / textarea, do NOT scroll
+    if (!selectionChanged || (!selectedMentionId && !selectedEntityId)) return;
+
+    const activeEl = document.activeElement;
+    if (activeEl && (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
+      return;
+    }
 
     if (selectedMentionId) {
       const element = containerRef.current.querySelector(`#mention-${selectedMentionId}`);
@@ -247,12 +410,24 @@ export default function RawTranscriptView({
         }
       }
     } else if (selectedEntityId) {
-      const firstMention = derivedMentions.find(m => m.entityId === selectedEntityId);
-      if (firstMention && firstMention.textSpan && firstMention.textSpan.lineIndex >= 0) {
-        const lineIdx = firstMention.textSpan.lineIndex;
-        const element = containerRef.current.querySelector(`[data-segment-idx="${lineIdx}"]`);
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      // If any mention for this entity is already in view, do NOT jump/scroll
+      const entityMentions = derivedMentions.filter(m => m.entityId === selectedEntityId);
+      const isAnyMentionVisible = entityMentions.some(m => {
+        const el = containerRef.current?.querySelector(`#mention-${m.id}`) as HTMLElement | null;
+        if (!el || !containerRef.current) return false;
+        const elRect = el.getBoundingClientRect();
+        const contRect = containerRef.current.getBoundingClientRect();
+        return elRect.top >= contRect.top && elRect.bottom <= contRect.bottom;
+      });
+
+      if (!isAnyMentionVisible) {
+        const firstMention = entityMentions[0];
+        if (firstMention && firstMention.textSpan && firstMention.textSpan.lineIndex >= 0) {
+          const lineIdx = firstMention.textSpan.lineIndex;
+          const element = containerRef.current.querySelector(`[data-segment-idx="${lineIdx}"]`);
+          if (element) {
+            element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
         }
       }
     }
@@ -280,20 +455,29 @@ export default function RawTranscriptView({
   };
 
   const getEntityTypeColor = (type: string) => {
-    switch (type) {
-      case 'Symptom':
-        return 'bg-amber-50 text-amber-800 border-amber-200';
-      case 'Condition':
-        return 'bg-orange-50 text-orange-800 border-orange-200';
-      case 'Medication':
-        return 'bg-emerald-50 text-emerald-800 border-emerald-200';
-      case 'Dosage':
-        return 'bg-sky-50 text-sky-800 border-sky-200';
-      case 'FollowUp':
-        return 'bg-purple-50 text-purple-800 border-purple-200';
-      default:
-        return 'bg-slate-50 text-slate-700 border-slate-200';
+    const t = (type || '').toLowerCase();
+    if (t.includes('social') || t.includes('lifestyle') || t.includes('habit')) {
+      return 'bg-lime-50 text-lime-800 border-lime-200';
     }
+    if (t.includes('symptom') || t.includes('allergy')) {
+      return 'bg-amber-50 text-amber-800 border-amber-200';
+    }
+    if (t.includes('condition') || t.includes('disease') || t.includes('disorder')) {
+      return 'bg-orange-50 text-orange-800 border-orange-200';
+    }
+    if (t.includes('medication') || t.includes('drug') || t.includes('treatment') || t.includes('statement')) {
+      return 'bg-emerald-50 text-emerald-800 border-emerald-200';
+    }
+    if (t.includes('dosage')) {
+      return 'bg-sky-50 text-sky-800 border-sky-200';
+    }
+    if (t.includes('follow') || t.includes('task') || t.includes('plan') || t.includes('procedure') || t.includes('servicerequest') || t.includes('request')) {
+      return 'bg-purple-50 text-purple-800 border-purple-200';
+    }
+    if (t.includes('meas') || t.includes('lab') || t.includes('vital') || t.includes('observation') || t.includes('diagnostic')) {
+      return 'bg-teal-50 text-teal-800 border-teal-200';
+    }
+    return 'bg-blue-50 text-blue-800 border-blue-200';
   };
 
   const findClosestOccurrence = (text: string, term: string, targetIndex: number) => {
@@ -319,14 +503,33 @@ export default function RawTranscriptView({
     return { start: targetIndex, end: targetIndex + term.length };
   };
 
-  const renderSegmentText = (segText: string, segIdx: number) => {
+  const renderSegmentText = (segText: string, segIdx: number, segId?: string) => {
     if (derivedMentions.length === 0) return segText;
 
-    // Filter and realign mentions belonging to this segment index
-    const segMentions = derivedMentions.filter(m => 
-      m.textSpan && 
-      m.textSpan.lineIndex === segIdx
-    ).map(m => {
+    // Filter and realign mentions belonging to this segment:
+    // Match by segmentId OR lineIndex (with verification that text belongs here)
+    const segMentions = derivedMentions.filter(m => {
+      if (!m.textSpan) return false;
+      // 1. Direct segmentId match
+      if (segId && (m.segmentId === segId || m.textSpan.segmentId === segId)) {
+        return true;
+      }
+      // 2. Direct line index match IF the segment text actually contains the span text
+      if (m.textSpan.lineIndex === segIdx) {
+        if (!m.textSpan.text || segText.toLowerCase().includes(m.textSpan.text.toLowerCase())) {
+          return true;
+        }
+      }
+      // 3. Resilient fallback: If this segment contains m.textSpan.text, but m's assigned lineIndex points to a segment that does not have it
+      if (m.textSpan.text && segText.toLowerCase().includes(m.textSpan.text.toLowerCase())) {
+        const assignedIdx = m.textSpan.lineIndex;
+        const assignedSeg = segments && assignedIdx >= 0 && assignedIdx < segments.length ? segments[assignedIdx] : null;
+        if (!assignedSeg || !assignedSeg.text.toLowerCase().includes(m.textSpan.text.toLowerCase())) {
+          return true;
+        }
+      }
+      return false;
+    }).map(m => {
       const span = m.textSpan!;
       let startChar = span.startChar;
       let endChar = span.endChar;
@@ -334,8 +537,10 @@ export default function RawTranscriptView({
       // If text is provided, find the closest case-insensitive match to align offsets perfectly
       if (span.text && span.text.trim().length > 0) {
         const aligned = findClosestOccurrence(segText, span.text, span.startChar);
-        startChar = aligned.start;
-        endChar = aligned.end;
+        if (aligned.start >= 0) {
+          startChar = aligned.start;
+          endChar = aligned.end;
+        }
       }
 
       return {
@@ -424,6 +629,13 @@ export default function RawTranscriptView({
     return elements;
   };
 
+  const activeSelectedMention = selectedMentionId
+    ? derivedMentions.find(m => m.id === selectedMentionId)
+    : null;
+  const activeSelectedMentionEntity = activeSelectedMention
+    ? entities.find(e => e.id === activeSelectedMention.entityId)
+    : null;
+
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm flex flex-col h-[calc(100vh-200px)] max-h-[calc(100vh-8rem)] min-h-[400px]">
       <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100 shrink-0">
@@ -443,89 +655,359 @@ export default function RawTranscriptView({
         </div>
       </div>
 
-      {pendingAnnotation && (
-        <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4 shadow-sm animate-fadeIn shrink-0">
-          <div className="flex items-center justify-between pb-2 border-b border-blue-100">
-            <span className="text-[11px] font-bold text-blue-800 uppercase tracking-wider font-mono flex items-center gap-1">
-              <Sparkles className="w-3.5 h-3.5 text-blue-600 animate-pulse" />
-              New Entity Annotation
+      {activeSelectedMention && !pendingAnnotation && (
+        <div className="bg-indigo-50/90 border border-indigo-200/90 rounded-xl p-2.5 mb-4 shadow-xs flex items-center justify-between gap-3 animate-fadeIn shrink-0">
+          <div className="flex items-center gap-2 min-w-0 flex-wrap">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-700 font-mono flex items-center gap-1 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+              Selected Mention:
             </span>
+            <span className="text-xs font-semibold italic text-slate-800 bg-white px-2 py-0.5 rounded border border-indigo-100 shadow-xs truncate max-w-[200px]" title={activeSelectedMention.textSpan?.text}>
+              "{activeSelectedMention.textSpan?.text}"
+            </span>
+            <span className="text-[9px] bg-indigo-100 text-indigo-800 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+              {encounterType === 'note' ? `Section ${(activeSelectedMention.textSpan?.lineIndex ?? 0) + 1}` : `U-${activeSelectedMention.textSpan?.lineIndex}`}
+            </span>
+            {(activeSelectedMention.globalStartWord !== undefined || activeSelectedMention.textSpan?.globalStartWord !== undefined) && (
+              <span className="text-[9px] bg-slate-200/80 text-slate-700 px-1.5 py-0.5 rounded font-mono font-medium shrink-0" title="Global word count offset across text stream (invariant to utterance splits & speaker changes)">
+                Word W{activeSelectedMention.globalStartWord ?? activeSelectedMention.textSpan?.globalStartWord}{(activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord) !== undefined && (activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord) !== (activeSelectedMention.globalStartWord ?? activeSelectedMention.textSpan?.globalStartWord) ? `–W${activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord}` : ''}
+              </span>
+            )}
+            {activeSelectedMention.canonicalName && (
+              <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded font-medium shrink-0" title="Canonical Concept (EN)">
+                EN: <strong>{activeSelectedMention.canonicalName}</strong>
+              </span>
+            )}
+            {activeSelectedMention.supportedAttribute && (
+              <span className="text-[9px] bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded font-mono font-bold shrink-0" title="Supported Entity Attribute">
+                attr: {activeSelectedMention.supportedAttribute}
+              </span>
+            )}
+            {activeSelectedMention.polarity && (
+              <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-medium shrink-0 border ${
+                activeSelectedMention.polarity === 'negative'
+                  ? 'bg-rose-50 text-rose-700 border-rose-200'
+                  : 'bg-slate-50 text-slate-600 border-slate-200'
+              }`}>
+                {activeSelectedMention.polarity}
+              </span>
+            )}
+            {activeSelectedMention.temporality && (
+              <span className="text-[9px] bg-slate-50 text-slate-600 border border-slate-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                {activeSelectedMention.temporality}
+              </span>
+            )}
+            {activeSelectedMention.certainty && activeSelectedMention.certainty !== 'certain' && (
+              <span className="text-[9px] bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                {activeSelectedMention.certainty}
+              </span>
+            )}
+            {activeSelectedMention.experiencer && activeSelectedMention.experiencer !== 'patient' && (
+              <span className="text-[9px] bg-purple-50 text-purple-700 border border-purple-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                exp: {activeSelectedMention.experiencer}
+              </span>
+            )}
+            {activeSelectedMention.function && activeSelectedMention.function !== 'asserted' && (
+              <span className="text-[9px] bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                fn: {activeSelectedMention.function}
+              </span>
+            )}
+            {activeSelectedMentionEntity && (
+              <span className="text-[10px] text-slate-600 font-medium truncate max-w-[200px]">
+                Mapped to: <strong className="text-slate-900">{activeSelectedMentionEntity.name}</strong> ({activeSelectedMention.entityType || activeSelectedMentionEntity.type})
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {onUpdateNotes && (
+              <button
+                type="button"
+                onClick={() => {
+                  const updatedMentions = (mentions || []).filter(m => m.id !== activeSelectedMention.id);
+                  if (onSelectMention) onSelectMention(null);
+                  const notes = clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] };
+                  onUpdateNotes(notes, entities, undefined, updatedMentions);
+                }}
+                className="flex items-center gap-1 text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer shadow-xs"
+                title="Delete this mention highlight from text (keeps entity in clinical notes)"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                <span>Delete Mention</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (onSelectMention) onSelectMention(null);
+              }}
+              className="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-200/60 rounded-lg transition-colors cursor-pointer"
+              title="Deselect mention"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pendingAnnotation && (
+        <div className="bg-blue-50/90 border border-blue-200 rounded-xl p-3 mb-4 shadow-md animate-fadeIn shrink-0">
+          <div className="flex items-center justify-between pb-2 border-b border-blue-100">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setAnnotationMode('annotate')}
+                className={`px-2.5 py-1 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  annotationMode === 'annotate'
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-blue-100/60'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Annotate Entity</span>
+              </button>
+
+              {onSplitUtterance && encounterType !== 'note' && (
+                <button
+                  type="button"
+                  onClick={() => setAnnotationMode('split')}
+                  className={`px-2.5 py-1 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    annotationMode === 'split'
+                      ? 'bg-indigo-600 text-white shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-blue-100/60'
+                  }`}
+                >
+                  <Scissors className="w-3.5 h-3.5" />
+                  <span>Split Utterance at Selection</span>
+                </button>
+              )}
+            </div>
+
             <button
               onClick={() => setPendingAnnotation(null)}
-              className="text-slate-400 hover:text-slate-600 cursor-pointer font-bold"
+              className="text-slate-400 hover:text-slate-600 cursor-pointer font-bold p-1"
             >
               <X className="w-4 h-4" />
             </button>
           </div>
 
-          <div className="mt-2.5 space-y-2.5">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div>
-                <span className="text-[9px] font-bold text-slate-400 uppercase font-mono">Selected Span</span>
-                <div className="mt-1 p-2 bg-white border border-slate-200 rounded-lg text-xs font-semibold text-slate-800 italic truncate" title={pendingAnnotation.text}>
-                  "{pendingAnnotation.text}"
+          {annotationMode === 'annotate' ? (
+            <div className="mt-2.5 space-y-2.5">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <span className="text-[9px] font-bold text-slate-400 uppercase font-mono">Selected Span</span>
+                  <div className="mt-1 p-2 bg-white border border-slate-200 rounded-lg text-xs font-semibold text-slate-800 italic truncate" title={pendingAnnotation.text}>
+                    "{pendingAnnotation.text}"
+                  </div>
+                  <div className="mt-0.5 text-[8px] text-slate-400 font-mono">
+                    Utterance U-{pendingAnnotation.lineIndex}, chars {pendingAnnotation.startChar}-{pendingAnnotation.endChar}
+                  </div>
                 </div>
-                <div className="mt-0.5 text-[8px] text-slate-400 font-mono">
-                  Utterance U-{pendingAnnotation.lineIndex}, chars {pendingAnnotation.startChar}-{pendingAnnotation.endChar}
+
+                <div>
+                  <label className="text-[9px] font-bold text-slate-400 uppercase font-mono">Annotation Schema Category</label>
+                  <select
+                    value={selectedCategoryId}
+                    onChange={(e) => {
+                      setSelectedCategoryId(e.target.value);
+                      setSelectedEntityToMap('__new__');
+                    }}
+                    className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 mt-1 bg-white font-medium text-slate-800"
+                  >
+                    {activeSchema.map(cat => (
+                      <option key={cat.id} value={cat.id}>
+                        {cat.displayName} ({cat.entityType})
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
-              <div>
-                <label className="text-[9px] font-bold text-slate-400 uppercase font-mono">Entity Type</label>
+              {/* Clinical Concept Mapping dropdown */}
+              <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-lg space-y-1.5">
+                <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block">Clinical Concept Mapping</label>
                 <select
-                  value={newEntityType}
-                  onChange={(e) => setNewEntityType(e.target.value as EntityType)}
-                  className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 mt-1 bg-white font-medium"
+                  value={selectedEntityToMap}
+                  onChange={(e) => setSelectedEntityToMap(e.target.value)}
+                  className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium text-slate-800"
                 >
-                  <option value="Symptom">Symptom</option>
-                  <option value="Condition">Condition</option>
-                  <option value="Medication">Medication</option>
-                  <option value="Dosage">Dosage</option>
-                  <option value="FollowUp">Follow-up Task</option>
-                  <option value="Measurement">Measurement</option>
-                  <option value="Other">Other</option>
+                  <option value="__new__">🆕 Create new {selectedCategory?.displayName || 'entity'}: "{pendingAnnotation.text}"</option>
+                  {eligibleEntitiesForCategory.map(ent => (
+                    <option key={ent.id} value={ent.id}>
+                      🔗 Link to existing {selectedCategory?.displayName || ent.type}: {ent.name}
+                    </option>
+                  ))}
                 </select>
+                <p className="text-[9px] text-slate-400 leading-normal">
+                  {selectedEntityToMap === '__new__' 
+                    ? `This will add a new entry to the ${selectedCategory?.displayName || 'clinical'} schema category and register a new canonical entity.`
+                    : "This will add a new occurrence (highlight) of this term in the text, but map it to the same row in your clinical notes, avoiding duplicates."}
+                </p>
+              </div>
+
+              {/* Supported Entity Attribute Input */}
+              <div className="bg-white border border-slate-200 p-2.5 rounded-lg space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-[9px] font-bold text-slate-500 uppercase font-mono">
+                    Supported Attribute <span className="font-normal text-slate-400 lowercase">(optional)</span>
+                  </label>
+                  {annotationSupportedAttribute && (
+                    <button
+                      type="button"
+                      onClick={() => setAnnotationSupportedAttribute('')}
+                      className="text-[9px] text-rose-500 hover:text-rose-700 font-semibold cursor-pointer"
+                      title="Clear supported attribute"
+                    >
+                      Clear attribute
+                    </button>
+                  )}
+                </div>
+
+                {/* Quick attribute suggestion buttons */}
+                <div className="flex flex-wrap gap-1 items-center">
+                  <span className="text-[9px] text-slate-400 font-medium">Quick select:</span>
+                  {['value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'].map(attr => (
+                    <button
+                      key={attr}
+                      type="button"
+                      onClick={() => setAnnotationSupportedAttribute(attr)}
+                      className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-medium border transition-colors cursor-pointer ${
+                        annotationSupportedAttribute.toLowerCase() === attr
+                          ? 'bg-violet-600 text-white border-violet-600 shadow-xs'
+                          : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                      }`}
+                    >
+                      {attr}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <select
+                    value={availableCategoryAttributes.includes(annotationSupportedAttribute) ? annotationSupportedAttribute : (annotationSupportedAttribute ? '__custom__' : '')}
+                    onChange={(e) => {
+                      if (e.target.value === '__custom__') return;
+                      setAnnotationSupportedAttribute(e.target.value);
+                    }}
+                    className="text-xs border border-slate-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium text-slate-800 flex-1"
+                  >
+                    <option value="">-- None / Primary Concept --</option>
+                    {availableCategoryAttributes.map(attr => (
+                      <option key={attr} value={attr}>
+                        Supports attribute: {attr.toUpperCase()}
+                      </option>
+                    ))}
+                    {annotationSupportedAttribute && !availableCategoryAttributes.includes(annotationSupportedAttribute) && (
+                      <option value="__custom__">Custom: {annotationSupportedAttribute}</option>
+                    )}
+                  </select>
+                  <input
+                    type="text"
+                    value={annotationSupportedAttribute}
+                    onChange={(e) => setAnnotationSupportedAttribute(e.target.value)}
+                    placeholder="or type attribute..."
+                    className="text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 font-medium text-slate-800 placeholder:text-slate-300 w-36"
+                  />
+                </div>
+
+                <p className="text-[9px] text-slate-400 leading-tight">
+                  Specifies which entity attribute this mention grounds (e.g. mention "145" supports <strong>VALUE</strong>, "moderate" supports <strong>SEVERITY</strong>, "20mg" supports <strong>DOSAGE</strong>).
+                </p>
+              </div>
+
+              <div className="flex justify-end gap-1.5 border-t border-blue-100/50 pt-2.5">
+                <button
+                  onClick={() => setPendingAnnotation(null)}
+                  className="px-2.5 py-1 text-xs font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleCreateEntityFromSpan}
+                  className="px-3.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Create Entity</span>
+                </button>
               </div>
             </div>
-
-            {/* Clinical Concept Mapping dropdown */}
-            <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-lg space-y-1.5">
-              <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block">Clinical Concept Mapping</label>
-              <select
-                value={selectedEntityToMap}
-                onChange={(e) => setSelectedEntityToMap(e.target.value)}
-                className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium"
-              >
-                <option value="__new__">🆕 Create brand new clinical entity: "{pendingAnnotation.text}"</option>
-                {entities.filter(ent => ent.type === newEntityType).map(ent => (
-                  <option key={ent.id} value={ent.id}>
-                    🔗 Link to existing {ent.type}: {ent.name}
-                  </option>
-                ))}
-              </select>
-              <p className="text-[9px] text-slate-400 leading-normal">
-                {selectedEntityToMap === '__new__' 
-                  ? "This will add a new entry to the clinical tables and register a new canonical entity."
-                  : "This will add a new occurrence (highlight) of this term in the text, but map it to the same row in your clinical notes, avoiding duplicates."}
+          ) : (
+            /* Utterance Splitting Mode */
+            <div className="mt-2.5 space-y-2.5">
+              <p className="text-xs text-slate-700">
+                Split utterance <span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded">U-{pendingAnnotation.lineIndex}</span> into two separate speaker turns right at this cursor position:
               </p>
-            </div>
 
-            <div className="flex justify-end gap-1.5 border-t border-blue-100/50 pt-2.5">
-              <button
-                onClick={() => setPendingAnnotation(null)}
-                className="px-2.5 py-1 text-xs font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleCreateEntityFromSpan}
-                className="px-3.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Create Entity</span>
-              </button>
+              {(() => {
+                const targetSeg = enrichedSegments[pendingAnnotation.lineIndex];
+                const fullText = targetSeg?.text || '';
+                const turn1Text = fullText.substring(0, pendingAnnotation.startChar).trim();
+                const turn2Text = fullText.substring(pendingAnnotation.startChar).trim();
+
+                return (
+                  <div className="space-y-2 text-xs">
+                    <div className="bg-white border border-slate-200 rounded-lg p-2.5">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase font-mono block mb-1">
+                        Turn 1 · {targetSeg?.speaker || 'Speaker'} (Unchanged)
+                      </span>
+                      <p className="font-mono text-slate-700 text-[11px] leading-relaxed break-words bg-slate-50 p-2 rounded">
+                        {turn1Text || <span className="italic text-slate-400">(empty)</span>}
+                      </p>
+                    </div>
+
+                    <div className="bg-white border border-indigo-200 rounded-lg p-2.5">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] font-bold text-indigo-600 uppercase font-mono">
+                          Turn 2 · New Utterance Speaker
+                        </span>
+                        <select
+                          value={splitSpeaker}
+                          onChange={(e) => setSplitSpeaker(e.target.value)}
+                          className="text-xs font-semibold bg-indigo-50 border border-indigo-200 text-indigo-800 rounded px-2 py-0.5 focus:ring-2 focus:ring-indigo-400"
+                        >
+                          <option value="Patient">Patient</option>
+                          <option value="Doctor">Doctor</option>
+                          <option value="Clinician">Clinician</option>
+                          <option value="Nurse">Nurse</option>
+                          <option value="Other">Other</option>
+                        </select>
+                      </div>
+                      <p className="font-mono text-slate-700 text-[11px] leading-relaxed break-words bg-indigo-50/40 p-2 rounded border border-indigo-100">
+                        {turn2Text || <span className="italic text-slate-400">(empty)</span>}
+                      </p>
+                    </div>
+
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-2 text-[11px] text-emerald-800 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span>
+                        Mentions inside both turns will be strictly preserved and assigned to the correct utterance & speaker!
+                      </span>
+                    </div>
+
+                    <div className="flex justify-end gap-1.5 border-t border-blue-100/50 pt-2">
+                      <button
+                        onClick={() => setPendingAnnotation(null)}
+                        className="px-2.5 py-1 text-xs font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (onSplitUtterance) {
+                            onSplitUtterance(pendingAnnotation.lineIndex, pendingAnnotation.startChar, splitSpeaker);
+                          }
+                          setPendingAnnotation(null);
+                        }}
+                        className="px-3.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Scissors className="w-3.5 h-3.5" />
+                        <span>Confirm & Split Utterance</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
-          </div>
+          )}
         </div>
       )}
 
@@ -573,7 +1055,7 @@ export default function RawTranscriptView({
                   className="text-[13px] leading-relaxed text-slate-750 select-text cursor-text font-serif"
                   onMouseUp={(e) => handleTextSelection(e, idx)}
                 >
-                  {renderSegmentText(seg.text, idx)}
+                  {renderSegmentText(seg.text, idx, seg.id)}
                 </div>
               </div>
             );
@@ -591,7 +1073,23 @@ export default function RawTranscriptView({
             >
               <div className="shrink-0 w-24 text-[10px] font-bold mt-1 uppercase tracking-wider select-none">
                 <div className="flex flex-col gap-1">
-                  <span className={speakerColor}>[{seg.speaker}]</span>
+                  {onChangeSpeaker ? (
+                    <div className="flex items-center gap-1 group relative">
+                      <select
+                        value={seg.speaker}
+                        onChange={(e) => onChangeSpeaker(idx, e.target.value)}
+                        className={`text-[10px] font-bold uppercase rounded px-1 py-0.5 border border-slate-200 hover:border-blue-300 bg-white/90 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-400 cursor-pointer ${speakerColor}`}
+                        title="Click to switch speaker for this utterance"
+                      >
+                        <option value={seg.speaker}>{seg.speaker}</option>
+                        {['Doctor', 'Patient', 'Clinician', 'Nurse', 'Other'].filter(s => s.toLowerCase() !== seg.speaker.toLowerCase()).map(s => (
+                          <option key={s} value={s}>{s}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <span className={speakerColor}>[{seg.speaker}]</span>
+                  )}
                   <span className="inline-block text-[9px] bg-slate-100 text-slate-600 px-1 py-0.5 rounded font-mono w-fit mt-0.5" title={`Utterance ID: U-${idx} (lineIndex in annotation JSON)`}>
                     U-{idx}
                   </span>
@@ -604,7 +1102,7 @@ export default function RawTranscriptView({
                 className="flex-1 text-xs leading-relaxed text-slate-700 select-text cursor-text"
                 onMouseUp={(e) => handleTextSelection(e, idx)}
               >
-                {renderSegmentText(seg.text, idx)}
+                {renderSegmentText(seg.text, idx, seg.id)}
               </div>
             </div>
           );

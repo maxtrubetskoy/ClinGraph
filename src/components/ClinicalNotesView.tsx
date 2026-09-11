@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from '../types';
-import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers, Syringe, Users, ClipboardCheck } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
+import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers, Syringe, Users, ClipboardCheck, FileCode, HeartHandshake } from 'lucide-react';
+import ExportJsonlModal from './ExportJsonlModal';
 
 interface ClinicalNotesViewProps {
   clinicalNotes?: ClinicalCategory;
@@ -18,110 +19,163 @@ interface ClinicalNotesViewProps {
   encounterType?: 'dialogue' | 'note';
 }
 
+export function getCategoryForEntity(ent: Entity, activeSchema: AnnotationCategory[]): AnnotationCategory | null {
+  if (!ent || !ent.type) return null;
+  const typeLower = (ent.type || '').toLowerCase().trim();
+  const nameLower = (ent.name || '').toLowerCase().trim();
+
+  // 0. Speaker / Meta roles are NEVER clinical categories
+  const speakerRoles = ['patient', 'patiënt', 'doctor', 'dokter', 'arts', 'huisarts', 'specialist', 'behandelaar', 'zorgverlener', 'verpleegkundige', 'assistent', 'mevrouw', 'meneer', 'dhr', 'mw', 'person', 'persoon'];
+  if (speakerRoles.includes(nameLower) || speakerRoles.includes(typeLower) || typeLower === 'person' || typeLower === 'other') {
+    return null;
+  }
+
+  // 1. Direct match by category ID (e.g. ent.type === "fhir_conditions" or "conditions")
+  const directCat = activeSchema.find(c => c.id.toLowerCase() === typeLower);
+  if (directCat) {
+    return directCat;
+  }
+
+  // 2. Normalized match by category ID (without fhir_ or trailing s)
+  const normType = typeLower.replace(/^fhir_/, '').replace(/s$/, '');
+  const normCat = activeSchema.find(c => {
+    const cNorm = c.id.toLowerCase().replace(/^fhir_/, '').replace(/s$/, '');
+    return cNorm === normType;
+  });
+  if (normCat) {
+    return normCat;
+  }
+
+  // 2b. Check if entity type or name indicates social history / lifestyle status
+  const isSocialEntity = typeLower.includes('social') || typeLower.includes('lifestyle') || typeLower.includes('habit') ||
+    nameLower.includes('smoke') || nameLower.includes('smoking') || nameLower.includes('tobacco') || nameLower.includes('cigarette') ||
+    nameLower.includes('rook') || nameLower.includes('roken') || nameLower.includes('vape') || nameLower.includes('vaping') ||
+    nameLower.includes('alcohol') || nameLower.includes('drink') || nameLower.includes('drank') || nameLower.includes('substance') ||
+    nameLower.includes('drug') || nameLower.includes('employment') || nameLower.includes('occupation') || nameLower.includes('living') ||
+    nameLower.includes('woonsituatie') || nameLower.includes('beroep');
+
+  if (isSocialEntity) {
+    const socialCat = activeSchema.find(c => c.id.toLowerCase().includes('social') || (c.displayName || '').toLowerCase().includes('social'));
+    if (socialCat) {
+      return socialCat;
+    }
+  }
+
+  // 3. Match by entityType (e.g. Condition, MedicationStatement, Immunization, Procedure, etc.)
+  const entityTypeMatches = activeSchema.filter(c => {
+    const cTypeNorm = (c.entityType || '').toLowerCase().replace(/^fhir_/, '').replace(/s$/, '');
+    return cTypeNorm === normType || (c.entityType || '').toLowerCase() === typeLower;
+  });
+  if (entityTypeMatches.length === 1) {
+    return entityTypeMatches[0];
+  } else if (entityTypeMatches.length > 1) {
+    if (typeLower === 'observation' || normType === 'observation') {
+      if (isSocialEntity) {
+        const socialCat = entityTypeMatches.find(c => c.id.toLowerCase().includes('social') || (c.displayName || '').toLowerCase().includes('social'));
+        if (socialCat) return socialCat;
+      }
+      const measCat = entityTypeMatches.find(c => c.id.toLowerCase().includes('observ') || c.id.toLowerCase().includes('meas'));
+      if (measCat) return measCat;
+    }
+    const condCat = activeSchema.find(c => (c.id.toLowerCase().includes('condition') && !c.id.toLowerCase().includes('family')) || ((c.entityType || '').toLowerCase().includes('condition') && !(c.entityType || '').toLowerCase().includes('family')));
+    if (condCat && entityTypeMatches.some(c => c.id === condCat.id)) return condCat;
+    return entityTypeMatches[0];
+  }
+
+  return null;
+}
+
 function shouldEntityGoToCategory(ent: Entity, cat: AnnotationCategory, activeSchema: AnnotationCategory[]): boolean {
-  if (!ent || !ent.type || !cat) return false;
-  const entType = (ent.type || '').trim();
-  const entTypeLower = entType.toLowerCase();
-
-  const catIdLower = (cat.id || '').toLowerCase();
-  const catDisplayNameLower = (cat.displayName || '').toLowerCase();
-  const catEntityTypeLower = (cat.entityType || '').toLowerCase();
-
-  // 1. Direct match on Category ID, Display Name, or EntityType
-  if (entTypeLower === catIdLower || entTypeLower === catDisplayNameLower || entTypeLower === catEntityTypeLower) {
-    // If another category in activeSchema matches ent.type exact ID, prefer that exact ID match
-    const exactOtherCat = activeSchema.find(c => c.id.toLowerCase() === entTypeLower && c.id.toLowerCase() !== catIdLower);
-    if (exactOtherCat) {
-      return false;
-    }
-    return true;
-  }
-
-  // 2. Normalized matching (ignoring fhir_ prefix, plural 's')
-  const normEntType = entTypeLower.replace(/^fhir_/, '').replace(/s$/, '');
-  const normCatId = catIdLower.replace(/^fhir_/, '').replace(/s$/, '');
-  const normCatDisplayName = catDisplayNameLower.replace(/^fhir_/, '').replace(/s$/, '');
-  const normCatEntityType = catEntityTypeLower.replace(/^fhir_/, '').replace(/s$/, '');
-
-  if (normEntType === normCatId || normEntType === normCatDisplayName || normEntType === normCatEntityType) {
-    const exactOtherCat = activeSchema.find(c => {
-      const cNormId = c.id.toLowerCase().replace(/^fhir_/, '').replace(/s$/, '');
-      return cNormId === normEntType && c.id.toLowerCase() !== catIdLower;
-    });
-    if (exactOtherCat) {
-      return false;
-    }
-    return true;
-  }
-
-  // 3. Sub-category disambiguation when multiple categories share entityType
-  if (catEntityTypeLower && (entTypeLower.includes(normCatEntityType) || normEntType.includes(normCatEntityType))) {
-    const name = (ent.name || '').toLowerCase();
-    const desc = (ent.description || '').toLowerCase();
-
-    // Procedures vs Service Requests
-    if (catIdLower.includes('procedure') || normCatId === 'procedure') {
-      const isProcedure = entTypeLower.includes('procedure') || name.includes('procedure') || name.includes('surgery') || name.includes('operatie') || name.includes('scan') || name.includes('mri');
-      if (isProcedure) return true;
-    } else if (catIdLower.includes('servicerequest') || catIdLower.includes('followup') || catIdLower.includes('request')) {
-      const isProcedure = entTypeLower.includes('procedure') || name.includes('procedure') || name.includes('surgery') || name.includes('operatie') || name.includes('scan') || name.includes('mri');
-      if (!isProcedure) return true;
-    }
-
-    // Allergies vs Symptoms
-    if (catIdLower.includes('allergy') || catIdLower.includes('intolerance')) {
-      const isAllergy = entTypeLower.includes('allergy') || name.includes('allergy') || name.includes('allergie') || name.includes('intoleran') || desc.includes('allergy');
-      if (isAllergy) return true;
-    } else if (catIdLower.includes('symptom')) {
-      const isAllergy = entTypeLower.includes('allergy') || name.includes('allergy') || name.includes('allergie') || name.includes('intoleran') || desc.includes('allergy');
-      if (!isAllergy) return true;
-    }
-
-    // Family History vs Conditions
-    if (catIdLower.includes('family') || catIdLower.includes('history')) {
-      const isFamily = entTypeLower.includes('family') || name.includes('vader') || name.includes('moeder') || name.includes('father') || name.includes('mother') || name.includes('sibling') || name.includes('family');
-      if (isFamily) return true;
-    } else if (catIdLower.includes('condition')) {
-      const isFamily = entTypeLower.includes('family') || name.includes('vader') || name.includes('moeder') || name.includes('father') || name.includes('mother') || name.includes('sibling') || name.includes('family');
-      if (!isFamily) return true;
-    }
-
-    // Diagnostic Reports vs Observations
-    if (catIdLower.includes('report') || catIdLower.includes('diagnostic')) {
-      const isReport = entTypeLower.includes('report') || name.includes('report') || name.includes('panel') || name.includes('verslag') || name.includes('cbc');
-      if (isReport) return true;
-    } else if (catIdLower.includes('observation') || catIdLower.includes('measurement')) {
-      const isReport = entTypeLower.includes('report') || name.includes('report') || name.includes('panel') || name.includes('verslag') || name.includes('cbc');
-      if (!isReport) return true;
-    }
-  }
-
-  return false;
+  if (!ent || !cat) return false;
+  const targetCat = getCategoryForEntity(ent, activeSchema);
+  return targetCat?.id === cat.id;
 }
 
 function isSupportEntity(ent: Entity, activeSchema: AnnotationCategory[]): boolean {
   if (!ent || !ent.type) return false;
+  return getCategoryForEntity(ent, activeSchema) === null;
+}
 
-  // 1. If it matches ANY category in the active schema, it's NOT a support entity
-  if (activeSchema.some(cat => shouldEntityGoToCategory(ent, cat, activeSchema))) {
-    return false;
+// Retrieves an attribute value from a clinical note item safely,
+// resolving case differences, trimming, and checking clinical aliases (e.g. status <-> clinicalStatus).
+export function getResolvedAttributeValue(item: Record<string, any>, attr: AnnotationAttribute): any {
+  if (!item || !attr) return undefined;
+
+  // 1. Direct match
+  if (item[attr.name] !== undefined && item[attr.name] !== null && item[attr.name] !== '') {
+    return item[attr.name];
   }
 
-  // 2. If its type matches any category id, displayName, or entityType in activeSchema
-  const tLower = ent.type.toLowerCase().trim();
-  const matchesAnyCategory = activeSchema.some(cat => 
-    cat.id.toLowerCase() === tLower ||
-    cat.displayName.toLowerCase() === tLower ||
-    cat.entityType.toLowerCase() === tLower ||
-    tLower.includes(cat.entityType.toLowerCase()) ||
-    cat.id.toLowerCase().includes(tLower)
-  );
+  const targetNameLower = attr.name.toLowerCase();
 
-  if (matchesAnyCategory) {
-    return false;
+  // 2. Case-insensitive key match in item
+  const keyMatch = Object.keys(item).find(k => k.toLowerCase() === targetNameLower);
+  if (keyMatch && item[keyMatch] !== undefined && item[keyMatch] !== null && item[keyMatch] !== '') {
+    return item[keyMatch];
   }
 
-  return true;
+  // 3. Clinical alias lookup
+  const aliasMap: Record<string, string[]> = {
+    clinicalstatus: ['status', 'clinical_status', 'conditionstatus', 'clinicalStatus', 'verificationstatus', 'state'],
+    status: ['clinicalstatus', 'clinicalStatus', 'clinical_status', 'verificationstatus', 'state'],
+    verificationstatus: ['verification_status', 'status', 'clinicalstatus', 'clinicalStatus'],
+    severity: ['intensity', 'grade'],
+    details: ['description', 'notes', 'comment', 'note'],
+    description: ['details', 'notes', 'comment', 'note'],
+    name: ['title', 'task', 'medication', 'vaccine', 'condition', 'reportName'],
+    task: ['name', 'title'],
+    title: ['name', 'task'],
+    dosage: ['dose', 'amount'],
+    action: ['plan', 'instruction'],
+    value: ['result', 'measurement', 'val']
+  };
+
+  const aliases = aliasMap[targetNameLower] || [];
+  for (const alias of aliases) {
+    if (item[alias] !== undefined && item[alias] !== null && item[alias] !== '') {
+      return item[alias];
+    }
+    const aliasKey = Object.keys(item).find(k => k.toLowerCase() === alias.toLowerCase());
+    if (aliasKey && item[aliasKey] !== undefined && item[aliasKey] !== null && item[aliasKey] !== '') {
+      return item[aliasKey];
+    }
+  }
+
+  return undefined;
+}
+
+// Robustly matches a value against a list of select choices case-insensitively,
+// and if not present, dynamically includes it in options so existing data is NEVER lost or displayed as unassigned.
+export function matchChoiceInsensitive(
+  value: any,
+  availableChoices: string[],
+  fallback = ''
+): { selectedValue: string; options: string[] } {
+  const choices = Array.isArray(availableChoices) ? [...availableChoices] : [];
+  const str = String(value ?? '').trim();
+  if (!str) {
+    const unassigned = choices.find(c => c.toLowerCase() === 'unassigned') || fallback || choices[0] || '';
+    return { selectedValue: unassigned, options: choices };
+  }
+
+  const match = choices.find(c => c.toLowerCase() === str.toLowerCase());
+  if (match) {
+    return { selectedValue: match, options: choices };
+  }
+
+  // If choices contains something with slash matching e.g. "None / Denied" vs "none" or "refuted"
+  const partialMatch = choices.find(c => {
+    const cLower = c.toLowerCase();
+    const strLower = str.toLowerCase();
+    return cLower.includes(strLower) || strLower.includes(cLower);
+  });
+  if (partialMatch) {
+    return { selectedValue: partialMatch, options: choices };
+  }
+
+  // Not in choices: dynamically add to choices so it displays faithfully and doesn't get reset
+  choices.push(str);
+  return { selectedValue: str, options: choices };
 }
 
 export default function ClinicalNotesView({
@@ -149,6 +203,7 @@ export default function ClinicalNotesView({
 
   // Clear Annotations Confirmation State
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showExportJsonlModal, setShowExportJsonlModal] = useState(false);
 
   const renderEntityConflictsAndSummary = (entityId: string) => {
     const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
@@ -187,6 +242,18 @@ export default function ClinicalNotesView({
       .map(([p, count]) => `${count} ${p}`)
       .join(', ');
 
+    // Determine effective polarity with fallback to all entity mentions
+    let effectivePolarity = polarities[0];
+    if (!effectivePolarity) {
+      if (entityMentions.some(m => m.polarity === 'negative')) {
+        effectivePolarity = 'negative';
+      } else if (entityMentions.some(m => m.function === 'questioned')) {
+        effectivePolarity = 'unconfirmed';
+      } else {
+        effectivePolarity = 'positive';
+      }
+    }
+
     // 4. Gather certainties (calculated only from summaryMentions)
     const certainties = summaryMentions.map(m => m.certainty || 'certain');
     const certCounts: { [key: string]: number } = {};
@@ -223,8 +290,16 @@ export default function ClinicalNotesView({
           </div>
           <div>
             <span className="text-slate-500 font-semibold">Polarity:</span>{' '}
-            <span className={hasPolConflict ? 'text-rose-600 font-bold' : 'text-slate-600'}>
-              {hasPolConflict ? polSummary : (polarities[0] || 'positive')}
+            <span className={
+              hasPolConflict 
+                ? 'text-rose-600 font-bold' 
+                : (effectivePolarity === 'negative' 
+                    ? 'text-rose-600 font-bold' 
+                    : (effectivePolarity === 'unconfirmed' 
+                        ? 'text-amber-600 font-semibold' 
+                        : 'text-slate-600'))
+            }>
+              {hasPolConflict ? polSummary : (effectivePolarity === 'negative' ? 'negative (denied)' : effectivePolarity)}
             </span>
           </div>
           <div>
@@ -234,6 +309,22 @@ export default function ClinicalNotesView({
             </span>
           </div>
         </div>
+
+        {(() => {
+          const supportedAttrMentions = entityMentions.filter(m => Boolean(m.supportedAttribute && m.textSpan?.text));
+          if (supportedAttrMentions.length === 0) return null;
+          return (
+            <div className="flex items-center gap-1.5 pt-1 border-t border-slate-100 flex-wrap">
+              <span className="text-slate-500 font-semibold font-mono text-[9px]">Supported Attributes:</span>
+              {supportedAttrMentions.map((m, idx) => (
+                <span key={idx} className="bg-violet-50 text-violet-700 font-bold px-1.5 py-0.2 rounded border border-violet-200 font-mono text-[9px]" title={`Mention "${m.textSpan?.text}" supports attribute ${m.supportedAttribute}`}>
+                  <span className="text-violet-500 mr-1 uppercase">{m.supportedAttribute}:</span>
+                  "{m.textSpan?.text}"
+                </span>
+              ))}
+            </div>
+          );
+        })()}
       </div>
     );
   };
@@ -249,6 +340,14 @@ export default function ClinicalNotesView({
       );
     }
 
+    const parentEntity = entities.find(e => e.id === entityId);
+    const parentCategory = activeSchema.find(c => c.id === parentEntity?.type || c.entityType.toLowerCase() === parentEntity?.type?.toLowerCase());
+    const categoryAttributes = parentCategory?.attributes?.map(a => a.name) || [];
+    const allSuggestedAttributes = Array.from(new Set([
+      ...categoryAttributes,
+      'value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'
+    ]));
+
     return (
       <div className="mt-3 pt-3 border-t border-slate-100 space-y-3 animate-fadeIn">
         <div className="text-[10px] font-bold text-slate-400 uppercase font-mono tracking-wider flex items-center justify-between">
@@ -259,22 +358,36 @@ export default function ClinicalNotesView({
         <div className="space-y-2.5">
           {entityMentions.map((mention, mIdx) => {
             const isMentionSelected = selectedMentionId === mention.id;
-            const segment = segments?.find((s, idx) => idx === mention.textSpan.lineIndex);
+            const segment = segments?.find((s, idx) => {
+              if (mention.segmentId && s.id === mention.segmentId) return true;
+              if (mention.textSpan?.segmentId && s.id === mention.textSpan.segmentId) return true;
+              if (idx === mention.textSpan?.lineIndex) {
+                if (!mention.textSpan?.text || s.text.toLowerCase().includes(mention.textSpan.text.toLowerCase())) {
+                  return true;
+                }
+              }
+              return false;
+            }) || (mention.textSpan?.text ? segments?.find(s => s.text.toLowerCase().includes(mention.textSpan.text.toLowerCase())) : undefined);
+            const resolvedLineIndex = segment && segments ? segments.indexOf(segment) : mention.textSpan.lineIndex;
             const derivedSpeaker = segment ? segment.speaker.toLowerCase() : 'patient';
             const speakerDisplay = mention.speaker || derivedSpeaker;
             const isSpeakerCorrected = mention.speaker && mention.speaker !== derivedSpeaker;
             const isCorrectingSpeaker = correctingSpeakerMentionId === mention.id;
-            const functionDisplay = mention.function || 'asserted';
+            const functionDisplay = mention.function || 'unassigned';
 
             const isExceptionPolarity = mention.polarity && mention.polarity !== 'positive';
             const isExceptionCertainty = mention.certainty && mention.certainty !== 'certain';
             const isExceptionTemporality = mention.temporality && mention.temporality !== 'current';
             const isExceptionExperiencer = mention.experiencer && mention.experiencer !== 'patient';
 
-            const handleAttributeChange = (field: 'speaker' | 'polarity' | 'certainty' | 'temporality' | 'experiencer' | 'function', value: string) => {
+            const handleAttributeChange = (field: 'speaker' | 'polarity' | 'certainty' | 'temporality' | 'experiencer' | 'function' | 'supportedAttribute', value: string) => {
               if (isReadOnly) return;
               const updatedMentions = (mentions || []).map(m => {
                 if (m.id === mention.id) {
+                  if (field === 'supportedAttribute') {
+                    const trimmed = value.trim();
+                    return { ...m, supportedAttribute: trimmed ? trimmed : undefined };
+                  }
                   return { ...m, [field]: value };
                 }
                 return m;
@@ -295,11 +408,21 @@ export default function ClinicalNotesView({
               setCorrectingSpeakerMentionId(null);
             };
 
+            const handleDeleteThisMention = (e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (isReadOnly) return;
+              const updatedMentions = (mentions || []).filter(m => m.id !== mention.id);
+              if (selectedMentionId === mention.id && onSelectMention) {
+                onSelectMention(null);
+              }
+              onUpdateNotes(clinicalNotes, entities, relations, updatedMentions);
+            };
+
             return (
               <div
                 key={mention.id || mIdx}
                 id={`mention-card-${mention.id}`}
-                className={`border rounded-lg p-2.5 space-y-2 transition-all duration-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/10 ${
+                className={`border rounded-lg p-2.5 space-y-2 transition-all duration-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/10 group ${
                   isMentionSelected
                     ? 'bg-indigo-50/80 border-indigo-500 ring-2 ring-indigo-100 shadow-sm'
                     : 'bg-slate-50/80 border-slate-150'
@@ -313,15 +436,28 @@ export default function ClinicalNotesView({
               >
                 {isMentionSelected ? (
                   <>
-                    {/* Header with segment reference */}
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="font-mono text-slate-500 bg-slate-200/60 px-1.5 py-0.5 rounded flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
-                        {encounterType === 'note' ? `Section ${mention.textSpan.lineIndex + 1}` : `Segment U-${mention.textSpan.lineIndex}`}
-                      </span>
-                      <span className="font-semibold italic text-slate-700 max-w-[200px] truncate" title={mention.textSpan.text}>
-                        "{mention.textSpan.text}"
-                      </span>
+                    {/* Header with segment reference and Delete action */}
+                    <div className="flex items-center justify-between text-[10px] gap-2">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="font-mono text-slate-500 bg-slate-200/60 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
+                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                          {encounterType === 'note' ? `Section ${resolvedLineIndex + 1}` : `Segment U-${resolvedLineIndex}`}
+                        </span>
+                        <span className="font-semibold italic text-slate-700 truncate" title={mention.textSpan.text}>
+                          "{mention.textSpan.text}"
+                        </span>
+                      </div>
+                      {!isReadOnly && (
+                        <button
+                          type="button"
+                          onClick={handleDeleteThisMention}
+                          className="flex items-center gap-1 text-[9px] font-semibold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200/80 px-2 py-0.5 rounded transition-all cursor-pointer shrink-0"
+                          title="Delete this specific mention highlight (retains parent entity)"
+                        >
+                          <Trash2 className="w-3 h-3 text-rose-500" />
+                          <span>Delete Mention</span>
+                        </button>
+                      )}
                     </div>
 
                     {/* Speaker Info Bar (Static by default, editable on secondary action) */}
@@ -331,13 +467,14 @@ export default function ClinicalNotesView({
                           <span className="font-semibold uppercase tracking-wider text-[8px] text-slate-400 font-mono">Speaker:</span>
                           {isCorrectingSpeaker ? (
                             <select
-                              value={mention.speaker || derivedSpeaker}
+                              value={(mention.speaker || derivedSpeaker || 'unassigned').toLowerCase()}
                               onChange={(e) => {
                                 handleAttributeChange('speaker', e.target.value);
                                 setCorrectingSpeakerMentionId(null);
                               }}
                               className="text-[9px] font-bold bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
                             >
+                              <option value="unassigned">Unassigned</option>
                               <option value="patient">Patient (derived)</option>
                               <option value="doctor">Doctor</option>
                               <option value="relative">Relative</option>
@@ -387,15 +524,18 @@ export default function ClinicalNotesView({
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
                         <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Polarity</span>
                         <select
-                          value={mention.polarity || 'positive'}
+                          value={(mention.polarity || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('polarity', e.target.value)}
                           className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
-                            mention.polarity === 'negative' 
-                              ? 'border-rose-200 text-rose-700 bg-rose-50/10' 
+                            (mention.polarity || '').toLowerCase() === 'negative' 
+                              ? 'border-rose-200 text-rose-700 bg-rose-50/10 font-bold' 
+                              : (mention.polarity || '').toLowerCase() === 'unassigned' || !mention.polarity
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
+                          <option value="unassigned">Unassigned</option>
                           <option value="positive">Positive</option>
                           <option value="negative">Negative</option>
                           <option value="neutral">Neutral</option>
@@ -406,15 +546,18 @@ export default function ClinicalNotesView({
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
                         <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Certainty</span>
                         <select
-                          value={mention.certainty || 'certain'}
+                          value={(mention.certainty || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('certainty', e.target.value)}
                           className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
-                            mention.certainty !== 'certain' 
-                              ? 'border-amber-200 text-amber-700 bg-amber-50/10' 
+                            (mention.certainty || '').toLowerCase() === 'uncertain' || (mention.certainty || '').toLowerCase() === 'hypothetical'
+                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-bold' 
+                              : (mention.certainty || '').toLowerCase() === 'unassigned' || !mention.certainty
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
+                          <option value="unassigned">Unassigned</option>
                           <option value="certain">Certain</option>
                           <option value="uncertain">Uncertain</option>
                           <option value="hypothetical">Hypothetical</option>
@@ -425,15 +568,18 @@ export default function ClinicalNotesView({
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
                         <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Temporality</span>
                         <select
-                          value={mention.temporality || 'current'}
+                          value={(mention.temporality || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('temporality', e.target.value)}
                           className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
-                            mention.temporality !== 'current' 
-                              ? 'border-blue-200 text-blue-700 bg-blue-50/10' 
+                            (mention.temporality || '').toLowerCase() === 'past' || (mention.temporality || '').toLowerCase() === 'future'
+                              ? 'border-blue-200 text-blue-700 bg-blue-50/10 font-bold' 
+                              : (mention.temporality || '').toLowerCase() === 'unassigned' || !mention.temporality
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
+                          <option value="unassigned">Unassigned</option>
                           <option value="current">Current</option>
                           <option value="past">Past / History</option>
                           <option value="future">Future</option>
@@ -444,11 +590,16 @@ export default function ClinicalNotesView({
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
                         <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Experiencer</span>
                         <select
-                          value={mention.experiencer || 'patient'}
+                          value={(mention.experiencer || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('experiencer', e.target.value)}
-                          className="w-full text-[9px] font-semibold bg-white border border-slate-200 rounded px-1 py-0.5 text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer"
+                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                            (mention.experiencer || '').toLowerCase() === 'unassigned' || !mention.experiencer
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
+                              : 'border-slate-200 text-slate-700'
+                          }`}
                         >
+                          <option value="unassigned">Unassigned</option>
                           <option value="patient">Patient</option>
                           <option value="family">Family</option>
                           <option value="other">Other</option>
@@ -459,24 +610,94 @@ export default function ClinicalNotesView({
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
                         <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Function</span>
                         <select
-                          value={mention.function || 'asserted'}
+                          value={(mention.function || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('function', e.target.value)}
                           className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
-                            mention.function === 'questioned'
+                            (mention.function || '').toLowerCase() === 'questioned'
                               ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-bold'
-                              : mention.function === 'hypothetical'
+                              : (mention.function || '').toLowerCase() === 'hypothetical'
                               ? 'border-purple-200 text-purple-700 bg-purple-50/10 font-bold'
-                              : mention.function === 'explanatory'
+                              : (mention.function || '').toLowerCase() === 'explanatory'
                               ? 'border-slate-350 text-slate-700 bg-slate-50/10 font-bold'
+                              : (mention.function || '').toLowerCase() === 'unassigned' || !mention.function
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
+                          <option value="unassigned">Unassigned</option>
                           <option value="asserted">Asserted</option>
                           <option value="questioned">Questioned</option>
                           <option value="hypothetical">Hypothetical</option>
                           <option value="explanatory">General/explanatory</option>
                         </select>
+                      </div>
+
+                      {/* Supported Entity Attribute (e.g. "value", "severity", "dosage") */}
+                      <div className="flex flex-col gap-0.5 flex-1 min-w-[160px]">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Supported Attribute</span>
+                          {mention.supportedAttribute && !isReadOnly && (
+                            <button
+                              type="button"
+                              onClick={() => handleAttributeChange('supportedAttribute', '')}
+                              className="text-[8px] text-rose-500 hover:text-rose-700 font-semibold cursor-pointer"
+                              title="Clear supported attribute"
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <select
+                            value={allSuggestedAttributes.includes(mention.supportedAttribute || '') ? (mention.supportedAttribute || '') : (mention.supportedAttribute ? '__custom__' : '')}
+                            disabled={isReadOnly}
+                            onChange={(e) => {
+                              if (e.target.value === '__custom__') return;
+                              handleAttributeChange('supportedAttribute', e.target.value);
+                            }}
+                            className={`text-[9px] font-semibold bg-white border rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 flex-1 ${
+                              mention.supportedAttribute
+                                ? 'border-violet-300 text-violet-800 bg-violet-50/30 font-bold'
+                                : 'border-slate-200 text-slate-500'
+                            }`}
+                          >
+                            <option value="">-- None / Primary --</option>
+                            {allSuggestedAttributes.map(attr => (
+                              <option key={attr} value={attr}>
+                                attr: {attr.toUpperCase()}
+                              </option>
+                            ))}
+                            {mention.supportedAttribute && !allSuggestedAttributes.includes(mention.supportedAttribute) && (
+                              <option value="__custom__">Custom: {mention.supportedAttribute}</option>
+                            )}
+                          </select>
+                          <input
+                            type="text"
+                            value={mention.supportedAttribute || ''}
+                            disabled={isReadOnly}
+                            onChange={(e) => handleAttributeChange('supportedAttribute', e.target.value)}
+                            placeholder="or type attr..."
+                            className="w-20 text-[9px] font-semibold bg-white border border-slate-200 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 text-slate-700"
+                          />
+                        </div>
+                        <div className="flex flex-wrap gap-0.5 mt-0.5">
+                          {['value', 'severity', 'dosage', 'status'].map(attr => (
+                            <button
+                              key={attr}
+                              type="button"
+                              disabled={isReadOnly}
+                              onClick={() => handleAttributeChange('supportedAttribute', attr)}
+                              className={`text-[7.5px] px-1 py-0.2 rounded font-mono border transition-colors cursor-pointer ${
+                                mention.supportedAttribute === attr
+                                  ? 'bg-violet-600 text-white border-violet-600 font-bold'
+                                  : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                              }`}
+                            >
+                              {attr}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
 
@@ -485,11 +706,11 @@ export default function ClinicalNotesView({
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          const currentPolarity = mention.polarity || 'positive';
-                          const currentCertainty = mention.certainty || 'certain';
-                          const currentTemporality = mention.temporality || 'current';
-                          const currentExperiencer = mention.experiencer || 'patient';
-                          const currentFunction = mention.function || 'asserted';
+                          const currentPolarity = mention.polarity || 'unassigned';
+                          const currentCertainty = mention.certainty || 'unassigned';
+                          const currentTemporality = mention.temporality || 'unassigned';
+                          const currentExperiencer = mention.experiencer || 'unassigned';
+                          const currentFunction = mention.function || 'unassigned';
                           const currentSpeaker = mention.speaker;
 
                           const updatedMentions = (mentions || []).map(m => {
@@ -520,7 +741,7 @@ export default function ClinicalNotesView({
                   <div className="flex items-center justify-between text-xs py-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded-md font-semibold text-[9px]">
-                        U-{mention.textSpan.lineIndex}
+                        U-{resolvedLineIndex}
                       </span>
                       <span className="text-slate-400 font-medium font-sans select-none">·</span>
                       <span className="text-slate-700 font-bold capitalize text-[10px]">{speakerDisplay}</span>
@@ -529,35 +750,77 @@ export default function ClinicalNotesView({
                         functionDisplay === 'questioned' ? 'text-amber-600 bg-amber-50' :
                         functionDisplay === 'hypothetical' ? 'text-purple-600 bg-purple-50' :
                         functionDisplay === 'explanatory' ? 'text-slate-600 bg-slate-100 font-medium' :
+                        functionDisplay === 'unassigned' ? 'text-slate-500 bg-slate-100 font-medium italic border border-dashed border-slate-300' :
                         'text-emerald-600 bg-emerald-50'
                       }`}>
                         {functionDisplay === 'explanatory' ? 'General/explanatory' : functionDisplay}
                       </span>
                       {/* Exception Badges */}
                       {isExceptionPolarity && (
-                        <span className="text-[8px] bg-rose-50 text-rose-600 border border-rose-100 font-bold px-1 py-0.2 rounded uppercase">
+                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                          mention.polarity === 'negative'
+                            ? 'bg-rose-50 text-rose-600 border-rose-100'
+                            : mention.polarity === 'unassigned'
+                            ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
                           {mention.polarity}
                         </span>
                       )}
                       {isExceptionCertainty && (
-                        <span className="text-[8px] bg-amber-50 text-amber-600 border border-amber-100 font-bold px-1 py-0.2 rounded uppercase">
+                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                          mention.certainty === 'uncertain' || mention.certainty === 'hypothetical'
+                            ? 'bg-amber-50 text-amber-600 border-amber-100'
+                            : mention.certainty === 'unassigned'
+                            ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
                           {mention.certainty}
                         </span>
                       )}
                       {isExceptionTemporality && (
-                        <span className="text-[8px] bg-blue-50 text-blue-600 border border-blue-100 font-bold px-1 py-0.2 rounded uppercase">
+                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                          mention.temporality === 'past' || mention.temporality === 'future'
+                            ? 'bg-blue-50 text-blue-600 border-blue-100'
+                            : mention.temporality === 'unassigned'
+                            ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
                           {mention.temporality}
                         </span>
                       )}
                       {isExceptionExperiencer && (
-                        <span className="text-[8px] bg-orange-50 text-orange-600 border border-orange-100 font-bold px-1 py-0.2 rounded uppercase">
+                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                          mention.experiencer === 'other'
+                            ? 'bg-orange-50 text-orange-600 border-orange-100'
+                            : mention.experiencer === 'unassigned'
+                            ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}>
                           {mention.experiencer === 'other' ? 'Other Experiencer' : mention.experiencer}
                         </span>
                       )}
+                      {mention.supportedAttribute && (
+                        <span className="text-[8px] font-bold px-1.5 py-0.2 rounded font-mono bg-violet-50 text-violet-700 border border-violet-200" title={`Supported Entity Attribute: ${mention.supportedAttribute}`}>
+                          attr: {mention.supportedAttribute}
+                        </span>
+                      )}
                     </div>
-                    <span className="text-[10px] text-slate-500 italic max-w-[150px] truncate select-none block" title={mention.textSpan.text}>
-                      "{mention.textSpan.text}"
-                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span className="text-[10px] text-slate-500 italic max-w-[140px] truncate select-none block" title={mention.textSpan.text}>
+                        "{mention.textSpan.text}"
+                      </span>
+                      {!isReadOnly && (
+                        <button
+                          type="button"
+                          onClick={handleDeleteThisMention}
+                          className="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-all cursor-pointer"
+                          title="Delete this mention (keeps entity)"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -581,15 +844,23 @@ export default function ClinicalNotesView({
     setShowClearConfirm(false);
   };
 
+  const prevSelectedMentionRef = useRef<string | null>(null);
   useEffect(() => {
-    if (selectedMentionId) {
-      setTimeout(() => {
-        const card = document.getElementById(`mention-card-${selectedMentionId}`);
-        if (card) {
-          card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        }
-      }, 100);
+    if (prevSelectedMentionRef.current === selectedMentionId) return;
+    prevSelectedMentionRef.current = selectedMentionId;
+    if (!selectedMentionId) return;
+
+    const activeEl = document.activeElement;
+    if (activeEl && (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
+      return;
     }
+
+    setTimeout(() => {
+      const card = document.getElementById(`mention-card-${selectedMentionId}`);
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }, 100);
   }, [selectedMentionId]);
 
   // New Relation States
@@ -612,11 +883,27 @@ export default function ClinicalNotesView({
     let hasChanges = false;
     const updatedNotes = { ...clinicalNotes };
 
+    // Build a set of all entity IDs already assigned in ANY category of clinicalNotes
+    const allAssignedEntityIds = new Set<string>();
+    activeSchema.forEach(cat => {
+      const items = clinicalNotes[cat.id] || [];
+      items.forEach((item: any) => {
+        if (item && item.entityId) {
+          allAssignedEntityIds.add(item.entityId);
+        }
+      });
+    });
+
     activeSchema.forEach(cat => {
       const currentItems = clinicalNotes[cat.id] || [];
       const missingItems: any[] = [];
 
       entities.forEach(ent => {
+        // If entity is already assigned in any category, do not auto-inject into another category
+        if (allAssignedEntityIds.has(ent.id)) {
+          return;
+        }
+
         if (shouldEntityGoToCategory(ent, cat, activeSchema)) {
           const alreadyExists = currentItems.some((s: any) => s.entityId === ent.id);
           if (!alreadyExists) {
@@ -629,7 +916,17 @@ export default function ClinicalNotesView({
               } else if (attr.name === 'details') {
                 newItem[attr.name] = ent.description || '';
               } else if (attr.type === 'select') {
-                newItem[attr.name] = attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'Unspecified';
+                const entMentions = mentions.filter(m => m.entityId === ent.id);
+                const hasNegative = entMentions.some(m => m.polarity === 'negative');
+                if (hasNegative && (attr.name === 'status' || attr.name === 'verificationStatus')) {
+                  const refutedChoice = (attr.choices || []).find(c => c.toLowerCase() === 'refuted');
+                  newItem[attr.name] = refutedChoice || (attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'refuted');
+                } else if (hasNegative && attr.name === 'severity') {
+                  const deniedChoice = (attr.choices || []).find(c => /none|denied/i.test(c));
+                  newItem[attr.name] = deniedChoice || 'Unspecified';
+                } else {
+                  newItem[attr.name] = attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'Unspecified';
+                }
               } else if (attr.type === 'boolean') {
                 newItem[attr.name] = false;
               } else {
@@ -637,6 +934,7 @@ export default function ClinicalNotesView({
               }
             });
             missingItems.push(newItem);
+            allAssignedEntityIds.add(ent.id);
             hasChanges = true;
           }
         }
@@ -924,8 +1222,8 @@ export default function ClinicalNotesView({
   };
 
   const handleMapAllEntities = async () => {
-    // Map Symptoms, Conditions, Medications, and Measurements
-    const mappableTypes = ['Symptom', 'Condition', 'Medication', 'Measurement'];
+    // Map Symptoms, Conditions, Medications, Measurements, Observations, and Social History
+    const mappableTypes = ['Symptom', 'Condition', 'Medication', 'Measurement', 'Observation', 'SocialHistory', 'SocialStatus'];
     const targets = entities.filter(ent => mappableTypes.includes(ent.type) && !ent.umlsMapping?.cui);
 
     if (targets.length === 0) {
@@ -1177,8 +1475,18 @@ export default function ClinicalNotesView({
     );
   };
 
+  const prevSelectedEntityRef = useRef<string | null>(null);
   useEffect(() => {
-    if (selectedEntityId && itemRefs.current[selectedEntityId]) {
+    if (prevSelectedEntityRef.current === selectedEntityId) return;
+    prevSelectedEntityRef.current = selectedEntityId;
+    if (!selectedEntityId) return;
+
+    const activeEl = document.activeElement;
+    if (activeEl && (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
+      return;
+    }
+
+    if (itemRefs.current[selectedEntityId]) {
       itemRefs.current[selectedEntityId]?.scrollIntoView({
         behavior: 'smooth',
         block: 'center',
@@ -1197,11 +1505,19 @@ export default function ClinicalNotesView({
     }
     updatedNotes[category] = (updatedNotes[category] as any[]).filter((_, idx) => idx !== index);
     
+    // Also clean up references in other categories if any existed
+    activeSchema.forEach(cat => {
+      if (cat.id !== category && updatedNotes[cat.id]) {
+        updatedNotes[cat.id] = (updatedNotes[cat.id] as any[]).filter((item: any) => item.entityId !== entityId);
+      }
+    });
+
     // Also remove from general entities array
     const updatedEntities = entities.filter(e => e.id !== entityId);
     const updatedMentions = mentions.filter(m => m.entityId !== entityId);
+    const updatedRelations = relations.filter(r => r.source !== entityId && r.target !== entityId);
 
-    onUpdateNotes(updatedNotes, updatedEntities, relations, updatedMentions);
+    onUpdateNotes(updatedNotes, updatedEntities, updatedRelations, updatedMentions);
     if (selectedEntityId === entityId) {
       onSelectEntity(null);
     }
@@ -1213,7 +1529,35 @@ export default function ClinicalNotesView({
     if (category === 'support') {
       setSupportForm(item);
     } else {
-      setActiveForm(item);
+      const cat = activeSchema.find(c => c.id === category);
+      const initialForm = { ...item };
+      if (cat) {
+        cat.attributes.forEach(attr => {
+          const val = (initialForm[attr.name] !== undefined && initialForm[attr.name] !== '')
+            ? initialForm[attr.name]
+            : getResolvedAttributeValue(initialForm, attr);
+
+          if (val !== undefined && val !== null && val !== '') {
+            if (attr.type === 'select' && Array.isArray(attr.choices)) {
+              const { selectedValue } = matchChoiceInsensitive(val, attr.choices);
+              initialForm[attr.name] = selectedValue;
+            } else {
+              initialForm[attr.name] = val;
+            }
+          }
+        });
+
+        // Cross-sync status and clinicalStatus
+        if (initialForm.clinicalStatus && !initialForm.status) {
+          initialForm.status = initialForm.clinicalStatus;
+        }
+        if (initialForm.status && !initialForm.clinicalStatus && cat.attributes.some(a => a.name === 'clinicalStatus')) {
+          const clinAttr = cat.attributes.find(a => a.name === 'clinicalStatus');
+          const matched = clinAttr?.choices?.find(c => c.toLowerCase() === String(initialForm.status).toLowerCase());
+          initialForm.clinicalStatus = matched || initialForm.status;
+        }
+      }
+      setActiveForm(initialForm);
     }
   };
 
@@ -1251,7 +1595,45 @@ export default function ClinicalNotesView({
       const currentItem = categoryItems[index];
       if (!currentItem) return;
 
-      const updatedItem = { ...currentItem, ...activeForm };
+      const primaryAttr = getPrimaryAttribute(cat);
+      // Determine what the user edited as the primary identifier (title, task, medication, vaccine, name, etc.)
+      const primaryName =
+        (activeForm[primaryAttr.name] !== undefined && activeForm[primaryAttr.name] !== '')
+          ? String(activeForm[primaryAttr.name]).trim()
+          : (activeForm.name ||
+             activeForm.task ||
+             activeForm.title ||
+             activeForm.medication ||
+             activeForm.vaccine ||
+             activeForm.condition ||
+             activeForm.reportName ||
+             activeForm.description ||
+             currentItem[primaryAttr.name] ||
+             currentItem.name ||
+             currentItem.task ||
+             currentItem.title ||
+             `Updated ${cat.displayName}`);
+
+      const updatedItem = {
+        ...currentItem,
+        ...activeForm,
+        [primaryAttr.name]: primaryName,
+        name: primaryName,
+      };
+
+      if (updatedItem.clinicalStatus !== undefined && updatedItem.status === undefined) {
+        updatedItem.status = updatedItem.clinicalStatus;
+      } else if (updatedItem.status !== undefined && updatedItem.clinicalStatus === undefined && cat.attributes.some(a => a.name === 'clinicalStatus')) {
+        updatedItem.clinicalStatus = updatedItem.status;
+      }
+
+      if (primaryAttr.name === 'task' || updatedItem.task !== undefined) {
+        updatedItem.task = primaryName;
+      }
+      if (primaryAttr.name === 'title' || updatedItem.title !== undefined) {
+        updatedItem.title = primaryName;
+      }
+
       if (!updatedNotes[category]) updatedNotes[category] = [];
       const noteIdx = (updatedNotes[category] as any[]).findIndex((item: any) => item.entityId === currentItem.entityId);
       if (noteIdx > -1) {
@@ -1260,12 +1642,11 @@ export default function ClinicalNotesView({
         updatedNotes[category].push(updatedItem);
       }
 
-      // Update matching entity
+      // Update matching entity in entities list
       const entIdx = updatedEntities.findIndex(e => e.id === updatedItem.entityId);
       if (entIdx > -1) {
-        const primaryName = updatedItem.name || updatedItem.task || `Updated ${cat.displayName}`;
         const detailsParts = cat.attributes
-          .filter(attr => attr.name !== 'name' && attr.name !== 'task')
+          .filter(attr => attr.name !== primaryAttr.name && attr.name !== 'name' && attr.name !== 'task' && attr.name !== 'title')
           .map(attr => {
             const val = updatedItem[attr.name];
             if (val === undefined || val === '' || val === null) return null;
@@ -1298,8 +1679,9 @@ export default function ClinicalNotesView({
     });
 
     const updatedMentions = mentions.filter(m => m.entityId !== entityId);
+    const updatedRelations = relations.filter(r => r.source !== entityId && r.target !== entityId);
 
-    onUpdateNotes(updatedNotes, updatedEntities, relations, updatedMentions);
+    onUpdateNotes(updatedNotes, updatedEntities, updatedRelations, updatedMentions);
     if (selectedEntityId === entityId) {
       onSelectEntity(null);
     }
@@ -1340,18 +1722,24 @@ export default function ClinicalNotesView({
     const cat = activeSchema.find(c => c.id === category);
     if (!cat) return;
 
+    const primaryAttr = getPrimaryAttribute(cat);
+    const defaultDisplayName = `New ${cat.displayName.endsWith('s') ? cat.displayName.slice(0, -1) : cat.displayName}`;
+
     const newItem: any = { entityId: newId };
     cat.attributes.forEach(attr => {
-      if (attr.name === 'name' || attr.name === 'task') {
-        newItem[attr.name] = `New ${cat.displayName.endsWith('s') ? cat.displayName.slice(0, -1) : cat.displayName}`;
+      if (attr.name === primaryAttr.name || attr.name === 'name' || attr.name === 'task' || attr.name === 'title') {
+        newItem[attr.name] = defaultDisplayName;
       } else if (attr.type === 'select') {
-        newItem[attr.name] = attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'Unspecified';
+        const unassignedChoice = attr.choices?.find(c => c.toLowerCase() === 'unassigned');
+        newItem[attr.name] = unassignedChoice || (attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'unassigned');
       } else if (attr.type === 'boolean') {
         newItem[attr.name] = false;
       } else {
-        newItem[attr.name] = '';
+        newItem[attr.name] = attr.name.toLowerCase().includes('status') ? 'unassigned' : '';
       }
     });
+    newItem[primaryAttr.name] = defaultDisplayName;
+    newItem.name = defaultDisplayName;
 
     if (!updatedNotes[category]) {
       updatedNotes[category] = [];
@@ -1359,7 +1747,7 @@ export default function ClinicalNotesView({
     updatedNotes[category] = [...(updatedNotes[category] as any[]), newItem];
 
     const detailsParts = cat.attributes
-      .filter(attr => attr.name !== 'name' && attr.name !== 'task')
+      .filter(attr => attr.name !== primaryAttr.name && attr.name !== 'name' && attr.name !== 'task' && attr.name !== 'title')
       .map(attr => {
         const val = newItem[attr.name];
         if (val === undefined || val === '' || val === null) return null;
@@ -1369,7 +1757,7 @@ export default function ClinicalNotesView({
 
     updatedEntities.push({
       id: newId,
-      name: newItem.name || newItem.task || `New ${cat.displayName}`,
+      name: defaultDisplayName,
       type: cat.entityType,
       description: detailsParts.join(' | ') || `Added manually to ${cat.displayName}`
     });
@@ -1383,6 +1771,7 @@ export default function ClinicalNotesView({
 
   const getCategoryIcon = (catId: string) => {
     const id = catId.toLowerCase();
+    if (id.includes('social') || id.includes('lifestyle') || id.includes('habit')) return <HeartHandshake className="w-4.5 h-4.5 text-lime-600" />;
     if (id.includes('symptom') || id.includes('allergy')) return <Activity className="w-4.5 h-4.5 text-amber-600" />;
     if (id.includes('family') || id.includes('history')) return <Users className="w-4.5 h-4.5 text-teal-600" />;
     if (id.includes('condition') || id.includes('disorder') || id.includes('disease')) return <Activity className="w-4.5 h-4.5 text-emerald-600" />;
@@ -1408,15 +1797,16 @@ export default function ClinicalNotesView({
           if (seenEntityIds.has(eId)) return;
           seenEntityIds.add(eId);
         }
-        const primaryAttr = cat.attributes.find(a => a.name === 'name' || a.name === 'task') || cat.attributes[0];
+        const primaryAttr = getPrimaryAttribute(cat);
         const linkedEnt = eId ? entities.find(e => e.id === eId) : null;
-        const resolvedName = item.name || item.task || item[primaryAttr.name] || linkedEnt?.name || '';
+        const resolvedName = getItemDisplayName(item, cat, linkedEnt);
 
         result.push({
           ...item,
-          name: item.name || resolvedName,
-          task: item.task || resolvedName,
-          [primaryAttr.name]: item[primaryAttr.name] || resolvedName
+          [primaryAttr.name]: item[primaryAttr.name] || resolvedName,
+          name: item[primaryAttr.name] || item.name || resolvedName,
+          task: item.task || item[primaryAttr.name] || resolvedName,
+          title: item.title || item[primaryAttr.name] || resolvedName
         });
       });
     };
@@ -1462,11 +1852,12 @@ export default function ClinicalNotesView({
       if (ent && ent.id && !seenEntityIds.has(ent.id)) {
         if (shouldEntityGoToCategory(ent, cat, activeSchema)) {
           seenEntityIds.add(ent.id);
-          const primaryAttr = cat.attributes.find(attr => attr.name === 'name' || attr.name === 'task') || cat.attributes[0];
+          const primaryAttr = getPrimaryAttribute(cat);
           const newItem: any = {
             entityId: ent.id,
             name: ent.name,
-            task: ent.name
+            task: ent.name,
+            title: ent.name
           };
           newItem[primaryAttr.name] = ent.name;
           if (ent.description) {
@@ -1487,42 +1878,53 @@ export default function ClinicalNotesView({
 
   return (
     <div className="space-y-6">
-      {/* Clinical Workspace Header with Clear All Button */}
+      {/* Clinical Workspace Header with Export JSONL & Clear All Buttons */}
       <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Layers className="w-4.5 h-4.5 text-slate-500" />
           <span className="text-xs font-semibold text-slate-700 uppercase tracking-wider font-mono">Clinical Workspace</span>
         </div>
-        {!isReadOnly && (
-          <div className="flex items-center gap-2">
-            {showClearConfirm ? (
-              <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 px-2.5 py-1.5 rounded-lg animate-in fade-in duration-200">
-                <span className="text-[10px] text-rose-700 font-medium">Delete all annotations?</span>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowExportJsonlModal(true)}
+            className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
+            title="Export entities, mentions, and relations to JSONL format"
+          >
+            <FileCode className="w-3.5 h-3.5 text-indigo-600" />
+            <span>Export JSONL</span>
+          </button>
+
+          {!isReadOnly && (
+            <>
+              {showClearConfirm ? (
+                <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 px-2.5 py-1.5 rounded-lg animate-in fade-in duration-200">
+                  <span className="text-[10px] text-rose-700 font-medium">Delete all annotations?</span>
+                  <button
+                    onClick={handleClearAllAnnotations}
+                    className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[9px] rounded shadow-sm transition-all cursor-pointer"
+                  >
+                    Yes, Clear
+                  </button>
+                  <button
+                    onClick={() => setShowClearConfirm(false)}
+                    className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-[9px] rounded transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
                 <button
-                  onClick={handleClearAllAnnotations}
-                  className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[9px] rounded shadow-sm transition-all cursor-pointer"
+                  onClick={() => setShowClearConfirm(true)}
+                  className="px-2.5 py-1.5 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 text-slate-500 border border-slate-200 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                  title="Delete all clinical annotated entities and relationships"
                 >
-                  Yes, Clear
+                  <Trash2 className="w-3.5 h-3.5 text-slate-400 hover:text-rose-500 transition-colors" />
+                  <span>Clear All Annotations</span>
                 </button>
-                <button
-                  onClick={() => setShowClearConfirm(false)}
-                  className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-[9px] rounded transition-all cursor-pointer"
-                >
-                  Cancel
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => setShowClearConfirm(true)}
-                className="px-2.5 py-1.5 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 text-slate-500 border border-slate-200 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
-                title="Delete all clinical annotated entities and relationships"
-              >
-                <Trash2 className="w-3.5 h-3.5 text-slate-400 hover:text-rose-500 transition-colors" />
-                <span>Clear All Annotations</span>
-              </button>
-            )}
-          </div>
-        )}
+              )}
+            </>
+          )}
+        </div>
       </div>
 
       {isReadOnly && (
@@ -1629,9 +2031,9 @@ export default function ClinicalNotesView({
                   const isSelected = selectedEntityId === item.entityId;
                   const isEditing = editingIndex?.category === cat.id && editingIndex?.index === idx;
 
-                  // Find primary attribute (either 'name' or 'task' or first string)
-                  const primaryAttr = cat.attributes.find(attr => attr.name === 'name' || attr.name === 'task') || cat.attributes[0];
-                  const primaryValue = item.name || item.task || item[primaryAttr.name] || (item.entityId ? (entities.find(e => e.id === item.entityId)?.name) : '') || `New ${cat.displayName}`;
+                  // Find primary attribute
+                  const primaryAttr = getPrimaryAttribute(cat);
+                  const primaryValue = getItemDisplayName(item, cat, item.entityId ? (entities.find(e => e.id === item.entityId)) : null);
 
                   return (
                     <div
@@ -1661,21 +2063,39 @@ export default function ClinicalNotesView({
                                     {attrDisplayName}
                                   </span>
                                   {attr.type === 'select' ? (
-                                    <select
-                                      value={activeForm[attr.name] || ''}
-                                      onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.value })}
-                                      className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-indigo-400 focus:outline-none transition-colors shadow-sm"
-                                    >
-                                      {(attr.choices || []).map(choice => (
-                                        <option key={choice} value={choice}>{choice}</option>
-                                      ))}
-                                    </select>
+                                    (() => {
+                                      const rawVal = (activeForm[attr.name] !== undefined && activeForm[attr.name] !== '')
+                                        ? activeForm[attr.name]
+                                        : getResolvedAttributeValue(activeForm, attr);
+                                      const { selectedValue, options } = matchChoiceInsensitive(rawVal, attr.choices || [], 'unassigned');
+                                      return (
+                                        <select
+                                          value={selectedValue}
+                                          onChange={e => {
+                                            const val = e.target.value;
+                                            const nextForm = { ...activeForm, [attr.name]: val };
+                                            if (attr.name === 'clinicalStatus') nextForm.status = val;
+                                            if (attr.name === 'status' && cat.attributes.some(a => a.name === 'clinicalStatus')) {
+                                              const clinAttr = cat.attributes.find(a => a.name === 'clinicalStatus');
+                                              const match = clinAttr?.choices?.find(c => c.toLowerCase() === val.toLowerCase());
+                                              nextForm.clinicalStatus = match || val;
+                                            }
+                                            setActiveForm(nextForm);
+                                          }}
+                                          className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-indigo-400 focus:outline-none transition-colors shadow-sm cursor-pointer"
+                                        >
+                                          {options.map(choice => (
+                                            <option key={choice} value={choice}>{choice}</option>
+                                          ))}
+                                        </select>
+                                      );
+                                    })()
                                   ) : attr.type === 'boolean' ? (
                                     <div className="flex items-center h-9">
                                       <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none">
                                         <input
                                           type="checkbox"
-                                          checked={!!activeForm[attr.name]}
+                                          checked={!!((activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : getResolvedAttributeValue(activeForm, attr))}
                                           onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.checked })}
                                           className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-400 h-4 w-4"
                                         />
@@ -1684,7 +2104,7 @@ export default function ClinicalNotesView({
                                     </div>
                                   ) : attr.type === 'textarea' ? (
                                     <textarea
-                                      value={activeForm[attr.name] || ''}
+                                      value={(activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : (getResolvedAttributeValue(activeForm, attr) || '')}
                                       onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.value })}
                                       className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 py-1.5 focus:ring-1 focus:ring-indigo-400 focus:outline-none min-h-[72px] bg-white transition-colors shadow-sm"
                                       placeholder={attr.hint || `Enter ${attrDisplayName.toLowerCase()}`}
@@ -1692,7 +2112,7 @@ export default function ClinicalNotesView({
                                   ) : (
                                     <input
                                       type={attr.type === 'number' ? 'number' : 'text'}
-                                      value={activeForm[attr.name] || ''}
+                                      value={(activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : (getResolvedAttributeValue(activeForm, attr) || '')}
                                       onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.value })}
                                       className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-indigo-400 focus:outline-none transition-colors shadow-sm"
                                       placeholder={attr.hint || `Enter ${attrDisplayName.toLowerCase()}`}
@@ -1722,10 +2142,29 @@ export default function ClinicalNotesView({
                       ) : (
                         <div className="space-y-1.5">
                           <div className="flex items-start justify-between gap-2">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <span className="text-slate-800 font-bold text-xs">
                                 {primaryValue}
                               </span>
+                              {(() => {
+                                const supportedAttrMentions = (mentions || [])
+                                  .filter(m => m.entityId === item.entityId && m.supportedAttribute && m.textSpan?.text);
+                                if (supportedAttrMentions.length === 0) return null;
+                                return (
+                                  <div className="flex flex-wrap gap-1 items-center">
+                                    {supportedAttrMentions.map((m, mIdx) => (
+                                      <span
+                                        key={mIdx}
+                                        className="text-[9px] font-mono font-bold bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded"
+                                        title={`Mention "${m.textSpan?.text}" grounds attribute "${m.supportedAttribute}"`}
+                                      >
+                                        <span className="text-violet-500 uppercase mr-1">{m.supportedAttribute}:</span>
+                                        "{m.textSpan?.text}"
+                                      </span>
+                                    ))}
+                                  </div>
+                                );
+                              })()}
                             </div>
                             {!isReadOnly && (
                               <div className="flex gap-1 opacity-0 group-hover:opacity-100 hover:opacity-100 transition-opacity">
@@ -1748,18 +2187,24 @@ export default function ClinicalNotesView({
                           {/* Attributes render */}
                           <div className="flex flex-wrap items-center gap-2 pt-0.5">
                             {cat.attributes
-                              .filter(attr => attr.name !== primaryAttr.name && item[attr.name] !== undefined && item[attr.name] !== '')
+                              .filter(attr => attr.name !== primaryAttr.name)
                               .map(attr => {
-                                const val = item[attr.name];
-                                const isBoldValue = attr.type === 'select' && val !== 'Unspecified';
+                                const val = (item[attr.name] !== undefined && item[attr.name] !== '')
+                                  ? item[attr.name]
+                                  : getResolvedAttributeValue(item, attr);
+                                if (val === undefined || val === '' || val === null) return null;
+                                const isNegativeAttr = typeof val === 'string' && /^(absent|refuted|denied|none|negative|none \/ denied|refuted \/ absent)$/i.test(val.trim());
+                                const isBoldValue = attr.type === 'select' && String(val).toLowerCase() !== 'unspecified' && String(val).toLowerCase() !== 'unassigned';
                                 const attrDisplayName = attr.displayName || attr.name.replace(/([A-Z])/g, ' $1').replace(/^[a-z]/, (str: string) => str.toUpperCase()).trim();
                                 return (
                                   <span
                                     key={attr.name}
                                     className={`text-[9px] px-1.5 py-0.5 rounded-md font-medium border ${
-                                      isBoldValue
-                                        ? 'bg-indigo-50/50 text-indigo-700 border-indigo-100 font-bold'
-                                        : 'bg-slate-100/50 text-slate-600 border-slate-200'
+                                      isNegativeAttr
+                                        ? 'bg-rose-50 text-rose-700 border-rose-200 font-semibold'
+                                        : isBoldValue
+                                          ? 'bg-indigo-50/50 text-indigo-700 border-indigo-100 font-bold'
+                                          : 'bg-slate-100/50 text-slate-600 border-slate-200'
                                     }`}
                                   >
                                     <span className="text-slate-400 font-mono font-medium">{attrDisplayName}:</span> {val === true ? 'Yes' : val === false ? 'No' : String(val)}
@@ -2405,6 +2850,15 @@ export default function ClinicalNotesView({
           </div>
         </div>
       )}
+
+      <ExportJsonlModal
+        isOpen={showExportJsonlModal}
+        onClose={() => setShowExportJsonlModal(false)}
+        entities={entities}
+        mentions={mentions}
+        relations={relations}
+        clinicalNotes={clinicalNotes}
+      />
     </div>
   );
 }

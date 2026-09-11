@@ -1,9 +1,11 @@
-import { useState, useEffect } from 'react';
-import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit, Key } from 'lucide-react';
+import { isJsonOrJsonlFormat } from '../utils/transcriptParser';
 
 interface ConversationEditorProps {
   rawTranscript: string;
   onTranscriptChange: (text: string) => void;
+  onFocusEditor?: () => void;
   onAnnotate: () => void;
   onDiarize: () => void;
   onManualAnnotate: () => void;
@@ -14,6 +16,8 @@ interface ConversationEditorProps {
   encounterType?: 'dialogue' | 'note';
   isReadOnly?: boolean;
   isServerReady?: boolean;
+  onOpenSettings?: () => void;
+  hasApiKey?: boolean;
 }
 
 const DIALOGUE_TEMPLATES = [
@@ -108,15 +112,10 @@ Patient is instructed to schedule a follow-up spirometry check in 4 weeks with D
   }
 ];
 
-const isJsonlFormat = (text: string) => {
-  if (!text) return false;
-  const firstLine = text.trim().split('\n')[0];
-  return firstLine.startsWith('{') && firstLine.endsWith('}');
-};
-
 export default function ConversationEditor({
   rawTranscript,
   onTranscriptChange,
+  onFocusEditor,
   onAnnotate,
   onDiarize,
   onManualAnnotate,
@@ -126,10 +125,31 @@ export default function ConversationEditor({
   warningMessage,
   encounterType = 'dialogue',
   isReadOnly = false,
-  isServerReady = true
+  isServerReady = true,
+  onOpenSettings,
+  hasApiKey = false
 }: ConversationEditorProps) {
+  const [localText, setLocalText] = useState(rawTranscript);
   const [selectedTemplateIdx, setSelectedTemplateIdx] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const isTypingRef = useRef(false);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Sync external rawTranscript changes when user is not actively typing
+  useEffect(() => {
+    if (!isTypingRef.current) {
+      setLocalText(rawTranscript);
+    }
+  }, [rawTranscript]);
+
+  // Clean up timer on unmount
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
 
   // Reset template index if encounter type changes
   useEffect(() => {
@@ -138,21 +158,53 @@ export default function ConversationEditor({
 
   const templates = encounterType === 'note' ? NOTE_TEMPLATES : DIALOGUE_TEMPLATES;
 
-  const applyTemplate = (idx: number) => {
-    setSelectedTemplateIdx(idx);
-    onTranscriptChange(templates[idx].text);
+  const handleTextChange = (newText: string) => {
+    setLocalText(newText);
+    isTypingRef.current = true;
+
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(() => {
+      onTranscriptChange(newText);
+      isTypingRef.current = false;
+    }, 450);
   };
 
-  const isJsonl = isJsonlFormat(rawTranscript);
+  const handleBlur = () => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    if (localText !== rawTranscript) {
+      onTranscriptChange(localText);
+    }
+    isTypingRef.current = false;
+  };
+
+  const applyTemplate = (idx: number) => {
+    setSelectedTemplateIdx(idx);
+    const templateText = templates[idx].text;
+    setLocalText(templateText);
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    isTypingRef.current = false;
+    onTranscriptChange(templateText);
+  };
+
+  const isJsonl = isJsonOrJsonlFormat(localText);
 
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(rawTranscript);
+    navigator.clipboard.writeText(localText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const downloadTranscript = () => {
-    const blob = new Blob([rawTranscript], { type: isJsonl ? 'application/jsonl+json' : 'text/plain' });
+    const blob = new Blob([localText], { type: isJsonl ? 'application/jsonl+json' : 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -161,6 +213,19 @@ export default function ConversationEditor({
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const handleAnnotateClick = () => {
+    // Flush any pending text before annotating
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    if (localText !== rawTranscript) {
+      onTranscriptChange(localText);
+    }
+    isTypingRef.current = false;
+    onAnnotate();
   };
 
   return (
@@ -207,6 +272,18 @@ export default function ConversationEditor({
               <div className="text-xs leading-normal flex-1">
                 <span className="font-bold">{isError ? 'System Error / Diagnosis Trace:' : 'Notice / Info:'}</span>{' '}
                 {warningMessage.split('\n')[0]}
+                {onOpenSettings && (warningMessage.toLowerCase().includes('api key') || warningMessage.toLowerCase().includes('popup')) && (
+                  <div className="mt-2.5">
+                    <button
+                      type="button"
+                      onClick={onOpenSettings}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+                    >
+                      <Key className="w-3.5 h-3.5" />
+                      <span>Set Your API Key in Popup</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
             
@@ -226,7 +303,7 @@ export default function ConversationEditor({
         );
       })()}
 
-      {rawTranscript.trim() && (
+      {localText.trim() && (
         <div className="flex items-center justify-between bg-slate-50/80 border border-slate-100 rounded-xl px-3 py-2 text-xs">
           <div className="flex items-center gap-1.5">
             {isJsonl ? (
@@ -263,8 +340,10 @@ export default function ConversationEditor({
 
       <div className="relative">
         <textarea
-          value={rawTranscript}
-          onChange={(e) => onTranscriptChange(e.target.value)}
+          value={localText}
+          onChange={(e) => handleTextChange(e.target.value)}
+          onBlur={handleBlur}
+          onFocus={onFocusEditor}
           placeholder={
             encounterType === 'note'
               ? "Type or paste the unstructured clinical note, referral letter, or SOAP summary here..."
@@ -277,9 +356,33 @@ export default function ConversationEditor({
           readOnly={isReadOnly}
         />
         <div className="absolute bottom-3 right-3 text-[9px] font-mono text-slate-400 select-none pointer-events-none">
-          {rawTranscript.length} characters
+          {localText.length} characters
         </div>
       </div>
+
+      {/* API Key hint if unset */}
+      {!hasApiKey && !isReadOnly && (
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-amber-50/80 border border-amber-200/70 rounded-xl text-xs text-amber-900 shadow-2xs">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 bg-amber-200/60 text-amber-800 rounded-lg shrink-0">
+              <Key className="w-4 h-4" />
+            </div>
+            <div>
+              <span className="font-bold text-amber-950">Bring Your Own Key:</span> The default Gemini key is unset. You can configure your own Gemini or OpenAI API key in the popup to run live AI models, or explore using the local rule demo.
+            </div>
+          </div>
+          {onOpenSettings && (
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded-lg transition-all shadow-2xs cursor-pointer flex items-center gap-1.5 shrink-0 self-start sm:self-auto"
+            >
+              <Key className="w-3.5 h-3.5" />
+              <span>Set Keys in Popup</span>
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-1">
         <div className="flex items-center gap-1.5 text-[10px] text-slate-400">
@@ -345,12 +448,12 @@ export default function ConversationEditor({
               </button>
 
               <button
-                onClick={onAnnotate}
-                disabled={status === 'processing' || isDiarizing || !rawTranscript.trim() || !isServerReady}
+                onClick={handleAnnotateClick}
+                disabled={status === 'processing' || isDiarizing || !localText.trim() || !isServerReady}
                 className={`flex items-center gap-1.5 text-xs font-semibold px-5 py-2.5 rounded-lg shadow-sm transition-all cursor-pointer ${
                   status === 'processing' || isDiarizing || !isServerReady
                     ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
-                    : !rawTranscript.trim()
+                    : !localText.trim()
                     ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
                     : 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-md'
                 }`}

@@ -1,12 +1,17 @@
 import { useState, useEffect, useRef, MouseEvent } from 'react';
-import { Entity, Relation, EntityType } from '../types';
-import { Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Info, Download } from 'lucide-react';
+import { Entity, Relation, EntityType, Mention } from '../types';
+import { Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Info, Download, FileCode, Share2, Sparkles } from 'lucide-react';
+import { generateJsonlContent, downloadJsonlFile } from '../utils/exportJsonl';
 
 interface KnowledgeGraphProps {
   entities: Entity[];
   relations: Relation[];
+  mentions?: Mention[];
   selectedEntityId?: string | null;
   onSelectEntity: (id: string | null) => void;
+  onGenerateRelations?: () => void;
+  isGeneratingRelations?: boolean;
+  isReadOnly?: boolean;
 }
 
 interface GraphNode {
@@ -30,8 +35,12 @@ interface GraphLink {
 export default function KnowledgeGraph({
   entities,
   relations,
+  mentions = [],
   selectedEntityId,
-  onSelectEntity
+  onSelectEntity,
+  onGenerateRelations,
+  isGeneratingRelations = false,
+  isReadOnly = false
 }: KnowledgeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [nodes, setNodes] = useState<GraphNode[]>([]);
@@ -325,6 +334,11 @@ export default function KnowledgeGraph({
     downloadAnchor.remove();
   };
 
+  const exportGraphJsonl = () => {
+    const jsonl = generateJsonlContent('entities_mentions', null, entities, mentions || [], relations);
+    downloadJsonlFile(jsonl, `clinical_knowledge_graph_${Date.now()}.jsonl`);
+  };
+
   // Node Color Mapper
   const getNodeColor = (type: EntityType) => {
     switch (type) {
@@ -383,6 +397,21 @@ export default function KnowledgeGraph({
           border: '#16a34a', // green-600
           text: '#14532d', // green-950
           shadow: 'rgba(22, 163, 74, 0.2)'
+        };
+      case 'SocialStatus':
+      case 'SocialHistory':
+        return {
+          bg: '#f7fee7', // lime-50
+          border: '#65a30d', // lime-600
+          text: '#365314', // lime-950
+          shadow: 'rgba(101, 163, 13, 0.2)'
+        };
+      case 'Observation':
+        return {
+          bg: '#ecfeff', // cyan-50
+          border: '#0891b2', // cyan-600
+          text: '#164e63', // cyan-950
+          shadow: 'rgba(8, 145, 178, 0.2)'
         };
       default:
         return {
@@ -452,7 +481,79 @@ export default function KnowledgeGraph({
           <Download className="w-3.5 h-3.5" />
           <span>Export JSON</span>
         </button>
+        <button
+          onClick={exportGraphJsonl}
+          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg shadow-sm transition-all cursor-pointer font-semibold text-xs ml-1"
+          title="Export Entities & Mentions to JSONL format"
+        >
+          <FileCode className="w-3.5 h-3.5 text-indigo-600" />
+          <span>Export JSONL</span>
+        </button>
+
+        {onGenerateRelations && !isReadOnly && (
+          <button
+            onClick={onGenerateRelations}
+            disabled={isGeneratingRelations || entities.length === 0}
+            className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-lg shadow-sm transition-all cursor-pointer font-semibold text-xs ml-2 disabled:opacity-50 disabled:cursor-not-allowed border border-blue-600"
+            title={entities.length === 0 ? "Extract clinical entities first in dialogue view" : "Generate Knowledge Graph relations between extracted entities"}
+          >
+            {isGeneratingRelations ? (
+              <>
+                <svg className="animate-spin h-3.5 w-3.5 text-white" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+                <span>Generating Relations...</span>
+              </>
+            ) : (
+              <>
+                <Share2 className="w-3.5 h-3.5" />
+                <span>{relations.length > 0 ? 'Regenerate Relations' : 'Generate Relations'}</span>
+              </>
+            )}
+          </button>
+        )}
       </div>
+
+      {/* Informative banner when entities exist but relations have not been generated yet */}
+      {entities.length > 0 && relations.length === 0 && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-10 bg-white/95 backdrop-blur border border-blue-200 rounded-xl px-4 py-3 shadow-md flex items-center gap-3 max-w-md pointer-events-auto">
+          <div className="p-2 bg-blue-50 border border-blue-100 rounded-lg text-blue-600 shrink-0">
+            <Share2 className="w-4 h-4" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h5 className="text-xs font-semibold text-slate-800">
+              Relations Not Generated ({entities.length} entities available)
+            </h5>
+            <p className="text-[11px] text-slate-500 mt-0.5">
+              Knowledge graph relation generation is separated from entity annotation.
+            </p>
+          </div>
+          {onGenerateRelations && !isReadOnly && (
+            <button
+              onClick={onGenerateRelations}
+              disabled={isGeneratingRelations}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold shrink-0 cursor-pointer shadow-sm transition-all disabled:opacity-50"
+            >
+              <Sparkles className="w-3.5 h-3.5 fill-white/20" />
+              <span>{isGeneratingRelations ? 'Generating...' : 'Generate Now'}</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Empty state when no entities exist */}
+      {entities.length === 0 && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none p-6 text-center z-10">
+          <div className="p-3 bg-white/80 border border-slate-200 rounded-2xl shadow-sm text-slate-400 mb-3">
+            <Share2 className="w-6 h-6 text-blue-400" />
+          </div>
+          <p className="text-sm font-semibold text-slate-700">No Clinical Entities Available</p>
+          <p className="text-xs text-slate-500 mt-1 max-w-xs">
+            Run "Generate AI Annotations" first in the dialogue view to extract clinical entities before generating knowledge graph relations.
+          </p>
+        </div>
+      )}
 
       <div className="absolute top-4 right-4 z-10 bg-white/95 backdrop-blur px-3 py-1.5 border border-slate-200 rounded-lg shadow-sm text-[10px] font-mono text-slate-500 max-w-xs pointer-events-none hidden md:block">
         Drag nodes to reorganize. Click node to inspect details.
@@ -697,6 +798,27 @@ export default function KnowledgeGraph({
                 )}
               </div>
             )}
+
+            {(() => {
+              const entityMentions = (mentions || []).filter(m => m.entityId === activeSelectedEntity?.id);
+              const supportedAttrMentions = entityMentions.filter(m => Boolean(m.supportedAttribute && m.textSpan?.text));
+              if (supportedAttrMentions.length === 0) return null;
+              return (
+                <div className="mt-2 pt-2 border-t border-slate-100 flex flex-wrap gap-1.5 items-center">
+                  <span className="text-[8px] font-bold text-slate-400 uppercase tracking-wider mr-1.5 font-mono">Supported Attributes:</span>
+                  {supportedAttrMentions.map((m, idx) => (
+                    <span
+                      key={idx}
+                      className="inline-flex items-center text-[9px] font-mono font-bold px-2 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
+                      title={`Mention "${m.textSpan?.text}" grounds attribute "${m.supportedAttribute}"`}
+                    >
+                      <span className="text-violet-500 uppercase mr-1">{m.supportedAttribute}:</span>
+                      "{m.textSpan?.text}"
+                    </span>
+                  ))}
+                </div>
+              );
+            })()}
           </div>
           <button
             onClick={() => onSelectEntity(null)}
