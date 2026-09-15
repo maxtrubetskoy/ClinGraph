@@ -1,7 +1,13 @@
+import { formatAttributeValue } from '../utils/attributeValues';
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { TranscriptSegment, Entity, ClinicalCategory, EntityType, Mention, Relation, AnnotationCategory, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
 import { MessageSquare, Plus, X, Sparkles, Brain, Info, FileText, Trash2, Scissors, ChevronDown, UserCheck } from 'lucide-react';
+import { getMentionAttributeName } from '../utils/evidence';
+import { mentionRoleLabel, mentionContextLabel, mentionContextDefaults, normalizeMentionContext, type MentionEvidenceRole } from '../utils/mentionContext';
 import { calculateGlobalWordSpan } from '../utils/wordAnchoring';
+
+const annotationFieldLabelClass = 'text-2xs font-semibold text-slate-500 uppercase font-sans';
+const annotationFieldSelectClass = 'w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-brand-400 bg-white font-medium text-slate-800';
 
 interface RawTranscriptViewProps {
   segments: TranscriptSegment[];
@@ -106,31 +112,16 @@ export default function RawTranscriptView({
     return activeSchema[0]?.id || 'symptoms';
   });
   const [selectedEntityToMap, setSelectedEntityToMap] = useState<string>('__new__');
-  const [annotationSupportedAttribute, setAnnotationSupportedAttribute] = useState<string>('');
-
-  // Smart prefill for supported attribute when a text span is selected (e.g. "145" -> "value", "moderate" -> "severity")
+  const [evidenceKind, setEvidenceKind] = useState<'entity' | 'attribute'>('entity');
+  const [selectedAttributeId, setSelectedAttributeId] = useState('');
+  const [evidenceRole, setEvidenceRole] = useState<MentionEvidenceRole>('unassigned');
+  useEffect(() => { setEvidenceRole('unassigned'); }, [pendingAnnotation]);
   useEffect(() => {
-    if (pendingAnnotation) {
-      const trimmed = pendingAnnotation.text.trim().toLowerCase();
-      if (/^(\d+(\/\d+)?(\.\d+)?|\b\d+\s*(mmhg|bpm|%)\b)/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('value');
-      } else if (/\b\d+\s*(mg|mcg|g|ml|tablets?|pills?|units?)\b/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('dosage');
-      } else if (/\b(mild|moderate|severe|sharp|dull|intense|slight|extreme)\b/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('severity');
-      } else if (/\b(active|resolved|chronic|refuted|absent|denied|confirmed)\b/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('status');
-      } else if (/\b(daily|bid|tid|qid|prn|twice|once|every\s+\w+)\b/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('frequency');
-      } else if (/\b(yesterday|days?|weeks?|months?|years?|ago|since|started)\b/i.test(trimmed)) {
-        setAnnotationSupportedAttribute('onset');
-      } else {
-        setAnnotationSupportedAttribute('');
-      }
-    } else {
-      setAnnotationSupportedAttribute('');
-    }
-  }, [pendingAnnotation]);
+    if (selectedEntityToMap === '__new__') setEvidenceKind('entity');
+    setSelectedAttributeId('');
+  }, [selectedEntityToMap, pendingAnnotation]);
+  const parentEntity = entities.find(entity => entity.id === selectedEntityToMap);
+  const attributeOptions = parentEntity?.attributes || [];
 
   // Synchronize selectedCategoryId if activeSchema changes
   useEffect(() => {
@@ -143,15 +134,6 @@ export default function RawTranscriptView({
     return activeSchema.find(c => c.id === selectedCategoryId) || activeSchema[0];
   }, [activeSchema, selectedCategoryId]);
 
-  const availableCategoryAttributes = useMemo(() => {
-    const attrs = new Set<string>();
-    if (selectedCategory?.attributes) {
-      selectedCategory.attributes.forEach(a => attrs.add(a.name));
-    }
-    ['value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'].forEach(a => attrs.add(a));
-    return Array.from(attrs);
-  }, [selectedCategory]);
-
   // Reset selectedEntityToMap when category changes
   useEffect(() => {
     setSelectedEntityToMap('__new__');
@@ -161,6 +143,7 @@ export default function RawTranscriptView({
   const eligibleEntitiesForCategory = useMemo(() => {
     if (!selectedCategory) return entities;
     return entities.filter(ent => {
+      if (ent.categoryId) return ent.categoryId === selectedCategory.id;
       const entTypeLower = (ent.type || '').toLowerCase();
       const catIdLower = (selectedCategory.id || '').toLowerCase();
       const catDisplayNameLower = (selectedCategory.displayName || '').toLowerCase();
@@ -176,20 +159,7 @@ export default function RawTranscriptView({
     });
   }, [entities, selectedCategory]);
 
-  // Derive mentions from entities for older sessions or default state
-  const derivedMentions: Mention[] = useMemo(() => {
-    if (mentions && mentions.length > 0) {
-      return mentions;
-    }
-    return (entities || [])
-      .filter(ent => ent.textSpan && ent.textSpan.lineIndex >= 0)
-      .map(ent => ({
-        id: `m_${ent.id}`,
-        textSpan: ent.textSpan!,
-        entityType: ent.type,
-        entityId: ent.id
-      }));
-  }, [mentions, entities]);
+  const derivedMentions = mentions;
 
   const enrichedSegments = getSegmentsWithTimestamps(segments);
 
@@ -224,6 +194,7 @@ export default function RawTranscriptView({
 
   const handleCreateEntityFromSpan = () => {
     if (!pendingAnnotation || !onUpdateNotes) return;
+    if (evidenceKind === 'attribute' && !attributeOptions.some(attribute => attribute.id === selectedAttributeId)) return;
 
     const notes = clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] };
     const currentEntities = entities || [];
@@ -240,7 +211,7 @@ export default function RawTranscriptView({
 
     if (selectedEntityToMap === '__new__') {
       targetEntityId = `e_user_${Date.now()}`;
-      
+
       const newItem: Record<string, any> = { entityId: targetEntityId };
       if (targetCat && targetCat.attributes && targetCat.attributes.length > 0) {
         targetCat.attributes.forEach(attr => {
@@ -269,7 +240,7 @@ export default function RawTranscriptView({
 
       const detailsParts = targetCat?.attributes
         ?.filter(attr => attr.name !== primaryAttr.name && attr.name !== 'name' && attr.name !== 'task' && attr.name !== 'title' && newItem[attr.name])
-        ?.map(attr => `${attr.name}: ${newItem[attr.name]}`)
+        ?.map(attr => `${attr.name}: ${formatAttributeValue(newItem[attr.name])}`)
         ?.filter(Boolean) || [];
 
       const targetSeg = enrichedSegments[pendingAnnotation.lineIndex];
@@ -284,6 +255,7 @@ export default function RawTranscriptView({
         id: targetEntityId,
         name: pendingAnnotation.text,
         type: catEntityType,
+        categoryId: catId,
         description: detailsParts.join(' | ') || `${targetCat?.displayName || catEntityType} (Annotated manually from dialogue)`,
         textSpan: {
           lineIndex: pendingAnnotation.lineIndex,
@@ -308,7 +280,7 @@ export default function RawTranscriptView({
     );
 
     const newMentionId = `m_user_${Date.now()}`;
-    const newMention: Mention = {
+    const newMention: Mention = normalizeMentionContext({
       id: newMentionId,
       segmentId: targetSeg?.id,
       globalStartWord: wordSpan?.globalStartWord,
@@ -326,13 +298,13 @@ export default function RawTranscriptView({
       speaker: targetSeg?.speaker || 'unassigned',
       entityType: catEntityType,
       entityId: targetEntityId,
-      polarity: 'unassigned',
-      certainty: 'unassigned',
-      temporality: 'unassigned',
+      evidenceRole,
+      target: evidenceKind === 'attribute'
+        ? { kind: 'attribute', entityId: targetEntityId, attributeId: selectedAttributeId }
+        : { kind: 'entity', entityId: targetEntityId },
+      ...mentionContextDefaults(evidenceRole),
       experiencer: 'unassigned',
-      function: 'unassigned',
-      supportedAttribute: annotationSupportedAttribute.trim() || undefined
-    };
+    });
 
     const updatedMentions = [...currentMentions, newMention];
 
@@ -341,13 +313,15 @@ export default function RawTranscriptView({
 
     onUpdateNotes(updatedNotes as ClinicalCategory, updatedEntities, undefined, updatedMentions);
     setPendingAnnotation(null);
-    setAnnotationSupportedAttribute('');
+    setSelectedAttributeId('');
     setSelectedEntityToMap('__new__');
-    if (onSelectMention) {
-      onSelectMention(newMentionId);
-    }
+    // Selecting an entity clears the old mention selection in App. Select the new
+    // mention afterwards so its role/context editor remains open after creation.
     if (onSelectEntity && targetEntityId) {
       onSelectEntity(targetEntityId);
+    }
+    if (onSelectMention) {
+      onSelectMention(newMentionId);
     }
   };
 
@@ -393,9 +367,9 @@ export default function RawTranscriptView({
       if (element) {
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
         // Pulse animation effect
-        element.classList.add('ring-4', 'ring-indigo-400', 'ring-offset-1', 'scale-110');
+        element.classList.add('ring-4', 'ring-brand-400', 'ring-offset-1', 'scale-110');
         const timer = setTimeout(() => {
-          element.classList.remove('ring-4', 'ring-indigo-400', 'ring-offset-1', 'scale-110');
+          element.classList.remove('ring-4', 'ring-brand-400', 'ring-offset-1', 'scale-110');
         }, 2500);
         return () => clearTimeout(timer);
       } else {
@@ -437,7 +411,7 @@ export default function RawTranscriptView({
     return (
       <div className="bg-white border border-slate-200 rounded-xl p-6 text-center shadow-sm">
         <MessageSquare className="w-8 h-8 text-slate-300 mx-auto mb-2" />
-        <p className="text-xs text-slate-400 italic">No structured transcription dialogue available yet.</p>
+        <p className="text-xs text-slate-500 italic">No structured transcription dialogue available yet.</p>
       </div>
     );
   }
@@ -483,10 +457,10 @@ export default function RawTranscriptView({
   const findClosestOccurrence = (text: string, term: string, targetIndex: number) => {
     const lowerText = text.toLowerCase();
     const lowerTerm = term.toLowerCase();
-    
+
     let bestStart = -1;
     let minDiff = Infinity;
-    
+
     let index = lowerText.indexOf(lowerTerm);
     while (index !== -1) {
       const diff = Math.abs(index - targetIndex);
@@ -496,7 +470,7 @@ export default function RawTranscriptView({
       }
       index = lowerText.indexOf(lowerTerm, index + 1);
     }
-    
+
     if (bestStart !== -1) {
       return { start: bestStart, end: bestStart + term.length };
     }
@@ -552,7 +526,7 @@ export default function RawTranscriptView({
         }
       };
     }).filter(m =>
-      m.textSpan.startChar >= 0 && 
+      m.textSpan.startChar >= 0 &&
       m.textSpan.endChar > m.textSpan.startChar &&
       m.textSpan.startChar <= segText.length
     );
@@ -588,7 +562,7 @@ export default function RawTranscriptView({
 
       // Find canonical entity name if mapped
       const mappedEntity = entities.find(e => e.id === mention.entityId);
-      const tooltipText = mappedEntity 
+      const tooltipText = mappedEntity
         ? `${mention.entityType}: ${mappedEntity.name} ${mappedEntity.umlsMapping ? '🧬 UMLS Mapped' : ''}`
         : `${mention.entityType}: "${span.text}" (Unmapped)`;
 
@@ -605,11 +579,11 @@ export default function RawTranscriptView({
               onSelectMention(mention.id === selectedMentionId ? null : mention.id);
             }
           }}
-          className={`inline-block px-1 py-0.5 mx-0.5 rounded font-medium cursor-pointer transition-all duration-200 border text-[11px] ${
+          className={`inline-block px-1 py-0.5 mx-0.5 rounded font-medium cursor-pointer transition-all duration-200 border text-2xs ${
             isMentionSelected
-              ? 'bg-indigo-600 text-white border-indigo-700 ring-2 ring-indigo-400 scale-105 font-bold shadow-md'
+              ? 'bg-brand-600 text-white border-brand-700 ring-2 ring-brand-400 scale-105 font-semibold shadow-md'
               : isSelected
-                ? 'bg-blue-600 text-white border-blue-700 ring-2 ring-blue-300 scale-105 font-semibold shadow-sm'
+                ? 'bg-brand-600 text-white border-brand-700 ring-2 ring-brand-300 scale-105 font-semibold shadow-sm'
                 : `${typeColorClass} hover:brightness-95 hover:scale-102`
           }`}
           title={tooltipText}
@@ -637,54 +611,57 @@ export default function RawTranscriptView({
     : null;
 
   return (
-    <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm flex flex-col h-[calc(100vh-200px)] max-h-[calc(100vh-8rem)] min-h-[400px]">
-      <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100 shrink-0">
+    <div className="flex flex-col h-[calc(100dvh-200px)] min-h-[440px]">
+      <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-4 border-b border-slate-100 shrink-0">
         <div className="flex items-center gap-2">
           {encounterType === 'note' ? (
-            <FileText className="w-4 h-4 text-indigo-500" />
+            <FileText className="w-4 h-4 text-brand-500" />
           ) : (
-            <MessageSquare className="w-4 h-4 text-blue-500" />
+            <MessageSquare className="w-4 h-4 text-brand-600" />
           )}
           <h3 className="text-sm font-semibold text-slate-800">
-            {encounterType === 'note' ? 'Annotated Clinical Document' : 'Diarized Conversation Dialogue'}
+            {encounterType === 'note' ? 'Annotated document' : 'Annotated dialogue'}
           </h3>
         </div>
         <div className="text-right">
-          <span className="text-[10px] text-slate-400 font-mono block">Click terms to inspect</span>
-          <span className="text-[9px] text-blue-500 font-medium block">Highlight text to annotate new entity</span>
+          <span className="text-2xs text-slate-500 block">Click a term to inspect</span>
+          <span className="text-2xs text-brand-600 font-medium block">Select text to add an annotation</span>
         </div>
       </div>
 
       {activeSelectedMention && !pendingAnnotation && (
-        <div className="bg-indigo-50/90 border border-indigo-200/90 rounded-xl p-2.5 mb-4 shadow-xs flex items-center justify-between gap-3 animate-fadeIn shrink-0">
+        <div className="bg-brand-50/90 border border-brand-200/90 rounded-xl p-2.5 mb-4 shadow-xs flex items-center justify-between gap-3 animate-fadeIn shrink-0">
           <div className="flex items-center gap-2 min-w-0 flex-wrap">
-            <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-700 font-mono flex items-center gap-1 shrink-0">
-              <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+            <span className="text-2xs font-semibold uppercase tracking-wider text-brand-700 font-sans flex items-center gap-1 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-brand-500 animate-pulse"></span>
               Selected Mention:
             </span>
-            <span className="text-xs font-semibold italic text-slate-800 bg-white px-2 py-0.5 rounded border border-indigo-100 shadow-xs truncate max-w-[200px]" title={activeSelectedMention.textSpan?.text}>
+            <span className="text-xs font-semibold italic text-slate-800 bg-white px-2 py-0.5 rounded border border-brand-100 shadow-xs truncate max-w-[200px]" title={activeSelectedMention.textSpan?.text}>
               "{activeSelectedMention.textSpan?.text}"
             </span>
-            <span className="text-[9px] bg-indigo-100 text-indigo-800 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+            <span className="text-2xs bg-brand-100 text-brand-800 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
               {encounterType === 'note' ? `Section ${(activeSelectedMention.textSpan?.lineIndex ?? 0) + 1}` : `U-${activeSelectedMention.textSpan?.lineIndex}`}
             </span>
             {(activeSelectedMention.globalStartWord !== undefined || activeSelectedMention.textSpan?.globalStartWord !== undefined) && (
-              <span className="text-[9px] bg-slate-200/80 text-slate-700 px-1.5 py-0.5 rounded font-mono font-medium shrink-0" title="Global word count offset across text stream (invariant to utterance splits & speaker changes)">
+              <span className="text-2xs bg-slate-200/80 text-slate-700 px-1.5 py-0.5 rounded font-mono font-medium shrink-0" title="Global word count offset across text stream (invariant to utterance splits & speaker changes)">
                 Word W{activeSelectedMention.globalStartWord ?? activeSelectedMention.textSpan?.globalStartWord}{(activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord) !== undefined && (activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord) !== (activeSelectedMention.globalStartWord ?? activeSelectedMention.textSpan?.globalStartWord) ? `–W${activeSelectedMention.globalEndWord ?? activeSelectedMention.textSpan?.globalEndWord}` : ''}
               </span>
             )}
             {activeSelectedMention.canonicalName && (
-              <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded font-medium shrink-0" title="Canonical Concept (EN)">
+              <span className="text-2xs bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded font-medium shrink-0" title="Canonical Concept (EN)">
                 EN: <strong>{activeSelectedMention.canonicalName}</strong>
               </span>
             )}
-            {activeSelectedMention.supportedAttribute && (
-              <span className="text-[9px] bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded font-mono font-bold shrink-0" title="Supported Entity Attribute">
-                attr: {activeSelectedMention.supportedAttribute}
+            {getMentionAttributeName(activeSelectedMention, entities) && (
+              <span className="text-2xs bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded font-mono font-semibold shrink-0" title="Supported Entity Attribute">
+                attr: {getMentionAttributeName(activeSelectedMention, entities)}
               </span>
             )}
+            <span className="text-2xs bg-white text-brand-700 px-1.5 py-0.5 rounded border border-brand-200">
+              {mentionRoleLabel(activeSelectedMention.evidenceRole)}
+            </span>
             {activeSelectedMention.polarity && (
-              <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-medium shrink-0 border ${
+              <span className={`text-2xs px-1.5 py-0.5 rounded font-mono font-medium shrink-0 border ${
                 activeSelectedMention.polarity === 'negative'
                   ? 'bg-rose-50 text-rose-700 border-rose-200'
                   : 'bg-slate-50 text-slate-600 border-slate-200'
@@ -693,27 +670,27 @@ export default function RawTranscriptView({
               </span>
             )}
             {activeSelectedMention.temporality && (
-              <span className="text-[9px] bg-slate-50 text-slate-600 border border-slate-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
-                {activeSelectedMention.temporality}
+              <span className="text-2xs bg-slate-50 text-slate-600 border border-slate-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                Temporality: {mentionContextLabel(activeSelectedMention.temporality)}
               </span>
             )}
-            {activeSelectedMention.certainty && activeSelectedMention.certainty !== 'certain' && (
-              <span className="text-[9px] bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
-                {activeSelectedMention.certainty}
+            {activeSelectedMention.certainty && (
+              <span className="text-2xs bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                Certainty: {mentionContextLabel(activeSelectedMention.certainty)}
               </span>
             )}
             {activeSelectedMention.experiencer && activeSelectedMention.experiencer !== 'patient' && (
-              <span className="text-[9px] bg-purple-50 text-purple-700 border border-purple-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+              <span className="text-2xs bg-purple-50 text-purple-700 border border-purple-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
                 exp: {activeSelectedMention.experiencer}
               </span>
             )}
-            {activeSelectedMention.function && activeSelectedMention.function !== 'asserted' && (
-              <span className="text-[9px] bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
-                fn: {activeSelectedMention.function}
+            {activeSelectedMention.function && (
+              <span className="text-2xs bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded font-mono font-medium shrink-0">
+                Function: {mentionContextLabel(activeSelectedMention.function)}
               </span>
             )}
             {activeSelectedMentionEntity && (
-              <span className="text-[10px] text-slate-600 font-medium truncate max-w-[200px]">
+              <span className="text-2xs text-slate-600 font-medium truncate max-w-[200px]">
                 Mapped to: <strong className="text-slate-900">{activeSelectedMentionEntity.name}</strong> ({activeSelectedMention.entityType || activeSelectedMentionEntity.type})
               </span>
             )}
@@ -728,7 +705,7 @@ export default function RawTranscriptView({
                   const notes = clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] };
                   onUpdateNotes(notes, entities, undefined, updatedMentions);
                 }}
-                className="flex items-center gap-1 text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer shadow-xs"
+                className="flex items-center gap-1 text-2xs font-semibold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer shadow-xs"
                 title="Delete this mention highlight from text (keeps entity in clinical notes)"
               >
                 <Trash2 className="w-3.5 h-3.5 text-rose-500" />
@@ -740,7 +717,7 @@ export default function RawTranscriptView({
               onClick={() => {
                 if (onSelectMention) onSelectMention(null);
               }}
-              className="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-200/60 rounded-lg transition-colors cursor-pointer"
+              className="p-1 text-slate-500 hover:text-slate-600 hover:bg-slate-200/60 rounded-lg transition-colors cursor-pointer"
               title="Deselect mention"
             >
               <X className="w-3.5 h-3.5" />
@@ -758,7 +735,7 @@ export default function RawTranscriptView({
                 onClick={() => setAnnotationMode('annotate')}
                 className={`px-2.5 py-1 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer ${
                   annotationMode === 'annotate'
-                    ? 'bg-blue-600 text-white shadow-sm'
+                    ? 'bg-brand-600 text-white shadow-sm'
                     : 'text-slate-600 hover:text-slate-900 hover:bg-blue-100/60'
                 }`}
               >
@@ -772,7 +749,7 @@ export default function RawTranscriptView({
                   onClick={() => setAnnotationMode('split')}
                   className={`px-2.5 py-1 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer ${
                     annotationMode === 'split'
-                      ? 'bg-indigo-600 text-white shadow-sm'
+                      ? 'bg-brand-600 text-white shadow-sm'
                       : 'text-slate-600 hover:text-slate-900 hover:bg-blue-100/60'
                   }`}
                 >
@@ -784,7 +761,7 @@ export default function RawTranscriptView({
 
             <button
               onClick={() => setPendingAnnotation(null)}
-              className="text-slate-400 hover:text-slate-600 cursor-pointer font-bold p-1"
+              className="text-slate-500 hover:text-slate-600 cursor-pointer font-semibold p-1"
             >
               <X className="w-4 h-4" />
             </button>
@@ -794,24 +771,25 @@ export default function RawTranscriptView({
             <div className="mt-2.5 space-y-2.5">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
-                  <span className="text-[9px] font-bold text-slate-400 uppercase font-mono">Selected Span</span>
+                  <span className="text-2xs font-semibold text-slate-500 uppercase font-sans">Selected Span</span>
                   <div className="mt-1 p-2 bg-white border border-slate-200 rounded-lg text-xs font-semibold text-slate-800 italic truncate" title={pendingAnnotation.text}>
                     "{pendingAnnotation.text}"
                   </div>
-                  <div className="mt-0.5 text-[8px] text-slate-400 font-mono">
+                  <div className="mt-0.5 text-2xs text-slate-500 font-mono">
                     Utterance U-{pendingAnnotation.lineIndex}, chars {pendingAnnotation.startChar}-{pendingAnnotation.endChar}
                   </div>
                 </div>
 
                 <div>
-                  <label className="text-[9px] font-bold text-slate-400 uppercase font-mono">Annotation Schema Category</label>
+                  <label className={annotationFieldLabelClass}>Annotation Schema Category</label>
                   <select
+                    aria-label="Annotation schema category"
                     value={selectedCategoryId}
                     onChange={(e) => {
                       setSelectedCategoryId(e.target.value);
                       setSelectedEntityToMap('__new__');
                     }}
-                    className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 mt-1 bg-white font-medium text-slate-800"
+                    className={`${annotationFieldSelectClass} mt-1`}
                   >
                     {activeSchema.map(cat => (
                       <option key={cat.id} value={cat.id}>
@@ -824,11 +802,12 @@ export default function RawTranscriptView({
 
               {/* Clinical Concept Mapping dropdown */}
               <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-lg space-y-1.5">
-                <label className="text-[9px] font-bold text-slate-400 uppercase font-mono block">Clinical Concept Mapping</label>
+                <label className={`${annotationFieldLabelClass} block`}>Clinical Concept Mapping</label>
                 <select
+                  aria-label="Evidence entity"
                   value={selectedEntityToMap}
                   onChange={(e) => setSelectedEntityToMap(e.target.value)}
-                  className="w-full text-xs border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium text-slate-800"
+                  className={annotationFieldSelectClass}
                 >
                   <option value="__new__">🆕 Create new {selectedCategory?.displayName || 'entity'}: "{pendingAnnotation.text}"</option>
                   {eligibleEntitiesForCategory.map(ent => (
@@ -837,84 +816,61 @@ export default function RawTranscriptView({
                     </option>
                   ))}
                 </select>
-                <p className="text-[9px] text-slate-400 leading-normal">
-                  {selectedEntityToMap === '__new__' 
+                <p className="text-2xs text-slate-500 leading-normal">
+                  {selectedEntityToMap === '__new__'
                     ? `This will add a new entry to the ${selectedCategory?.displayName || 'clinical'} schema category and register a new canonical entity.`
-                    : "This will add a new occurrence (highlight) of this term in the text, but map it to the same row in your clinical notes, avoiding duplicates."}
+                    : "Choose whether this text supports the entity itself or one specific attribute below."}
                 </p>
               </div>
 
-              {/* Supported Entity Attribute Input */}
               <div className="bg-white border border-slate-200 p-2.5 rounded-lg space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-[9px] font-bold text-slate-500 uppercase font-mono">
-                    Supported Attribute <span className="font-normal text-slate-400 lowercase">(optional)</span>
-                  </label>
-                  {annotationSupportedAttribute && (
-                    <button
-                      type="button"
-                      onClick={() => setAnnotationSupportedAttribute('')}
-                      className="text-[9px] text-rose-500 hover:text-rose-700 font-semibold cursor-pointer"
-                      title="Clear supported attribute"
-                    >
-                      Clear attribute
-                    </button>
-                  )}
-                </div>
-
-                {/* Quick attribute suggestion buttons */}
-                <div className="flex flex-wrap gap-1 items-center">
-                  <span className="text-[9px] text-slate-400 font-medium">Quick select:</span>
-                  {['value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'].map(attr => (
-                    <button
-                      key={attr}
-                      type="button"
-                      onClick={() => setAnnotationSupportedAttribute(attr)}
-                      className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-medium border transition-colors cursor-pointer ${
-                        annotationSupportedAttribute.toLowerCase() === attr
-                          ? 'bg-violet-600 text-white border-violet-600 shadow-xs'
-                          : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
-                      }`}
-                    >
-                      {attr}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="flex items-center gap-1.5">
-                  <select
-                    value={availableCategoryAttributes.includes(annotationSupportedAttribute) ? annotationSupportedAttribute : (annotationSupportedAttribute ? '__custom__' : '')}
-                    onChange={(e) => {
-                      if (e.target.value === '__custom__') return;
-                      setAnnotationSupportedAttribute(e.target.value);
-                    }}
-                    className="text-xs border border-slate-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white font-medium text-slate-800 flex-1"
-                  >
-                    <option value="">-- None / Primary Concept --</option>
-                    {availableCategoryAttributes.map(attr => (
-                      <option key={attr} value={attr}>
-                        Supports attribute: {attr.toUpperCase()}
-                      </option>
-                    ))}
-                    {annotationSupportedAttribute && !availableCategoryAttributes.includes(annotationSupportedAttribute) && (
-                      <option value="__custom__">Custom: {annotationSupportedAttribute}</option>
-                    )}
+                <label className="block">
+                  <span className={annotationFieldLabelClass}>Evidence supports</span>
+                  <select aria-label="Evidence supports" value={evidenceKind}
+                    onChange={event => setEvidenceKind(event.target.value as 'entity' | 'attribute')}
+                    className={`${annotationFieldSelectClass} mt-1 block`}>
+                    <option value="entity">Entity itself</option>
+                    <option value="attribute" disabled={selectedEntityToMap === '__new__'}>A specific attribute</option>
                   </select>
-                  <input
-                    type="text"
-                    value={annotationSupportedAttribute}
-                    onChange={(e) => setAnnotationSupportedAttribute(e.target.value)}
-                    placeholder="or type attribute..."
-                    className="text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 font-medium text-slate-800 placeholder:text-slate-300 w-36"
-                  />
-                </div>
-
-                <p className="text-[9px] text-slate-400 leading-tight">
-                  Specifies which entity attribute this mention grounds (e.g. mention "145" supports <strong>VALUE</strong>, "moderate" supports <strong>SEVERITY</strong>, "20mg" supports <strong>DOSAGE</strong>).
+                </label>
+                {evidenceKind === 'attribute' && (
+                  <label className="block">
+                    <span className={annotationFieldLabelClass}>Attribute</span>
+                    <select aria-label="Evidence attribute" value={selectedAttributeId}
+                      onChange={event => setSelectedAttributeId(event.target.value)}
+                      className={`${annotationFieldSelectClass} mt-1 block`}>
+                      <option value="">Choose an attribute</option>
+                      {attributeOptions.map(attribute => (
+                        <option key={attribute.id} value={attribute.id}>
+                          {attribute.name}: {formatAttributeValue(attribute.value, entities)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <p className="text-2xs text-slate-500">
+                  {evidenceKind === 'attribute'
+                    ? 'This mention will support only the selected attribute. Edit its value in the clinical notes.'
+                    : 'This mention will support the entity itself. To ground an attribute, select an existing entity and choose a specific attribute.'}
                 </p>
               </div>
 
               <div className="flex justify-end gap-1.5 border-t border-blue-100/50 pt-2.5">
+                <label className="text-slate-500 mr-auto">
+                  <span className={annotationFieldLabelClass}>Evidence role</span>
+                  <select aria-label="New mention evidence role" value={evidenceRole}
+                    onChange={event => setEvidenceRole(event.target.value as MentionEvidenceRole)}
+                    className={`${annotationFieldSelectClass} mt-1 block`}>
+                    <option value="unassigned">Unassigned — decide later</option>
+                    <option value="reference">Name / reference</option>
+                    <option value="claim">Claim evidence</option>
+                  </select>
+                  <span className="block text-2xs mt-1 max-w-[260px]">
+                    {evidenceRole === 'reference' ? 'Identifies what is discussed. Polarity starts neutral; temporality, certainty, and function start as not applicable.'
+                      : evidenceRole === 'claim' ? 'Supports a claim. Set its certainty and speech function in the mention editor.'
+                      : 'Role is separate from whether the target is an entity or attribute.'}
+                  </span>
+                </label>
                 <button
                   onClick={() => setPendingAnnotation(null)}
                   className="px-2.5 py-1 text-xs font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
@@ -923,10 +879,11 @@ export default function RawTranscriptView({
                 </button>
                 <button
                   onClick={handleCreateEntityFromSpan}
-                  className="px-3.5 py-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1"
+                  disabled={evidenceKind === 'attribute' && !selectedAttributeId}
+                  className="px-3.5 py-1 bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Create Entity</span>
+                  <span>{selectedEntityToMap === '__new__' ? 'Create Entity' : 'Link Evidence'}</span>
                 </button>
               </div>
             </div>
@@ -934,7 +891,7 @@ export default function RawTranscriptView({
             /* Utterance Splitting Mode */
             <div className="mt-2.5 space-y-2.5">
               <p className="text-xs text-slate-700">
-                Split utterance <span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded">U-{pendingAnnotation.lineIndex}</span> into two separate speaker turns right at this cursor position:
+                Split utterance <span className="font-mono font-semibold text-brand-700 bg-brand-50 px-1 py-0.5 rounded">U-{pendingAnnotation.lineIndex}</span> into two separate speaker turns right at this cursor position:
               </p>
 
               {(() => {
@@ -946,23 +903,23 @@ export default function RawTranscriptView({
                 return (
                   <div className="space-y-2 text-xs">
                     <div className="bg-white border border-slate-200 rounded-lg p-2.5">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase font-mono block mb-1">
+                      <span className="text-2xs font-semibold text-slate-500 uppercase font-sans block mb-1">
                         Turn 1 · {targetSeg?.speaker || 'Speaker'} (Unchanged)
                       </span>
-                      <p className="font-mono text-slate-700 text-[11px] leading-relaxed break-words bg-slate-50 p-2 rounded">
-                        {turn1Text || <span className="italic text-slate-400">(empty)</span>}
+                      <p className="font-mono text-slate-700 text-2xs leading-relaxed break-words bg-slate-50 p-2 rounded">
+                        {turn1Text || <span className="italic text-slate-500">(empty)</span>}
                       </p>
                     </div>
 
-                    <div className="bg-white border border-indigo-200 rounded-lg p-2.5">
+                    <div className="bg-white border border-brand-200 rounded-lg p-2.5">
                       <div className="flex items-center justify-between mb-1">
-                        <span className="text-[10px] font-bold text-indigo-600 uppercase font-mono">
+                        <span className="text-2xs font-semibold text-brand-600 uppercase font-sans">
                           Turn 2 · New Utterance Speaker
                         </span>
                         <select
                           value={splitSpeaker}
                           onChange={(e) => setSplitSpeaker(e.target.value)}
-                          className="text-xs font-semibold bg-indigo-50 border border-indigo-200 text-indigo-800 rounded px-2 py-0.5 focus:ring-2 focus:ring-indigo-400"
+                          className="text-xs font-semibold bg-brand-50 border border-brand-200 text-brand-800 rounded px-2 py-0.5 focus:ring-2 focus:ring-brand-400"
                         >
                           <option value="Patient">Patient</option>
                           <option value="Doctor">Doctor</option>
@@ -971,12 +928,12 @@ export default function RawTranscriptView({
                           <option value="Other">Other</option>
                         </select>
                       </div>
-                      <p className="font-mono text-slate-700 text-[11px] leading-relaxed break-words bg-indigo-50/40 p-2 rounded border border-indigo-100">
-                        {turn2Text || <span className="italic text-slate-400">(empty)</span>}
+                      <p className="font-mono text-slate-700 text-2xs leading-relaxed break-words bg-brand-50/40 p-2 rounded border border-brand-100">
+                        {turn2Text || <span className="italic text-slate-500">(empty)</span>}
                       </p>
                     </div>
 
-                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-2 text-[11px] text-emerald-800 flex items-center gap-1.5">
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-2 text-2xs text-emerald-800 flex items-center gap-1.5">
                       <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                       <span>
                         Mentions inside both turns will be strictly preserved and assigned to the correct utterance & speaker!
@@ -997,7 +954,7 @@ export default function RawTranscriptView({
                           }
                           setPendingAnnotation(null);
                         }}
-                        className="px-3.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1.5"
+                        className="px-3.5 py-1 bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs rounded-lg shadow-sm transition-colors cursor-pointer flex items-center gap-1.5"
                       >
                         <Scissors className="w-3.5 h-3.5" />
                         <span>Confirm & Split Utterance</span>
@@ -1013,17 +970,17 @@ export default function RawTranscriptView({
 
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-4 pr-1.5 scroll-smooth">
         {enrichedSegments.map((seg, idx) => {
-          const isSelectedSegment = selectedEntityId && derivedMentions.some(m => 
-            m.entityId === selectedEntityId && 
-            m.textSpan && 
+          const isSelectedSegment = selectedEntityId && derivedMentions.some(m =>
+            m.entityId === selectedEntityId &&
+            m.textSpan &&
             m.textSpan.lineIndex === idx
           );
 
           if (encounterType === 'note') {
             // Document section layout for notes (first-class clinical documents)
-            const showHeader = seg.speaker && 
-              seg.speaker !== 'Document' && 
-              seg.speaker !== 'Unknown' && 
+            const showHeader = seg.speaker &&
+              seg.speaker !== 'Document' &&
+              seg.speaker !== 'Unknown' &&
               seg.speaker !== 'Speaker' &&
               seg.speaker.trim() !== '';
 
@@ -1032,27 +989,27 @@ export default function RawTranscriptView({
                 key={seg.id}
                 data-segment-idx={idx}
                 className={`transition-all duration-300 p-4 rounded-xl border border-transparent ${
-                  isSelectedSegment 
-                    ? 'bg-indigo-50/40 border-indigo-200 shadow-sm ring-1 ring-indigo-100' 
+                  isSelectedSegment
+                    ? 'bg-brand-50/40 border-brand-200 shadow-sm ring-1 ring-brand-100'
                     : 'hover:bg-slate-50/50'
                 }`}
               >
                 {showHeader ? (
                   <div className="flex items-center gap-2 mb-2 select-none border-b border-slate-100 pb-1.5">
-                    <span className="text-xs font-bold uppercase tracking-wider text-indigo-700">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-brand-700">
                       {seg.speaker}
                     </span>
-                    <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-mono font-medium">
+                    <span className="text-2xs bg-brand-50 text-brand-600 px-1.5 py-0.5 rounded font-mono font-medium">
                       Section {idx + 1}
                     </span>
                   </div>
                 ) : (
-                  <div className="text-[9px] text-slate-400 font-mono mb-1.5 select-none">
+                  <div className="text-2xs text-slate-500 font-mono mb-1.5 select-none">
                     Paragraph {idx + 1}
                   </div>
                 )}
-                <div 
-                  className="text-[13px] leading-relaxed text-slate-750 select-text cursor-text font-serif"
+                <div
+                  className="text-sm leading-relaxed text-slate-700 select-text cursor-text"
                   onMouseUp={(e) => handleTextSelection(e, idx)}
                 >
                   {renderSegmentText(seg.text, idx, seg.id)}
@@ -1067,18 +1024,18 @@ export default function RawTranscriptView({
             <div
               key={seg.id}
               data-segment-idx={idx}
-              className={`flex gap-4 items-start border-b border-slate-50/50 pb-3 last:border-0 last:pb-0 transition-all duration-300 p-2 rounded-xl ${
+              className={`flex flex-col sm:flex-row gap-2 sm:gap-4 items-start border-b border-slate-100 pb-4 last:border-0 last:pb-0 transition-all duration-300 p-2 rounded-lg ${
                 isSelectedSegment ? 'bg-blue-50/40 border-l-2 border-l-blue-500 shadow-sm ring-1 ring-blue-100' : ''
               }`}
             >
-              <div className="shrink-0 w-24 text-[10px] font-bold mt-1 uppercase tracking-wider select-none">
+              <div className="shrink-0 w-24 text-2xs font-semibold mt-1 uppercase tracking-wider select-none">
                 <div className="flex flex-col gap-1">
                   {onChangeSpeaker ? (
                     <div className="flex items-center gap-1 group relative">
                       <select
                         value={seg.speaker}
                         onChange={(e) => onChangeSpeaker(idx, e.target.value)}
-                        className={`text-[10px] font-bold uppercase rounded px-1 py-0.5 border border-slate-200 hover:border-blue-300 bg-white/90 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-400 cursor-pointer ${speakerColor}`}
+                        className={`text-2xs font-semibold uppercase rounded px-1 py-0.5 border border-slate-200 hover:border-blue-300 bg-white/90 focus:bg-white focus:outline-none focus:ring-1 focus:ring-brand-400 cursor-pointer ${speakerColor}`}
                         title="Click to switch speaker for this utterance"
                       >
                         <option value={seg.speaker}>{seg.speaker}</option>
@@ -1090,16 +1047,16 @@ export default function RawTranscriptView({
                   ) : (
                     <span className={speakerColor}>[{seg.speaker}]</span>
                   )}
-                  <span className="inline-block text-[9px] bg-slate-100 text-slate-600 px-1 py-0.5 rounded font-mono w-fit mt-0.5" title={`Utterance ID: U-${idx} (lineIndex in annotation JSON)`}>
+                  <span className="inline-block text-2xs bg-slate-100 text-slate-600 px-1 py-0.5 rounded font-mono w-fit mt-0.5" title={`Utterance ID: U-${idx} (lineIndex in annotation JSON)`}>
                     U-{idx}
                   </span>
                 </div>
-                <span className="block text-[8px] font-mono text-slate-400 font-normal mt-1" title="Actual or estimated timing bracket">
+                <span className="block text-2xs font-mono text-slate-500 font-normal mt-1" title="Actual or estimated timing bracket">
                   [{seg.displayTimestamp}]
                 </span>
               </div>
-              <div 
-                className="flex-1 text-xs leading-relaxed text-slate-700 select-text cursor-text"
+              <div
+                className="flex-1 min-w-0 text-sm leading-relaxed text-slate-700 select-text cursor-text"
                 onMouseUp={(e) => handleTextSelection(e, idx)}
               >
                 {renderSegmentText(seg.text, idx, seg.id)}

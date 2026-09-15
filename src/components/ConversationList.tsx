@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Conversation, SessionGroup, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, FHIR_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from '../types';
 import {
   Search,
@@ -68,7 +69,7 @@ export default function ConversationList({
   const [newCatName, setNewCatName] = useState('');
   const [newCatEntityType, setNewCatEntityType] = useState('Other');
   const [newCatTypeHint, setNewCatTypeHint] = useState('');
-  const [newAttrState, setNewAttrState] = useState<Record<string, { name: string, type: 'text' | 'select' | 'boolean', choices: string, hint: string }>>({});
+  const [newAttrState, setNewAttrState] = useState<Record<string, { name: string, type: 'text' | 'select' | 'boolean' | 'trajectory', choices: string, hint: string }>>({});
 
   const handleSaveSessionRename = async (sessionId: string) => {
     if (!onRename) return;
@@ -132,18 +133,18 @@ export default function ConversationList({
   };
 
   return (
-    <div className="bg-white border border-slate-200 rounded-2xl p-4 flex flex-col h-full max-h-[850px] shadow-sm select-none">
+    <div className="session-sidebar select-none">
       {/* List Header */}
-      <div className="flex items-center justify-between pb-4 mb-3 border-b border-slate-100">
+      <div className="sidebar-heading">
         <div className="flex items-center gap-2">
-          <FolderOpen className="w-4 h-4 text-blue-500" />
-          <h3 className="text-sm font-semibold text-slate-800">Clinical Workspace</h3>
+          <FolderOpen className="w-4 h-4 text-slate-500" />
+          <h2 className="section-heading">Your workspace</h2>
         </div>
         <button
           onClick={() => onCreateNew(activeGroupId && activeGroupId !== 'ungrouped' ? activeGroupId : undefined)}
-          className="flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:text-blue-700 bg-blue-50/50 px-2.5 py-1.5 rounded-lg transition-all cursor-pointer"
+          className="btn btn-primary w-full"
         >
-          <Plus className="w-3.5 h-3.5" /> New Session
+          <Plus className="w-4 h-4" /> New Session
         </button>
       </div>
 
@@ -153,7 +154,8 @@ export default function ConversationList({
           <button 
             type="button"
             onClick={() => setIsGroupsExpanded(!isGroupsExpanded)}
-            className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-400 font-mono hover:text-slate-600 transition-colors cursor-pointer"
+            className="eyebrow flex items-center gap-1.5 hover:text-slate-800"
+            aria-expanded={isGroupsExpanded}
           >
             {isGroupsExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
             <span>Session Groups</span>
@@ -161,7 +163,7 @@ export default function ConversationList({
           <button
             type="button"
             onClick={() => setIsCreatingGroup(true)}
-            className="p-1 hover:bg-slate-100 text-slate-400 hover:text-blue-600 rounded transition-colors cursor-pointer"
+            className="p-1 hover:bg-slate-100 text-slate-500 hover:text-brand-600 rounded transition-colors cursor-pointer"
             title="Create New Group"
           >
             <FolderPlus className="w-3.5 h-3.5" />
@@ -169,22 +171,22 @@ export default function ConversationList({
         </div>
 
         {isGroupsExpanded && (
-          <div className="space-y-1 pl-1 max-h-[180px] overflow-y-auto pr-1">
+          <div className="space-y-1 max-h-[180px] overflow-y-auto">
             {/* All Sessions */}
             <button
               type="button"
               onClick={() => onSelectGroup(null)}
               className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
                 activeGroupId === null
-                  ? 'bg-blue-50 text-blue-700 font-semibold border-l-2 border-l-blue-600'
+                  ? 'bg-brand-50 text-brand-700 font-semibold border-l-2 border-l-brand-600'
                   : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
               <div className="flex items-center gap-2">
-                <FolderOpen className="w-3.5 h-3.5 text-blue-500" />
+                <FolderOpen className="w-3.5 h-3.5 text-brand-500" />
                 <span>All Sessions</span>
               </div>
-              <span className="text-[10px] text-slate-400 font-mono">{conversations.length}</span>
+              <span className="text-2xs text-slate-500 font-mono">{conversations.length}</span>
             </button>
 
             {/* Ungrouped */}
@@ -193,15 +195,15 @@ export default function ConversationList({
               onClick={() => onSelectGroup('ungrouped')}
               className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
                 activeGroupId === 'ungrouped'
-                  ? 'bg-blue-50 text-blue-700 font-semibold border-l-2 border-l-blue-600'
+                  ? 'bg-brand-50 text-brand-700 font-semibold border-l-2 border-l-brand-600'
                   : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
               <div className="flex items-center gap-2">
-                <FolderOpen className="w-3.5 h-3.5 text-slate-400" />
+                <FolderOpen className="w-3.5 h-3.5 text-slate-500" />
                 <span>Unassigned</span>
               </div>
-              <span className="text-[10px] text-slate-400 font-mono">
+              <span className="text-2xs text-slate-500 font-mono">
                 {conversations.filter(c => !c.groupId).length}
               </span>
             </button>
@@ -216,7 +218,7 @@ export default function ConversationList({
                   key={group.id}
                   className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all relative group/group-item ${
                     isSelected
-                      ? 'bg-blue-50 text-blue-700 font-semibold border-l-2 border-l-blue-600'
+                      ? 'bg-brand-50 text-brand-700 font-semibold border-l-2 border-l-brand-600'
                       : 'text-slate-600 hover:bg-slate-50'
                   }`}
                 >
@@ -225,15 +227,15 @@ export default function ConversationList({
                     onClick={() => onSelectGroup(group.id)}
                     className="flex-1 text-left flex items-center gap-2 min-w-0 cursor-pointer"
                   >
-                    <Folder className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-blue-500' : 'text-amber-500'}`} />
+                    <Folder className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-brand-500' : 'text-amber-500'}`} />
                     <span className="truncate pr-4">{group.name}</span>
                   </button>
 
                   <div className="flex items-center gap-1 shrink-0">
-                    <span className="text-[10px] text-slate-400 font-mono group-hover/group-item:hidden">
+                    <span className="text-2xs text-slate-500 font-mono group-hover/group-item:hidden">
                       {groupSessionsCount}
                     </span>
-                    <div className="hidden group-hover/group-item:flex items-center gap-1">
+                    <div className="flex items-center gap-1">
                       <button
                         type="button"
                         onClick={(e) => {
@@ -253,7 +255,7 @@ export default function ConversationList({
                           e.stopPropagation();
                           onDeleteGroup(group.id);
                         }}
-                        className="p-0.5 hover:bg-rose-100 rounded text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
+                        className="p-0.5 hover:bg-rose-100 rounded text-slate-500 hover:text-rose-600 transition-colors cursor-pointer"
                         title="Delete Group"
                       >
                         <Trash2 className="w-3 h-3" />
@@ -274,7 +276,7 @@ export default function ConversationList({
               placeholder="Group name..."
               value={newGroupName}
               onChange={(e) => setNewGroupName(e.target.value)}
-              className="w-full text-xs border border-slate-200 rounded px-2 py-1 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+              className="w-full text-xs border border-slate-200 rounded px-2 py-1 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
               autoFocus
             />
             <div className="flex justify-end gap-1.5">
@@ -284,7 +286,7 @@ export default function ConversationList({
                   setIsCreatingGroup(false);
                   setNewGroupName('');
                 }}
-                className="px-2 py-0.5 text-[10px] font-semibold text-slate-500 hover:bg-slate-200 rounded cursor-pointer"
+                className="px-2 py-0.5 text-2xs font-semibold text-slate-500 hover:bg-slate-200 rounded cursor-pointer"
               >
                 Cancel
               </button>
@@ -297,7 +299,7 @@ export default function ConversationList({
                     setIsCreatingGroup(false);
                   }
                 }}
-                className="px-2.5 py-0.5 text-[10px] font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded cursor-pointer"
+                className="px-2.5 py-0.5 text-2xs font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded cursor-pointer"
               >
                 Create
               </button>
@@ -308,26 +310,27 @@ export default function ConversationList({
 
       {/* Search Input */}
       <div className="relative mb-3">
-        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+        <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
         <input
           type="text"
           placeholder="Search within this view..."
+          aria-label="Search sessions"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full text-xs border border-slate-200 rounded-lg pl-8 pr-3.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white"
+          className="w-full text-xs border border-slate-200 rounded-lg pl-8 pr-3.5 py-2.5 focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-brand-500 bg-white"
         />
       </div>
 
       {/* Active Group Filter Banner */}
       {activeGroupId && (
-        <div className="flex items-center justify-between bg-slate-50 border border-slate-200/50 px-2.5 py-1.5 rounded-lg mb-3 text-[10px] font-medium text-slate-600">
+        <div className="flex items-center justify-between bg-slate-50 border border-slate-200/50 px-2.5 py-1.5 rounded-lg mb-3 text-2xs font-medium text-slate-600">
           <span className="truncate">
             Showing: <strong>{activeGroupId === 'ungrouped' ? 'Unassigned' : sessionGroups.find(g => g.id === activeGroupId)?.name || 'Filtered Group'}</strong>
           </span>
           <button
             type="button"
             onClick={() => onSelectGroup(null)}
-            className="text-slate-400 hover:text-slate-600 p-0.5"
+            className="text-slate-500 hover:text-slate-600 p-0.5"
             title="Clear group filter"
           >
             <X className="w-3 h-3" />
@@ -336,11 +339,12 @@ export default function ConversationList({
       )}
 
       {/* Session List */}
-      <div className="flex-1 overflow-y-auto space-y-2 pr-1 select-none">
+      <div className="flex-1 overflow-y-auto space-y-2 select-none">
         {filtered.length === 0 ? (
           <div className="text-center py-10">
-            <AlertCircle className="w-6 h-6 text-slate-300 mx-auto mb-2" />
-            <p className="text-xs text-slate-400 italic">No clinical sessions found.</p>
+            <FolderOpen className="w-7 h-7 text-slate-500 mx-auto mb-3" strokeWidth={1.5} />
+            <p className="text-xs font-medium text-slate-600">{searchQuery ? 'No matching sessions' : 'No sessions yet'}</p>
+            <p className="text-xs text-slate-500 mt-1">{searchQuery ? 'Try another title or keyword.' : 'Create a session to get started.'}</p>
           </div>
         ) : (
           filtered.map(conv => {
@@ -352,11 +356,8 @@ export default function ConversationList({
               <div
                 key={conv.id}
                 onClick={() => onSelect(conv.id)}
-                className={`border rounded-lg p-3.5 transition-all cursor-pointer relative group ${
-                  isSelected
-                    ? 'border-l-4 border-l-blue-600 border-y-slate-200 border-r-slate-200 bg-slate-50/80 shadow-sm'
-                    : 'border-slate-100 hover:border-slate-200 hover:bg-slate-50/50 bg-white'
-                }`}
+                className="session-row transition-colors cursor-pointer relative group"
+                data-selected={isSelected}
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
@@ -375,7 +376,7 @@ export default function ConversationList({
                               setEditingSessionId(null);
                             }
                           }}
-                          className="w-full text-xs font-semibold text-slate-800 bg-white border border-blue-400 rounded px-2 py-1 focus:ring-1 focus:ring-blue-500 focus:outline-none shadow-xs"
+                          className="w-full text-xs font-semibold text-slate-800 bg-white border border-brand-400 rounded px-2 py-1 focus:ring-1 focus:ring-brand-500 focus:outline-none shadow-xs"
                           placeholder="Session title..."
                           autoFocus
                         />
@@ -390,34 +391,37 @@ export default function ConversationList({
                         <button
                           type="button"
                           onClick={() => setEditingSessionId(null)}
-                          className="p-1 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded transition-colors cursor-pointer"
+                          className="p-1 hover:bg-slate-100 text-slate-500 hover:text-slate-600 rounded transition-colors cursor-pointer"
                           title="Cancel"
                         >
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     ) : (
-                      <h4 className="text-xs font-semibold text-slate-700 truncate pr-12">
-                        {conv.title || 'Untitled Clinical Session'}
+                      <h4 className="text-sm font-semibold text-slate-800 pr-10">
+                        <button type="button" className="text-left w-full truncate" aria-current={isSelected ? 'true' : undefined}
+                          onClick={event => { event.stopPropagation(); onSelect(conv.id); }}>
+                          {conv.title || 'Untitled Clinical Session'}
+                        </button>
                       </h4>
                     )}
                     
-                    <div className="flex items-center gap-1.5 text-[10px] text-slate-400 mt-1">
+                    <div className="flex items-center gap-1.5 text-2xs text-slate-500 mt-1">
                       <Calendar className="w-3 h-3" />
                       <span>{formatDate(conv.createdAt)}</span>
                     </div>
 
                     {/* Metadata tags */}
                     <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                      <span className={`text-[8.5px] font-bold px-1.5 py-0.5 rounded uppercase border ${
+                      <span className={`text-2xs font-semibold px-1.5 py-0.5 rounded uppercase border ${
                         conv.encounterType === 'note'
-                          ? 'bg-indigo-50 text-indigo-600 border-indigo-100/50'
-                          : 'bg-blue-50 text-blue-600 border-blue-100/50'
+                          ? 'bg-brand-50 text-brand-600 border-brand-100/50'
+                          : 'bg-brand-50 text-brand-600 border-brand-100/50'
                       }`}>
                         {conv.encounterType === 'note' ? 'Note' : 'Dialogue'}
                       </span>
 
-                      <span className={`text-[8.5px] font-bold px-1.5 py-0.5 rounded uppercase ${
+                      <span className={`text-2xs font-semibold px-1.5 py-0.5 rounded uppercase ${
                         conv.status === 'annotated' ? 'bg-green-50 text-green-600' :
                         conv.status === 'processing' ? 'bg-amber-50 text-amber-600' :
                         conv.status === 'failed' ? 'bg-rose-50 text-rose-600' : 'bg-slate-50 text-slate-500'
@@ -426,14 +430,14 @@ export default function ConversationList({
                       </span>
 
                       {groupName && (
-                        <span className="flex items-center gap-0.5 text-[8.5px] font-bold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-100/40">
+                        <span className="flex items-center gap-0.5 text-2xs font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-100/40">
                           <Folder className="w-2.5 h-2.5" />
                           {groupName}
                         </span>
                       )}
 
                       {entityCount > 0 && (
-                        <span className="flex items-center gap-0.5 text-[9px] font-medium text-blue-600 bg-blue-50/50 px-1.5 py-0.5 rounded">
+                        <span className="flex items-center gap-0.5 text-2xs font-medium text-brand-600 bg-brand-50/50 px-1.5 py-0.5 rounded">
                           <Tag className="w-2.5 h-2.5" />
                           {entityCount} {entityCount === 1 ? 'entity' : 'entities'}
                         </span>
@@ -443,7 +447,7 @@ export default function ConversationList({
 
                   {/* Actions (Rename & Delete icons) */}
                   {editingSessionId !== conv.id && (
-                    <div className="flex items-center gap-0.5 absolute top-2.5 right-2.5 opacity-0 group-hover:opacity-100 transition-opacity bg-white/90 backdrop-blur-xs rounded-md shadow-2xs border border-slate-100 p-0.5">
+                    <div className="session-actions flex items-center gap-0.5 absolute top-2.5 right-2.5 transition-opacity bg-white rounded-md border border-slate-200 p-0.5">
                       {onRename && (
                         <button
                           onClick={(e) => {
@@ -451,7 +455,7 @@ export default function ConversationList({
                             setEditingSessionId(conv.id);
                             setEditingSessionTitle(conv.title || '');
                           }}
-                          className="p-1 text-slate-400 hover:text-blue-600 rounded hover:bg-slate-100 transition-all cursor-pointer"
+                          className="p-1 text-slate-500 hover:text-brand-600 rounded hover:bg-slate-100 transition-all cursor-pointer"
                           title="Rename Session"
                         >
                           <Edit2 className="w-3 h-3" />
@@ -462,7 +466,7 @@ export default function ConversationList({
                           e.stopPropagation();
                           onDelete(conv.id);
                         }}
-                        className="p-1 text-slate-400 hover:text-rose-500 rounded hover:bg-slate-100 transition-all cursor-pointer"
+                        className="p-1 text-slate-500 hover:text-rose-500 rounded hover:bg-slate-100 transition-all cursor-pointer"
                         title="Delete Session"
                       >
                         <Trash2 className="w-3 h-3" />
@@ -581,7 +585,7 @@ export default function ConversationList({
           updateSchema(updated);
         };
 
-        return (
+        return createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
             {/* Backdrop */}
             <div
@@ -590,16 +594,16 @@ export default function ConversationList({
                 setEditingGroupName('');
                 setActiveSettingsTab('general');
               }}
-              className="absolute inset-0 bg-slate-900/45 backdrop-blur-xs"
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-xs"
             />
 
             {/* Modal Card */}
-            <div className="relative bg-white rounded-2xl shadow-xl border border-slate-100 max-w-3xl w-full p-6 space-y-4 overflow-hidden text-left z-50 max-h-[90vh] flex flex-col">
+            <div role="dialog" aria-modal="true" aria-label="Group settings" className="dialog-surface relative bg-white border border-slate-200 max-w-3xl w-full p-6 space-y-4 overflow-hidden text-left max-h-[90vh] flex flex-col">
               <div className="flex items-center justify-between pb-2 border-b border-slate-100 shrink-0">
                 <div className="flex items-center gap-2">
-                  <Settings className="w-4.5 h-4.5 text-blue-600" />
+                  <Settings className="w-4.5 h-4.5 text-brand-600" />
                   <h3 className="text-sm font-semibold text-slate-800">
-                    Project Group: <span className="text-blue-600 font-mono font-bold">{selectedGroupForSettings.name}</span>
+                    Project Group: <span className="text-brand-600 font-mono font-semibold">{selectedGroupForSettings.name}</span>
                   </h3>
                 </div>
                 <button
@@ -609,20 +613,20 @@ export default function ConversationList({
                     setEditingGroupName('');
                     setActiveSettingsTab('general');
                   }}
-                  className="text-slate-400 hover:text-slate-600 transition-colors p-1 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  className="text-slate-500 hover:text-slate-600 transition-colors p-1 rounded-lg hover:bg-slate-50 cursor-pointer"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
               {/* Tab Switcher */}
-              <div className="flex bg-slate-100 p-1 rounded-xl shrink-0 gap-1 w-fit">
+              <div className="flex flex-wrap bg-slate-100 p-1 rounded-lg shrink-0 gap-1 w-fit">
                 <button
                   type="button"
                   onClick={() => setActiveSettingsTab('general')}
                   className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-1.5 rounded-lg cursor-pointer transition-colors ${
                     activeSettingsTab === 'general'
-                      ? 'bg-white text-blue-700 shadow-xs'
+                      ? 'bg-white text-brand-700 shadow-xs'
                       : 'text-slate-500 hover:text-slate-800'
                   }`}
                 >
@@ -634,7 +638,7 @@ export default function ConversationList({
                   onClick={() => setActiveSettingsTab('schema')}
                   className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-1.5 rounded-lg cursor-pointer transition-colors ${
                     activeSettingsTab === 'schema'
-                      ? 'bg-white text-blue-700 shadow-xs'
+                      ? 'bg-white text-brand-700 shadow-xs'
                       : 'text-slate-500 hover:text-slate-800'
                   }`}
                 >
@@ -654,7 +658,7 @@ export default function ConversationList({
                         type="text"
                         value={editingGroupName}
                         onChange={(e) => setEditingGroupName(e.target.value)}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                       />
                     </div>
 
@@ -671,7 +675,7 @@ export default function ConversationList({
                             description: e.target.value
                           }
                         })}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none h-16 resize-none"
+                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none h-16 resize-none"
                       />
                     </div>
 
@@ -687,7 +691,7 @@ export default function ConversationList({
                             encounterTemplate: e.target.value
                           }
                         })}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none cursor-pointer"
                       >
                         <option value="standard">Standard SOAP Note</option>
                         <option value="soap">Comprehensive SOAP</option>
@@ -708,7 +712,7 @@ export default function ConversationList({
                             preferredModel: e.target.value
                           }
                         })}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none cursor-pointer"
                       >
                         <option value="gemini-3.5-flash">Gemini 3.5 Flash (Recommended)</option>
                         <option value="gemini-1.5-pro">Gemini 1.5 Pro (Advanced Clinical reasoning)</option>
@@ -727,7 +731,7 @@ export default function ConversationList({
                             clinicalTaxonomy: e.target.value
                           }
                         })}
-                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                        className="w-full border border-slate-200 rounded-lg px-3 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none cursor-pointer"
                       >
                         <option value="all">Standard Clinical Graph Mapping (All taxonomies)</option>
                         <option value="snomed">SNOMED-CT Only</option>
@@ -741,15 +745,15 @@ export default function ConversationList({
                     {/* Header Info */}
                     <div className="flex items-center justify-between bg-slate-50 p-3 rounded-xl border border-slate-200/50">
                       <div>
-                        <h4 className="font-bold text-slate-700">Project-Specific Schema Builder</h4>
-                        <p className="text-[10px] text-slate-500 leading-normal mt-0.5">
+                        <h4 className="font-semibold text-slate-700">Project-Specific Schema Builder</h4>
+                        <p className="text-2xs text-slate-500 leading-normal mt-0.5">
                           Specify which medical variables are documented during annotations. Deleting a category prevents it from cluttering the session's workspace.
                         </p>
                       </div>
                       <button
                         type="button"
                         onClick={handleResetSchema}
-                        className="flex items-center gap-1 text-[10px] font-bold text-blue-600 hover:text-blue-700 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 shrink-0 cursor-pointer"
+                        className="flex items-center gap-1 text-2xs font-semibold text-brand-600 hover:text-brand-700 bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg shadow-2xs hover:bg-slate-50 shrink-0 cursor-pointer"
                       >
                         <RefreshCw className="w-3 h-3" />
                         <span>Reset System Defaults</span>
@@ -758,18 +762,18 @@ export default function ConversationList({
 
                     {/* Pre-configured Schema Templates */}
                     <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200/50 space-y-2.5">
-                      <span className="font-bold text-slate-700 block text-[10px] uppercase tracking-wider font-mono">Load Pre-configured Schema Template</span>
+                      <span className="font-semibold text-slate-700 block text-2xs uppercase tracking-wider font-sans">Load Pre-configured Schema Template</span>
                       <div className="flex flex-wrap gap-2">
                         <button
                           type="button"
                           onClick={() => updateSchema(DEFAULT_ANNOTATION_SCHEMA)}
                           className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border cursor-pointer transition-all ${
                             JSON.stringify(schema) === JSON.stringify(DEFAULT_ANNOTATION_SCHEMA)
-                              ? 'bg-blue-50 text-blue-700 border-blue-200 font-bold'
+                              ? 'bg-brand-50 text-brand-700 border-brand-200 font-semibold'
                               : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 hover:border-slate-300'
                           }`}
                         >
-                          <Activity className="w-3.5 h-3.5 text-blue-600" />
+                          <Activity className="w-3.5 h-3.5 text-brand-600" />
                           <span>Standard Clinical Default</span>
                         </button>
                         <button
@@ -777,7 +781,7 @@ export default function ConversationList({
                           onClick={() => updateSchema(FHIR_ANNOTATION_SCHEMA)}
                           className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border cursor-pointer transition-all ${
                             JSON.stringify(schema) === JSON.stringify(FHIR_ANNOTATION_SCHEMA)
-                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200 font-bold'
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200 font-semibold'
                               : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 hover:border-slate-300'
                           }`}
                         >
@@ -785,7 +789,7 @@ export default function ConversationList({
                           <span>FHIR R4 Compliant Template</span>
                         </button>
                       </div>
-                      <p className="text-[10px] text-slate-400 leading-normal">
+                      <p className="text-2xs text-slate-500 leading-normal">
                         💡 <strong>Template Switch:</strong> Choosing a template will configure the variables and standard validations (like <code>clinicalStatus</code>, <code>verificationStatus</code>, <code>interpretation</code>, <code>priority</code>, or <code>lifecycleStatus</code>) for Condition, Observation (Measurements, Symptoms, and Social Status / Lifestyle such as smoking and alcohol use), MedicationStatement, MedicationRequest, AllergyIntolerance, ServiceRequest, CarePlan, Goal, Procedure, Immunization, FamilyMemberHistory, and DiagnosticReport resources.
                       </p>
                     </div>
@@ -793,7 +797,7 @@ export default function ConversationList({
                     {/* Current Schema Variables */}
                     <div className="space-y-3">
                       {schema.length === 0 ? (
-                        <div className="text-center py-6 bg-slate-50/50 border border-dashed rounded-xl border-slate-200 italic text-slate-400">
+                        <div className="text-center py-6 bg-slate-50/50 border border-dashed rounded-xl border-slate-200 italic text-slate-500">
                           No variables configured. Click below to add standard or custom clinical categories.
                         </div>
                       ) : (
@@ -805,15 +809,15 @@ export default function ConversationList({
                               {/* Category Header */}
                               <div className="flex items-center justify-between bg-slate-50 px-4 py-2.5 border-b border-slate-200">
                                 <div className="flex items-center gap-2">
-                                  <span className="font-bold text-slate-800">{cat.displayName}</span>
-                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded uppercase bg-blue-100 text-blue-800 font-mono">
+                                  <span className="font-semibold text-slate-800">{cat.displayName}</span>
+                                  <span className="text-2xs font-semibold px-1.5 py-0.5 rounded uppercase bg-brand-100 text-brand-800 font-sans">
                                     ID: {cat.id}
                                   </span>
                                 </div>
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteCategory(cat.id)}
-                                  className="p-1 hover:bg-rose-100 text-slate-400 hover:text-rose-600 rounded transition-colors cursor-pointer"
+                                  className="p-1 hover:bg-rose-100 text-slate-500 hover:text-rose-600 rounded transition-colors cursor-pointer"
                                   title="Delete entire category"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
@@ -822,7 +826,7 @@ export default function ConversationList({
 
                               {/* Model Type Hint Guidance */}
                               <div className="px-4 py-2.5 border-b border-slate-100 bg-amber-50/15 space-y-1">
-                                <label className="text-[10px] font-bold text-amber-800/80 uppercase tracking-wider font-mono flex items-center gap-1">
+                                <label className="text-2xs font-semibold text-amber-800/80 uppercase tracking-wider font-sans flex items-center gap-1">
                                   <span>🤖 LLM Annotation Type Hint (Model Guidance)</span>
                                 </label>
                                 <textarea
@@ -837,38 +841,38 @@ export default function ConversationList({
                                     });
                                     updateSchema(updated);
                                   }}
-                                  className="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none h-14 resize-none leading-normal font-sans text-slate-700"
+                                  className="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none h-14 resize-none leading-normal font-sans text-slate-700"
                                 />
                               </div>
 
                               {/* Attributes List */}
                               <div className="p-3.5 space-y-3">
                                 <div className="space-y-1.5">
-                                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-mono">Attributes & Validation Constraints</span>
+                                  <span className="text-2xs font-semibold text-slate-500 uppercase tracking-wider font-sans">Attributes & Validation Constraints</span>
                                   <div className="grid grid-cols-1 gap-1.5">
                                     {cat.attributes.map(attr => (
-                                      <div key={attr.name} className="flex items-start justify-between bg-slate-50/50 px-2.5 py-2 rounded-lg border border-slate-100 text-[11px]">
+                                      <div key={attr.name} className="flex items-start justify-between bg-slate-50/50 px-2.5 py-2 rounded-lg border border-slate-100 text-2xs">
                                         <div className="min-w-0 flex-1">
                                           <div className="flex items-center gap-1.5">
-                                            <span className="font-bold text-slate-700 font-mono">{attr.name}</span>
-                                            <span className="text-[9px] px-1 py-0.2 rounded bg-slate-200/60 font-medium text-slate-600">
+                                            <span className="font-semibold text-slate-700 font-mono">{attr.name}</span>
+                                            <span className="text-2xs px-1 py-0.2 rounded bg-slate-200/60 font-medium text-slate-600">
                                               {attr.type}
                                             </span>
                                             {attr.choices && (
-                                              <span className="text-[9px] font-mono text-blue-600 max-w-[200px] truncate" title={attr.choices.join(', ')}>
+                                              <span className="text-2xs font-mono text-brand-600 max-w-[200px] truncate" title={attr.choices.join(', ')}>
                                                 [{attr.choices.join(', ')}]
                                               </span>
                                             )}
                                           </div>
                                           {attr.hint && (
-                                            <p className="text-[10px] text-slate-400 italic mt-0.5">{attr.hint}</p>
+                                            <p className="text-2xs text-slate-500 italic mt-0.5">{attr.hint}</p>
                                           )}
                                         </div>
                                         {attr.name !== 'name' && attr.name !== 'task' && (
                                           <button
                                             type="button"
                                             onClick={() => handleDeleteAttribute(cat.id, attr.name)}
-                                            className="text-slate-400 hover:text-rose-500 p-0.5 cursor-pointer rounded hover:bg-rose-50"
+                                            className="text-slate-500 hover:text-rose-500 p-0.5 cursor-pointer rounded hover:bg-rose-50"
                                             title="Delete attribute"
                                           >
                                             <Trash2 className="w-3 h-3" />
@@ -880,8 +884,8 @@ export default function ConversationList({
                                 </div>
 
                                 {/* Add Attribute Form */}
-                                <div className="bg-slate-50/30 p-2.5 border border-slate-200/50 rounded-lg space-y-2 text-[11px]">
-                                  <span className="font-bold text-slate-500 font-mono block text-[9.5px] uppercase">Add Attribute to {cat.displayName}</span>
+                                <div className="bg-slate-50/30 p-2.5 border border-slate-200/50 rounded-lg space-y-2 text-2xs">
+                                  <span className="font-semibold text-slate-500 font-sans block text-2xs uppercase">Add Attribute to {cat.displayName}</span>
                                   <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
                                     <div className="sm:col-span-3">
                                       <input
@@ -892,7 +896,7 @@ export default function ConversationList({
                                           ...prev,
                                           [cat.id]: { ...attrForm, name: e.target.value }
                                         }))}
-                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                                       />
                                     </div>
                                     <div className="sm:col-span-3">
@@ -902,11 +906,12 @@ export default function ConversationList({
                                           ...prev,
                                           [cat.id]: { ...attrForm, type: e.target.value as any }
                                         }))}
-                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none cursor-pointer"
                                       >
                                         <option value="text">Text Field</option>
                                         <option value="select">Select Dropdown</option>
                                         <option value="boolean">Yes/No Toggle</option>
+                                        <option value="trajectory">Trajectory + Comparison Time</option>
                                       </select>
                                     </div>
                                     <div className="sm:col-span-6">
@@ -922,7 +927,7 @@ export default function ConversationList({
                                             hint: attrForm.type !== 'select' ? e.target.value : attrForm.hint
                                           }
                                         }))}
-                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                                       />
                                     </div>
                                   </div>
@@ -936,7 +941,7 @@ export default function ConversationList({
                                           ...prev,
                                           [cat.id]: { ...attrForm, hint: e.target.value }
                                         }))}
-                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                                        className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                                       />
                                     </div>
                                   )}
@@ -945,7 +950,7 @@ export default function ConversationList({
                                       type="button"
                                       onClick={() => handleAddAttribute(cat.id)}
                                       disabled={!attrForm.name.trim()}
-                                      className="flex items-center gap-1 px-3 py-1 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded text-[10px] cursor-pointer disabled:opacity-50 transition-colors"
+                                      className="flex items-center gap-1 px-3 py-1 bg-slate-800 hover:bg-slate-700 text-white font-semibold rounded text-2xs cursor-pointer disabled:opacity-50 transition-colors"
                                     >
                                       <Plus className="w-3 h-3" />
                                       <span>Add Attribute</span>
@@ -961,15 +966,15 @@ export default function ConversationList({
 
                     {/* Add Category Builders */}
                     <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-4 shadow-2xs">
-                      <h4 className="font-bold text-slate-700 flex items-center gap-1.5">
+                      <h4 className="font-semibold text-slate-700 flex items-center gap-1.5">
                         <PlusCircle className="w-4 h-4 text-emerald-600" />
                         <span>Add Clinical Variables Category</span>
                       </h4>
 
                       {/* Part A: Quick Add FHIR & Standard Categories */}
                       {fhirMissing.length > 0 && (
-                        <div className="space-y-1.5 p-2.5 bg-emerald-50/50 rounded-lg border border-emerald-100 text-[11px]">
-                          <span className="font-bold text-emerald-800 block flex items-center gap-1.5">
+                        <div className="space-y-1.5 p-2.5 bg-emerald-50/50 rounded-lg border border-emerald-100 text-2xs">
+                          <span className="font-semibold text-emerald-800 block flex items-center gap-1.5">
                             <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
                             <span>Quick Add Standard FHIR Resources:</span>
                           </span>
@@ -979,7 +984,7 @@ export default function ConversationList({
                                 key={def.id}
                                 type="button"
                                 onClick={() => handleAddFhirCategory(def.id)}
-                                className="flex items-center gap-1 px-2.5 py-1.5 bg-white hover:bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg font-semibold transition-all cursor-pointer text-[10px] shadow-3xs"
+                                className="flex items-center gap-1 px-2.5 py-1.5 bg-white hover:bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg font-semibold transition-all cursor-pointer text-2xs shadow-3xs"
                                 title={`Add ${def.displayName} to this group's schema`}
                               >
                                 <Plus className="w-3 h-3 text-emerald-600" />
@@ -991,17 +996,17 @@ export default function ConversationList({
                       )}
 
                       {standardMissing.length > 0 && (
-                        <div className="space-y-1.5 p-2 bg-blue-50/40 rounded-lg border border-blue-100 text-[11px]">
-                          <span className="font-bold text-blue-800 block">Restore Pre-existing Default Category:</span>
+                        <div className="space-y-1.5 p-2 bg-brand-50/40 rounded-lg border border-brand-100 text-2xs">
+                          <span className="font-semibold text-brand-800 block">Restore Pre-existing Default Category:</span>
                           <div className="flex flex-wrap items-center gap-2">
                             {standardMissing.map(def => (
                               <button
                                 key={def.id}
                                 type="button"
                                 onClick={() => handleAddStandardCategory(def.id)}
-                                className="flex items-center gap-1 px-2.5 py-1.5 bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 rounded-lg font-semibold transition-all cursor-pointer text-[10px] shadow-3xs"
+                                className="flex items-center gap-1 px-2.5 py-1.5 bg-white hover:bg-brand-50 text-brand-700 border border-brand-200 rounded-lg font-semibold transition-all cursor-pointer text-2xs shadow-3xs"
                               >
-                                <Plus className="w-3 h-3 text-blue-600" />
+                                <Plus className="w-3 h-3 text-brand-600" />
                                 <span>{def.displayName}</span>
                               </button>
                             ))}
@@ -1011,22 +1016,22 @@ export default function ConversationList({
 
                       {/* Part B: Completely Custom Category Builder */}
                       <div className="space-y-2.5 p-3 bg-slate-100/50 rounded-lg border border-slate-200/50">
-                        <span className="font-bold text-slate-700 block text-[11px]">Create Completely Custom Variables Category:</span>
-                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-[11px]">
+                        <span className="font-semibold text-slate-700 block text-2xs">Create Completely Custom Variables Category:</span>
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-2xs">
                           <div className="sm:col-span-6">
                             <input
                               type="text"
                               placeholder="Display Name (e.g. Social History)"
                               value={newCatName}
                               onChange={e => setNewCatName(e.target.value)}
-                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                             />
                           </div>
                           <div className="sm:col-span-6">
                             <select
                               value={newCatEntityType}
                               onChange={e => setNewCatEntityType(e.target.value)}
-                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none cursor-pointer"
                             >
                               <optgroup label="FHIR Standard Resources">
                                 <option value="CarePlan">CarePlan (Management Plans & Pathways)</option>
@@ -1054,14 +1059,14 @@ export default function ConversationList({
                             </select>
                           </div>
                         </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-[11px]">
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 text-2xs">
                           <div className="sm:col-span-9">
                             <input
                               type="text"
                               placeholder="Optional Model Type Hint (e.g. Use for active job status or environmental exposures)"
                               value={newCatTypeHint}
                               onChange={e => setNewCatTypeHint(e.target.value)}
-                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                              className="w-full text-xs border border-slate-200 rounded px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-brand-500 focus:outline-none"
                             />
                           </div>
                           <div className="sm:col-span-3">
@@ -1069,7 +1074,7 @@ export default function ConversationList({
                               type="button"
                               onClick={handleAddCategory}
                               disabled={!newCatName.trim()}
-                              className="w-full h-full flex items-center justify-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg text-xs cursor-pointer disabled:opacity-50 transition-colors"
+                              className="w-full h-full flex items-center justify-center gap-1 px-3 py-1.5 bg-brand-600 hover:bg-brand-700 text-white font-semibold rounded-lg text-xs cursor-pointer disabled:opacity-50 transition-colors"
                             >
                               <Plus className="w-3.5 h-3.5" />
                               <span>Create Category</span>
@@ -1084,7 +1089,7 @@ export default function ConversationList({
                 {/* Preview Warning / Disclaimer */}
                 <div className="bg-amber-50 border border-amber-100 p-3 rounded-lg flex gap-2 text-amber-800">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <p className="text-[10px] leading-normal font-medium">
+                  <p className="text-2xs leading-normal font-medium">
                     💡 <strong>Real-time Variable Annotation:</strong> Custom variables added to this project will be applied to all sessions in the group, restricting or extending the clinical fields rendered in active sessions.
                   </p>
                 </div>
@@ -1112,17 +1117,16 @@ export default function ConversationList({
                     setIsSettingsOpen(false);
                     setActiveSettingsTab('general');
                   }}
-                  className="px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-semibold cursor-pointer text-xs flex items-center gap-1 shadow-sm"
+                  className="px-4 py-1.5 bg-brand-600 text-white rounded-lg hover:bg-brand-700 font-semibold cursor-pointer text-xs flex items-center gap-1 shadow-sm"
                 >
                   <CheckCircle2 className="w-4 h-4" />
                   <span>Save Settings</span>
                 </button>
               </div>
             </div>
-          </div>
+          </div>, document.body
         );
       })()}
     </div>
   );
 }
-

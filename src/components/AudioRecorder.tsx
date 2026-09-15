@@ -3,7 +3,7 @@ import { Mic, Square, Trash2, Upload, Volume2, AlertCircle, RefreshCw } from 'lu
 import { compressAudioToMonoWav } from '../lib/audioCompressor';
 
 interface AudioRecorderProps {
-  onAudioRecorded: (blob: Blob, mimeType: string, speechToText?: string) => void;
+  onAudioRecorded: (blob: Blob, mimeType: string, speechToText?: string) => void | Promise<void>;
   onClearAudio: () => void;
   hasAudio: boolean;
   audioUrl?: string;
@@ -17,7 +17,6 @@ export default function AudioRecorder({
 }: AudioRecorderProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
-  const [recognitionText, setRecognitionText] = useState('');
   const [audioError, setAudioError] = useState<string | null>(null);
   const [isCompressing, setIsCompressing] = useState(false);
   const [compressionStatus, setCompressionStatus] = useState('');
@@ -26,42 +25,12 @@ export default function AudioRecorder({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const recognitionRef = useRef<any>(null);
-
-  // Initialize Speech Recognition
-  useEffect(() => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        let interimTranscript = '';
-        let finalTranscript = '';
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript + ' ';
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
-        }
-        
-        const fullText = finalTranscript || interimTranscript;
-        if (fullText.trim()) {
-          setRecognitionText(fullText);
-        }
-      };
-
-      recognition.onerror = (err: any) => {
-        console.warn('Speech recognition error:', err.error);
-      };
-
-      recognitionRef.current = recognition;
+  useEffect(() => () => {
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      recorder.onstop = null;
+      if (recorder.state !== 'inactive') recorder.stop();
+      recorder.stream.getTracks().forEach(track => track.stop());
     }
   }, []);
 
@@ -83,20 +52,24 @@ export default function AudioRecorder({
     };
   }, [isRecording]);
 
-  const processAndSaveAudio = async (rawBlob: Blob, mimeType: string, speechText?: string) => {
+  const processAndSaveAudio = async (rawBlob: Blob, mimeType: string) => {
     setIsCompressing(true);
     setAudioError(null);
     setAudioStats(null);
     try {
-      const { blob: compressedBlob, mimeType: compressedMime, originalSize, compressedSize } = await compressAudioToMonoWav(
-        rawBlob,
-        (msg) => setCompressionStatus(msg)
-      );
-      setAudioStats({ originalSize, compressedSize });
-      onAudioRecorded(compressedBlob, compressedMime, speechText);
+      const maxBytes = 50 * 1024 * 1024;
+      if (rawBlob.size <= maxBytes) {
+        await onAudioRecorded(rawBlob, mimeType);
+        return;
+      }
+      const compressed = await compressAudioToMonoWav(rawBlob, setCompressionStatus);
+      if (compressed.blob.size > maxBytes) {
+        throw new Error('Audio exceeds the 50 MB upload limit. Please use a shorter recording.');
+      }
+      await onAudioRecorded(compressed.blob, compressed.mimeType);
+      setAudioStats({ originalSize: rawBlob.size, compressedSize: compressed.blob.size });
     } catch (err: any) {
-      console.error("Audio optimization failed, falling back to original quality:", err);
-      onAudioRecorded(rawBlob, mimeType, speechText);
+      setAudioError(err.message || 'Could not save audio');
     } finally {
       setIsCompressing(false);
       setCompressionStatus('');
@@ -106,7 +79,6 @@ export default function AudioRecorder({
   const startRecording = async () => {
     audioChunksRef.current = [];
     setAudioError(null);
-    setRecognitionText('');
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -133,7 +105,7 @@ export default function AudioRecorder({
         const mimeType = mediaRecorder.mimeType || 'audio/webm';
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
         
-        processAndSaveAudio(audioBlob, mimeType, recognitionText);
+        processAndSaveAudio(audioBlob, mimeType);
         
         // Stop all stream tracks to release microphone
         stream.getTracks().forEach(track => track.stop());
@@ -142,14 +114,6 @@ export default function AudioRecorder({
       mediaRecorder.start(250); // Get chunks every 250ms
       setIsRecording(true);
 
-      // Start speech-to-text dictation
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch (recognitionStartError) {
-          console.warn('Recognition already started or error:', recognitionStartError);
-        }
-      }
     } catch (err: any) {
       console.error('Microphone access denied:', err);
       setAudioError('Unable to access microphone. Please enable microphone permissions.');
@@ -162,13 +126,6 @@ export default function AudioRecorder({
       setIsRecording(false);
     }
 
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (err) {
-        console.warn('Recognition stop error:', err);
-      }
-    }
   };
 
   // Drag and drop / Manual file selection handler
@@ -201,16 +158,16 @@ export default function AudioRecorder({
   };
 
   return (
-    <div className="bg-slate-50/50 border border-slate-100 rounded-xl p-4">
+    <div className="bg-slate-50/60 border border-slate-200 rounded-lg p-4">
       <div className="flex items-center justify-between mb-3.5">
-        <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider font-mono">Conversation Audio</h4>
+        <h3 className="section-heading">Conversation audio</h3>
         {hasAudio && (
           <button
             onClick={() => {
               setAudioStats(null);
               onClearAudio();
             }}
-            className="flex items-center gap-1 text-[11px] font-medium text-rose-500 hover:text-rose-600 bg-rose-50/55 px-2 py-1 rounded transition-colors cursor-pointer"
+            className="flex items-center gap-1 text-2xs font-medium text-rose-500 hover:text-rose-600 bg-rose-50/55 px-2 py-1 rounded transition-colors cursor-pointer"
           >
             <Trash2 className="w-3 h-3" /> Reset Audio
           </button>
@@ -225,21 +182,21 @@ export default function AudioRecorder({
       )}
 
       {isCompressing && (
-        <div className="bg-blue-50 border border-blue-100 text-blue-700 rounded-lg p-3.5 mb-3.5 flex items-center gap-3 text-xs animate-pulse">
-          <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0" />
+        <div className="bg-brand-50 border border-brand-100 text-brand-700 rounded-lg p-3.5 mb-3.5 flex items-center gap-3 text-xs animate-pulse">
+          <RefreshCw className="w-4 h-4 text-brand-600 animate-spin shrink-0" />
           <div>
-            <span className="font-bold">Optimizing Audio:</span> {compressionStatus || "Optimizing clinical audio..."}
+            <span className="font-semibold">Optimizing Audio:</span> {compressionStatus || "Optimizing clinical audio..."}
           </div>
         </div>
       )}
 
       {isCompressing ? (
         <div className="flex flex-col items-center justify-center py-6 bg-slate-50 border border-slate-100 rounded-lg text-xs text-slate-500 font-medium space-y-2">
-          <RefreshCw className="w-5 h-5 text-blue-500 animate-spin" />
+          <RefreshCw className="w-5 h-5 text-brand-500 animate-spin" />
           <span>Optimizing audio size to fit within secure pipeline limits...</span>
         </div>
       ) : !hasAudio ? (
-        <div className="flex flex-col md:flex-row items-center gap-4 justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3">
           {/* Record Section */}
           <div className="flex items-center gap-3 w-full md:w-auto">
             {isRecording ? (
@@ -253,22 +210,22 @@ export default function AudioRecorder({
             ) : (
               <button
                 onClick={startRecording}
-                className="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2.5 rounded-lg shadow-sm hover:shadow transition-all w-full md:w-auto cursor-pointer"
+                className="btn btn-secondary w-full sm:w-auto"
               >
                 <Mic className="w-4 h-4" />
-                <span className="text-sm">Record Speech</span>
+                <span>Record Speech</span>
               </button>
             )}
 
             {isRecording && (
               <div className="flex items-center gap-1.5 px-3 py-1 bg-rose-50 border border-rose-100 rounded-full animate-bounce">
                 <span className="w-2 h-2 rounded-full bg-rose-500"></span>
-                <span className="text-[10px] font-bold text-rose-600 uppercase font-mono">Listening...</span>
+                <span className="text-2xs font-semibold text-rose-600 uppercase font-sans">Listening...</span>
               </div>
             )}
           </div>
 
-          <div className="text-slate-300 font-mono text-[11px] hidden md:block">OR</div>
+          <div className="text-slate-500 text-xs hidden sm:block">or</div>
 
           {/* Upload File Section */}
           <div className="w-full md:w-auto relative">
@@ -281,7 +238,7 @@ export default function AudioRecorder({
             />
             <label
               htmlFor="audio-upload-input"
-              className="flex items-center justify-center gap-2 border border-slate-200 border-dashed hover:border-slate-300 bg-white hover:bg-slate-50 text-slate-600 hover:text-slate-800 px-4 py-2.5 rounded-lg transition-colors text-sm font-medium w-full md:w-auto cursor-pointer"
+              className="btn btn-secondary w-full sm:w-auto"
             >
               <Upload className="w-4 h-4" />
               <span>Upload Audio File</span>
@@ -293,23 +250,23 @@ export default function AudioRecorder({
           {audioUrl && (
             <div className="space-y-2">
               <div className="flex items-center gap-3 bg-white border border-slate-100 rounded-lg p-2.5">
-                <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
+                <div className="p-2 bg-brand-50 text-brand-600 rounded-lg">
                   <Volume2 className="w-4 h-4" />
                 </div>
                 <audio src={audioUrl} controls className="flex-1 h-8 max-w-full" />
               </div>
               
               {audioStats && (
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-[10px] font-mono bg-emerald-50/50 border border-emerald-100/40 rounded-lg px-3 py-2 text-emerald-800">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-2xs font-mono bg-emerald-50/50 border border-emerald-100/40 rounded-lg px-3 py-2 text-emerald-800">
                   <div className="flex items-center gap-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span className="font-semibold text-emerald-900">Secure pipeline optimized</span>
+                    <span className="font-semibold text-emerald-900">Audio size reduced</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="line-through text-slate-400">{(audioStats.originalSize / (1024 * 1024)).toFixed(2)} MB</span>
+                    <span className="line-through text-slate-500">{(audioStats.originalSize / (1024 * 1024)).toFixed(2)} MB</span>
                     <span>→</span>
-                    <span className="font-bold text-emerald-700">{(audioStats.compressedSize / (1024 * 1024)).toFixed(2)} MB</span>
-                    <span className="bg-emerald-100 text-emerald-900 text-[9px] font-bold px-1 py-0.2 rounded">
+                    <span className="font-semibold text-emerald-700">{(audioStats.compressedSize / (1024 * 1024)).toFixed(2)} MB</span>
+                    <span className="bg-emerald-100 text-emerald-900 text-2xs font-semibold px-1 py-0.2 rounded">
                       -{Math.round((1 - audioStats.compressedSize / audioStats.originalSize) * 100)}% Size
                     </span>
                   </div>
@@ -318,16 +275,6 @@ export default function AudioRecorder({
             </div>
           )}
 
-          {recognitionText && (
-            <div className="bg-blue-50/30 border border-blue-100/50 rounded-lg p-3">
-              <h5 className="text-[10px] font-bold text-blue-600 uppercase tracking-wide font-mono flex items-center gap-1">
-                <RefreshCw className="w-3 h-3 animate-spin" /> Live Dictation Stream
-              </h5>
-              <p className="text-xs text-slate-600 mt-1.5 italic">
-                "{recognitionText}"
-              </p>
-            </div>
-          )}
         </div>
       )}
     </div>

@@ -1,17 +1,20 @@
 import { useState, useEffect, useRef } from 'react';
 import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit, Key } from 'lucide-react';
 import { isJsonOrJsonlFormat } from '../utils/transcriptParser';
+import AnnotationProgress from './AnnotationProgress';
+import type { AnnotationProgress as Progress } from '../types';
 
 interface ConversationEditorProps {
   rawTranscript: string;
   onTranscriptChange: (text: string) => void;
   onFocusEditor?: () => void;
-  onAnnotate: () => void;
+  onAnnotate: (text: string) => void;
   onDiarize: () => void;
   onManualAnnotate: () => void;
   isDiarizing: boolean;
   hasAudio: boolean;
   status: 'draft' | 'processing' | 'annotated' | 'failed';
+  annotationProgress?: Progress | null;
   warningMessage?: string | null;
   encounterType?: 'dialogue' | 'note';
   isReadOnly?: boolean;
@@ -122,6 +125,7 @@ export default function ConversationEditor({
   isDiarizing,
   hasAudio,
   status,
+  annotationProgress,
   warningMessage,
   encounterType = 'dialogue',
   isReadOnly = false,
@@ -221,32 +225,31 @@ export default function ConversationEditor({
       clearTimeout(debounceTimerRef.current);
       debounceTimerRef.current = null;
     }
-    if (localText !== rawTranscript) {
-      onTranscriptChange(localText);
-    }
     isTypingRef.current = false;
-    onAnnotate();
+    onAnnotate(localText);
   };
 
   return (
-    <div className="bg-white border border-slate-100 rounded-2xl p-4.5 shadow-sm space-y-4 animate-fade-in">
-      <div className="flex items-center justify-between">
+    <div className="transcript-editor space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1.5">
           <FileText className="w-4 h-4 text-slate-500" />
           <h3 className="text-sm font-semibold text-slate-800">
-            {encounterType === 'note' ? 'Clinical Document / Record' : 'Transcript Conversation'}
+            {encounterType === 'note' ? 'Clinical document' : 'Conversation transcript'}
           </h3>
         </div>
         {!isReadOnly && (
-          <div className="flex gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-2xs text-slate-500 mr-1">Try an example</span>
             {templates.map((tpl, idx) => (
               <button
                 key={idx}
                 onClick={() => applyTemplate(idx)}
-                className={`text-[10px] font-medium px-2 py-1 rounded transition-colors cursor-pointer ${
+                disabled={status === 'processing' || isDiarizing}
+                className={`text-2xs font-medium px-2.5 py-1.5 rounded-md border transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                   selectedTemplateIdx === idx
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-50 text-slate-600 hover:bg-slate-100'
+                    ? 'bg-brand-50 text-brand-700 border-brand-200'
+                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
                 }`}
               >
                 {tpl.title}
@@ -270,7 +273,7 @@ export default function ConversationEditor({
             <div className="flex items-start gap-2.5">
               <AlertCircle className={`w-4 h-4 shrink-0 mt-0.5 ${isError ? 'text-rose-600' : 'text-amber-600'}`} />
               <div className="text-xs leading-normal flex-1">
-                <span className="font-bold">{isError ? 'System Error / Diagnosis Trace:' : 'Notice / Info:'}</span>{' '}
+                <span className="font-semibold">{isError ? 'System Error / Diagnosis Trace:' : 'Notice / Info:'}</span>{' '}
                 {warningMessage.split('\n')[0]}
                 {onOpenSettings && (warningMessage.toLowerCase().includes('api key') || warningMessage.toLowerCase().includes('popup')) && (
                   <div className="mt-2.5">
@@ -288,13 +291,13 @@ export default function ConversationEditor({
             </div>
             
             {warningMessage.includes('\n') && (
-              <details className={`text-[11px] font-mono border rounded-lg p-3 cursor-pointer select-text overflow-hidden ${
+              <details className={`text-2xs font-mono border rounded-lg p-3 cursor-pointer select-text overflow-hidden ${
                 isError ? 'bg-rose-100/40 border-rose-200/50 text-rose-950' : 'bg-amber-100/40 border-amber-200/50 text-amber-950'
               }`}>
                 <summary className="font-sans font-semibold text-xs mb-1.5 focus:outline-none cursor-pointer hover:underline flex items-center gap-1">
                   <span>Show Detailed System Diagnostics & Full Stack Trace</span>
                 </summary>
-                <pre className="whitespace-pre-wrap break-all text-[10px] mt-2 font-mono leading-relaxed bg-black/5 p-2.5 rounded select-all max-h-52 overflow-y-auto">
+                <pre className="whitespace-pre-wrap break-all text-2xs mt-2 font-mono leading-relaxed bg-black/5 p-2.5 rounded select-all max-h-52 overflow-y-auto">
                   {warningMessage}
                 </pre>
               </details>
@@ -307,20 +310,20 @@ export default function ConversationEditor({
         <div className="flex items-center justify-between bg-slate-50/80 border border-slate-100 rounded-xl px-3 py-2 text-xs">
           <div className="flex items-center gap-1.5">
             {isJsonl ? (
-              <span className="bg-indigo-100 text-indigo-800 text-[10px] font-bold px-2 py-0.5 rounded font-mono">
+              <span className="bg-brand-100 text-brand-800 text-2xs font-semibold px-2 py-0.5 rounded font-mono">
                 JSONL Format
               </span>
             ) : (
-              <span className="bg-slate-200 text-slate-700 text-[10px] font-bold px-2 py-0.5 rounded font-mono">
+              <span className="bg-slate-200 text-slate-700 text-2xs font-semibold px-2 py-0.5 rounded font-mono">
                 Standard Text
               </span>
             )}
-            <span className="text-slate-500 text-[11px] hidden sm:inline">Reusable structure for pipeline integrations</span>
+            <span className="text-slate-500 text-2xs hidden sm:inline">Source transcript</span>
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={copyToClipboard}
-              className="flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded shadow-sm transition-colors cursor-pointer"
+              className="flex items-center gap-1 text-2xs font-medium text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded shadow-sm transition-colors cursor-pointer"
               title="Copy to Clipboard"
             >
               <ClipboardCopy className="w-3.5 h-3.5 text-slate-500" />
@@ -328,7 +331,7 @@ export default function ConversationEditor({
             </button>
             <button
               onClick={downloadTranscript}
-              className="flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded shadow-sm transition-colors cursor-pointer"
+              className="flex items-center gap-1 text-2xs font-medium text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 px-2.5 py-1 rounded shadow-sm transition-colors cursor-pointer"
               title="Download File"
             >
               <Download className="w-3.5 h-3.5 text-slate-500" />
@@ -340,6 +343,7 @@ export default function ConversationEditor({
 
       <div className="relative">
         <textarea
+          aria-label={encounterType === 'note' ? 'Clinical document text' : 'Conversation transcript'}
           value={localText}
           onChange={(e) => handleTextChange(e.target.value)}
           onBlur={handleBlur}
@@ -349,44 +353,39 @@ export default function ConversationEditor({
               ? "Type or paste the unstructured clinical note, referral letter, or SOAP summary here..."
               : "Type or paste the clinical conversation transcript here (e.g., in JSONL format, or 'Speaker: text'), or use a template, or record/upload audio and click 'Diarize Audio'..."
           }
-          className={`w-full h-[220px] text-xs border border-slate-200 rounded-lg p-3 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 resize-none font-mono ${
-            isReadOnly ? 'bg-slate-50 text-slate-600' : 'bg-white'
+          className={`transcript-input w-full h-[220px] border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-brand-500 ${
+            isReadOnly ? 'bg-slate-50 text-slate-600' : 'bg-slate-50/50 text-slate-800'
           }`}
           disabled={status === 'processing' || isDiarizing}
           readOnly={isReadOnly}
         />
-        <div className="absolute bottom-3 right-3 text-[9px] font-mono text-slate-400 select-none pointer-events-none">
+        <div className="absolute bottom-3 right-3 text-2xs text-slate-500 bg-slate-50/90 px-1.5 rounded select-none pointer-events-none">
           {localText.length} characters
         </div>
       </div>
 
+      {annotationProgress && <AnnotationProgress progress={annotationProgress} encounterType={encounterType} />}
+
       {/* API Key hint if unset */}
       {!hasApiKey && !isReadOnly && (
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-amber-50/80 border border-amber-200/70 rounded-xl text-xs text-amber-900 shadow-2xs">
-          <div className="flex items-center gap-2.5">
-            <div className="p-1.5 bg-amber-200/60 text-amber-800 rounded-lg shrink-0">
-              <Key className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="font-bold text-amber-950">Bring Your Own Key:</span> The default Gemini key is unset. You can configure your own Gemini or OpenAI API key in the popup to run live AI models, or explore using the local rule demo.
-            </div>
-          </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+          <Sparkles className="w-3.5 h-3.5 text-brand-600" />
+          <span>Want a head start with AI?</span>
           {onOpenSettings && (
             <button
               type="button"
               onClick={onOpenSettings}
-              className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded-lg transition-all shadow-2xs cursor-pointer flex items-center gap-1.5 shrink-0 self-start sm:self-auto"
+              className="font-medium text-brand-700 hover:underline"
             >
-              <Key className="w-3.5 h-3.5" />
-              <span>Set Keys in Popup</span>
+              Connect your model in settings
             </button>
           )}
         </div>
       )}
 
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-1">
-        <div className="flex items-center gap-1.5 text-[10px] text-slate-400">
-          <Info className="w-3.5 h-3.5 text-slate-500" />
+      <div className="flex flex-col 2xl:flex-row 2xl:items-center justify-between gap-4 pt-4 border-t border-slate-100">
+        <div className="flex items-start gap-1.5 text-2xs text-slate-500">
+          <Info className="w-3.5 h-3.5 text-slate-500 shrink-0 mt-0.5" />
           <span>
             {encounterType === 'note'
               ? "Clinical text documents are automatically parsed by paragraph block headings (e.g. Subjective:, Objective:, Plan:)."
@@ -394,10 +393,10 @@ export default function ConversationEditor({
           </span>
         </div>
         
-        <div className="flex items-center gap-3 self-end sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 sm:self-end">
           {isReadOnly ? (
-            <div className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-4.5 py-2 font-medium flex items-center gap-1.5 shadow-sm">
-              <Info className="w-4 h-4 text-indigo-500 shrink-0" />
+            <div className="text-xs text-brand-700 bg-brand-50 border border-brand-100 rounded-lg px-4.5 py-2 font-medium flex items-center gap-1.5 shadow-sm">
+              <Info className="w-4 h-4 text-brand-500 shrink-0" />
               <span>Read-Only Session. Clone it to make edits.</span>
             </div>
           ) : (
@@ -408,13 +407,13 @@ export default function ConversationEditor({
                   disabled={isDiarizing || status === 'processing' || !isServerReady}
                   className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2.5 rounded-lg shadow-sm border transition-all cursor-pointer ${
                     isDiarizing || !isServerReady
-                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed shadow-none'
-                      : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200 hover:shadow-md'
+                      ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed shadow-none'
+                      : 'bg-brand-50 hover:bg-brand-100 text-brand-700 border-brand-200 hover:shadow-md'
                   }`}
                 >
                   {isDiarizing ? (
                     <>
-                      <svg className="animate-spin h-4 w-4 text-indigo-600" fill="none" viewBox="0 0 24 24">
+                      <svg className="animate-spin h-4 w-4 text-brand-600" fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                       </svg>
@@ -427,7 +426,7 @@ export default function ConversationEditor({
                     </>
                   ) : (
                     <>
-                      <Sparkles className="w-4 h-4 text-indigo-500" />
+                      <Sparkles className="w-4 h-4 text-brand-500" />
                       <span>Diarize Audio (JSONL)</span>
                     </>
                   )}
@@ -437,30 +436,20 @@ export default function ConversationEditor({
               <button
                 onClick={onManualAnnotate}
                 disabled={status === 'processing' || isDiarizing}
-                className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2.5 rounded-lg border shadow-sm transition-all cursor-pointer ${
-                  status === 'processing' || isDiarizing
-                    ? 'bg-slate-50 text-slate-400 border-slate-100 cursor-not-allowed shadow-none'
-                    : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200 hover:shadow-md'
-                }`}
+                className={`btn ${hasApiKey ? 'btn-secondary' : 'btn-primary'}`}
               >
-                <Edit className="w-3.5 h-3.5 text-slate-500" />
+                <Edit className="w-3.5 h-3.5" />
                 <span>Annotate Manually</span>
               </button>
 
               <button
                 onClick={handleAnnotateClick}
                 disabled={status === 'processing' || isDiarizing || !localText.trim() || !isServerReady}
-                className={`flex items-center gap-1.5 text-xs font-semibold px-5 py-2.5 rounded-lg shadow-sm transition-all cursor-pointer ${
-                  status === 'processing' || isDiarizing || !isServerReady
-                    ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
-                    : !localText.trim()
-                    ? 'bg-slate-100 text-slate-400 cursor-not-allowed shadow-none'
-                    : 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-md'
-                }`}
+                className={`btn ${hasApiKey ? 'btn-primary' : 'btn-secondary'}`}
               >
                 {status === 'processing' ? (
                   <>
-                    <svg className="animate-spin h-4 w-4 text-slate-400" fill="none" viewBox="0 0 24 24">
+                    <svg className="animate-spin h-4 w-4 text-slate-500" fill="none" viewBox="0 0 24 24">
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                     </svg>

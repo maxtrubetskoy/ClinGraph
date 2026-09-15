@@ -1,26 +1,18 @@
-import { useState, useEffect, useMemo } from 'react';
-import { db, auth } from './firebase';
-import {
-  collection,
-  onSnapshot,
-  doc,
-  setDoc,
-  deleteDoc,
-  query,
-  orderBy,
-  where,
-  getDoc
-} from 'firebase/firestore';
-import {
-  signInWithPopup,
-  GoogleAuthProvider,
-  signOut,
-  onAuthStateChanged,
-  User
-} from 'firebase/auth';
-import { Conversation, ClinicalCategory, Entity, Mention, migrateToMentionsSchema, SessionGroup, SessionGroupSettings, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, areSchemasIdentical } from './types';
-import { saveAudioBlob, getAudioBlob, deleteAudioBlob } from './lib/audioDb';
-import { parseTranscriptToSegments, parseNoteTextToSegments, isJsonOrJsonlFormat } from './utils/transcriptParser';
+import EncounterTimeEditor from './components/EncounterTimeEditor';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useWorkspace } from './lib/useWorkspace';
+import { Conversation, ClinicalCategory, Entity, Mention, SessionGroup, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from './types';
+import type { AnnotationProgress } from './types';
+import { readAnnotationResponse } from './lib/annotationStream';
+import { apiFetch } from './firebase';
+import { ANNOTATION_CONCURRENCY_ERROR, DEFAULT_ANNOTATION_CONCURRENCY, MAX_ANNOTATION_CONCURRENCY, isValidAnnotationConcurrency } from './utils/annotationConcurrency';
+import { getAudioBlob } from './lib/audioDb';
+import { normalizeEvidence, reconcileEvidenceWithNotes } from './utils/evidence';
+import { getProcedureRelations, unlinkDeletedProcedures } from './utils/procedureReferences';
+import EvidenceGraph from './components/EvidenceGraph';
+import AnnotationHistory from './components/AnnotationHistory';
+import LegacyArchive from './components/LegacyArchive';
+import { parseTranscriptToSegments, isJsonOrJsonlFormat } from './utils/transcriptParser';
 import { reconcileSegmentsWithExisting, realignMentionsWithSegments, splitSegmentAtOffset, changeSegmentSpeaker } from './utils/segmentRealignment';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -33,62 +25,31 @@ import ClinicalNotesView from './components/ClinicalNotesView';
 import RawTranscriptView from './components/RawTranscriptView';
 
 // Icons
-import { Sparkles, Brain, MessageSquare, Shield, HelpCircle, PanelLeftClose, PanelLeftOpen, X, FileText, Check, Edit2, Share2, LogOut, LogIn, Copy, ExternalLink, ShieldAlert, Key, Folder, FolderPlus, FileCode, Info } from 'lucide-react';
+import { Sparkles, Brain, MessageSquare, Shield, HelpCircle, PanelLeftClose, PanelLeftOpen, X, FileText, Check, Edit2, Share2, Copy, ExternalLink, ShieldAlert, Key, Folder, FolderPlus, FileCode, Info, History, Network, ArrowRight, Plus, Settings2 } from 'lucide-react';
 import ExportJsonlModal from './components/ExportJsonlModal';
 
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
-        providerId: provider.providerId,
-        email: provider.email,
-      })) || []
-    },
-    operationType,
-    path
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
-}
-
-export default function App() {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
+export default function App({ storageMode = 'sqlite', accountName, onSignOut }: {
+  storageMode?: 'sqlite' | 'firebase'; accountName?: string; onSignOut?: () => void;
+}) {
+  const { conversations, sessionGroups, settings, loading, error: storageError, reload,
+    saveConversation, deleteConversation, saveGroup, deleteGroup, saveSettings, saveAudio,
+    listCheckpoints, getCheckpoint, createCheckpoint, restoreCheckpoint } = useWorkspace();
+  const [activeId, setActiveId] = useState<string | null>(() => new URLSearchParams(window.location.search).get('session'));
+  const [audioRevision, setAudioRevision] = useState(0);
+  useEffect(() => {
+    if (loading) return;
+    setActiveId(previous => previous && conversations.some(c => c.id === previous) ? previous : conversations[0]?.id || null);
+  }, [conversations, loading]);
+  useEffect(() => {
+    if (loading || !activeId || !conversations.some(c => c.id === activeId)) return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('session') !== activeId) {
+      url.searchParams.set('session', activeId);
+      window.history.replaceState(null, '', url);
+    }
+  }, [activeId, loading, conversations]);
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'graph' | 'dialogue'>('dialogue');
+  const [activeTab, setActiveTab] = useState<'graph' | 'dialogue' | 'evidence'>('dialogue');
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedMentionId, setSelectedMentionId] = useState<string | null>(null);
   
@@ -102,6 +63,8 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState<string | undefined>(undefined);
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
   const [isDiarizing, setIsDiarizing] = useState(false);
+  const [annotationRuns, setAnnotationRuns] = useState<Record<string, AnnotationProgress>>({});
+  const annotatingIds = useRef(new Set<string>());
 
   // Session Creation Dialog State
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -112,10 +75,6 @@ export default function App() {
   // Session Renaming State
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleText, setEditingTitleText] = useState('');
-
-  // Account Management & User Authentication
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
 
   // Backend server readiness status
   const [serverStatus, setServerStatus] = useState<'checking' | 'ready' | 'loading' | 'error'>('checking');
@@ -164,231 +123,68 @@ export default function App() {
     };
   }, []);
 
-  // Sharing & Cloning State
-  const [sharedSession, setSharedSession] = useState<Conversation | null>(null);
-  const [loadingShared, setLoadingShared] = useState(false);
-  const [shareError, setShareError] = useState<string | null>(null);
+  // Local session links and export
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [isExportJsonlOpen, setIsExportJsonlOpen] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isArchiveOpen, setIsArchiveOpen] = useState(false);
   const [copiedShareLink, setCopiedShareLink] = useState(false);
   const [sharedLinkUrl, setSharedLinkUrl] = useState('');
 
   // Custom AI Settings (Bring Your Own Model)
-  const [userAiConfig, setUserAiConfig] = useState<any>(() => {
-    try {
-      const cached = localStorage.getItem('clinical_user_ai_config');
-      if (cached) return JSON.parse(cached);
-    } catch (e) {}
-    return {
-      transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
-      annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
-    };
+  const [userAiConfig, setUserAiConfig] = useState<any>({
+    transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
+    annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '', concurrency: DEFAULT_ANNOTATION_CONCURRENCY }
   });
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isDismissedKeyBanner, setIsDismissedKeyBanner] = useState(false);
   const [localConfig, setLocalConfig] = useState<any>({
     transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
-    annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
+    annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '', concurrency: DEFAULT_ANNOTATION_CONCURRENCY }
   });
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
+  const annotationConcurrencyValid = isValidAnnotationConcurrency(localConfig.annotation.concurrency);
 
   // Check if visitor has configured any API keys
   const hasUserConfiguredKeys = Boolean(
     userAiConfig?.annotation?.apiKey?.trim() || userAiConfig?.transcription?.apiKey?.trim()
   );
 
-  // Load User AI settings from Firestore
   useEffect(() => {
-    if (!currentUser) {
-      try {
-        const cached = localStorage.getItem('clinical_user_ai_config');
-        if (cached) {
-          setUserAiConfig(JSON.parse(cached));
-          return;
-        }
-      } catch (e) {}
-      return;
-    }
-
-    const docRef = doc(db, 'user_settings', currentUser.uid);
-    const unsubscribe = onSnapshot(docRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        const loaded = {
-          transcription: data.transcription || { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
-          annotation: data.annotation || { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
-        };
-        setUserAiConfig(loaded);
-        try {
-          localStorage.setItem('clinical_user_ai_config', JSON.stringify(loaded));
-        } catch (e) {}
-      } else {
-        // Sync local settings to cloud if user has local settings
-        try {
-          const cached = localStorage.getItem('clinical_user_ai_config');
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            setDoc(doc(db, 'user_settings', currentUser.uid), parsed).catch(() => {});
-          }
-        } catch (e) {}
-      }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, `user_settings/${currentUser.uid}`);
-    });
-
-    return () => unsubscribe();
-  }, [currentUser]);
+    if (settings) setUserAiConfig({ ...settings, annotation: {
+      ...settings.annotation, concurrency: settings.annotation.concurrency ?? DEFAULT_ANNOTATION_CONCURRENCY
+    } });
+  }, [settings]);
 
   const openSettingsModal = () => {
+    setSettingsSaveError(null);
     setLocalConfig(JSON.parse(JSON.stringify(userAiConfig || {
       transcription: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' },
-      annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '' }
+      annotation: { provider: 'gemini', model: 'gemini-3.1-flash-lite', apiKey: '', baseUrl: '', concurrency: DEFAULT_ANNOTATION_CONCURRENCY }
     })));
     setIsSettingsOpen(true);
   };
 
   const handleSaveSettings = async () => {
+    if (!annotationConcurrencyValid) return;
+    setSettingsSaveError(null);
     try {
-      localStorage.setItem('clinical_user_ai_config', JSON.stringify(localConfig));
-      setUserAiConfig(localConfig);
-      if (currentUser) {
-        await setDoc(doc(db, 'user_settings', currentUser.uid), localConfig);
-      }
-      setIsSettingsOpen(false);
-    } catch (err) {
-      console.warn("Could not save to Firestore, saved locally in browser:", err);
+      await saveSettings(localConfig);
       setUserAiConfig(localConfig);
       setIsSettingsOpen(false);
-    }
-  };
-
-  // Firestore reference
-  const conversationsCollection = collection(db, 'clinical_conversations');
-
-  // Handle Auth Changes
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setCurrentUser(user);
-      setAuthLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // Handle Google Sign-In
-  const handleGoogleSignIn = async () => {
-    const provider = new GoogleAuthProvider();
-    try {
-      await signInWithPopup(auth, provider);
     } catch (err) {
-      console.error('Google Sign In Error:', err);
+      console.error('Could not save AI settings:', err);
+      setSettingsSaveError(err instanceof Error ? err.message : 'Could not save AI settings. Please try again.');
     }
   };
-
-  // Handle Sign-Out
-  const handleSignOut = async () => {
-    try {
-      await signOut(auth);
-      setConversations([]);
-      setActiveId(null);
-    } catch (err) {
-      console.error('Sign Out Error:', err);
-    }
-  };
-
-  // Load shared session if 'share' query param is in the URL on mount
-  useEffect(() => {
-    const urlParams = new URLSearchParams(window.location.search);
-    const shareId = urlParams.get('share');
-    if (shareId) {
-      setLoadingShared(true);
-      const docRef = doc(db, 'clinical_conversations', shareId);
-      getDoc(docRef)
-        .then((docSnap) => {
-          if (docSnap.exists()) {
-            const data = docSnap.data() as Conversation;
-            if (data.isShared) {
-              setSharedSession({ id: docSnap.id, ...data });
-              setActiveId(shareId);
-            } else {
-              setShareError("This clinical session is not shared publicly.");
-            }
-          } else {
-            setShareError("The requested shared clinical session was not found.");
-          }
-        })
-        .catch((err) => {
-          console.error("Error loading shared session:", err);
-          setShareError("Could not retrieve the shared session.");
-        })
-        .finally(() => {
-          setLoadingShared(false);
-        });
-    }
-  }, []);
-
-  // Real-time listener for user-specific conversations
-  useEffect(() => {
-    if (!currentUser) {
-      setConversations([]);
-      return;
-    }
-
-    // Query for conversations belonging to current user
-    const q = query(conversationsCollection, where('userId', '==', currentUser.uid));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const list: Conversation[] = [];
-      snapshot.forEach((doc) => {
-        list.push({ id: doc.id, ...doc.data() } as Conversation);
-      });
-      
-      // Sort in memory by createdAt descending to bypass indexing limitations
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      
-      setConversations(list);
-
-      // Set first conversation as active if none selected and not viewing shared
-      const urlParams = new URLSearchParams(window.location.search);
-      if (list.length > 0 && !activeId && !urlParams.has('share')) {
-        setActiveId(list[0].id);
-      }
-    }, (error) => {
-      console.error("Firestore loading error:", error);
-    });
-
-    return () => unsubscribe();
-  }, [currentUser, activeId]);
-
-  // Real-time listener for user-specific session groups
-  useEffect(() => {
-    if (!currentUser) {
-      setSessionGroups([]);
-      return;
-    }
-
-    const sessionGroupsCollection = collection(db, 'session_groups');
-    const q = query(sessionGroupsCollection, where('userId', '==', currentUser.uid));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const list: SessionGroup[] = [];
-      snapshot.forEach((doc) => {
-        list.push({ id: doc.id, ...doc.data() } as SessionGroup);
-      });
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setSessionGroups(list);
-    }, (error) => {
-      console.error("Firestore loading session groups error:", error);
-    });
-
-    return () => unsubscribe();
-  }, [currentUser]);
 
   // Session group CRUD handlers
   const handleCreateGroup = async (name: string) => {
-    if (!currentUser) return;
-    const newGroupId = `group_${Date.now()}`;
+    const newGroupId = `group_${crypto.randomUUID()}`;
     const newGroup: SessionGroup = {
       id: newGroupId,
       name,
       createdAt: new Date().toISOString(),
-      userId: currentUser.uid,
       settings: {
         description: '',
         encounterTemplate: 'standard',
@@ -397,48 +193,27 @@ export default function App() {
       }
     };
     try {
-      await setDoc(doc(db, 'session_groups', newGroupId), newGroup);
+      await saveGroup(newGroupId, newGroup);
     } catch (err) {
       console.error("Error creating session group:", err);
     }
   };
 
   const handleUpdateGroup = async (id: string, name: string, settings: any) => {
-    if (!currentUser) return;
     try {
-      await setDoc(doc(db, 'session_groups', id), {
+      await saveGroup(id, {
         name,
         settings
       }, { merge: true });
 
-      // Keep sharedGroupData in sync for any shared sessions belonging to this group
-      const sharedSessionsInGroup = conversations.filter(c => c.groupId === id && c.isShared);
-      for (const session of sharedSessionsInGroup) {
-        await setDoc(doc(db, 'clinical_conversations', session.id), {
-          sharedGroupData: {
-            id,
-            name,
-            settings
-          }
-        }, { merge: true });
-      }
     } catch (err) {
       console.error("Error updating session group:", err);
     }
   };
 
   const handleDeleteGroup = async (id: string) => {
-    if (!currentUser) return;
     try {
-      await deleteDoc(doc(db, 'session_groups', id));
-      
-      // Update any sessions belonging to this group to remove the group association
-      const sessionsInGroup = conversations.filter(c => c.groupId === id);
-      for (const session of sessionsInGroup) {
-        await setDoc(doc(db, 'clinical_conversations', session.id), {
-          groupId: null
-        }, { merge: true });
-      }
+      await deleteGroup(id);
       
       if (activeGroupId === id) {
         setActiveGroupId(null);
@@ -448,176 +223,47 @@ export default function App() {
     }
   };
 
-  // Clone a shared session to the current user's local workspace
-  const handleCloneShared = async () => {
-    if (!currentUser || !sharedSession) return;
-    
-    // Suffix/Version original name
-    const getNextVersionTitle = (title: string): string => {
-      const versionRegex = / \(v(\d+)\)$/;
-      const match = title.match(versionRegex);
-      if (match) {
-        const currentVersion = parseInt(match[1], 10);
-        return title.replace(versionRegex, ` (v${currentVersion + 1})`);
-      }
-      return `${title} (v2)`;
-    };
-
-    // Determine shared group info
-    const sharedGroupInfo = sharedSession.sharedGroupData || (
-      sharedSession.groupId ? sessionGroups.find(g => g.id === sharedSession.groupId) : null
-    );
-
-    let targetGroupId: string | null = null;
-    let targetSharedGroupData: any = null;
-
-    if (sharedGroupInfo) {
-      const sharedSchema = sharedGroupInfo.settings?.annotationSchema;
-
-      // Check if user already has an exactly identical group (exact schema match)
-      // 1. First preference: group with matching name AND exact schema match
-      let matchingGroup = sessionGroups.find(g => {
-        return (
-          g.name.toLowerCase().trim() === (sharedGroupInfo.name || '').toLowerCase().trim() &&
-          areSchemasIdentical(g.settings?.annotationSchema, sharedSchema)
-        );
-      });
-
-      // 2. Second preference: any group with exact schema match
-      if (!matchingGroup) {
-        matchingGroup = sessionGroups.find(g => {
-          return areSchemasIdentical(g.settings?.annotationSchema, sharedSchema);
-        });
-      }
-
-      if (matchingGroup) {
-        // Exact schema match exists: add session to that existing group
-        targetGroupId = matchingGroup.id;
-        targetSharedGroupData = {
-          id: matchingGroup.id,
-          name: matchingGroup.name,
-          settings: matchingGroup.settings || {}
-        };
-      } else {
-        // No exact schema match: create a new group with the shared settings & schema
-        const newGroupId = `group_${Date.now()}`;
-        const newGroupName = sharedGroupInfo.name || 'Shared Annotations Group';
-        const newGroupSettings: SessionGroupSettings = {
-          description: sharedGroupInfo.settings?.description || '',
-          encounterTemplate: sharedGroupInfo.settings?.encounterTemplate || 'standard',
-          preferredModel: sharedGroupInfo.settings?.preferredModel || 'gemini-3.5-flash',
-          clinicalTaxonomy: sharedGroupInfo.settings?.clinicalTaxonomy || 'all',
-          annotationSchema: normalizeAnnotationSchema(sharedGroupInfo.settings?.annotationSchema || DEFAULT_ANNOTATION_SCHEMA)
-        };
-
-        const newGroup: SessionGroup = {
-          id: newGroupId,
-          name: newGroupName,
-          createdAt: new Date().toISOString(),
-          userId: currentUser.uid,
-          settings: newGroupSettings
-        };
-
-        try {
-          await setDoc(doc(db, 'session_groups', newGroupId), newGroup);
-          targetGroupId = newGroupId;
-          targetSharedGroupData = {
-            id: newGroupId,
-            name: newGroupName,
-            settings: newGroupSettings
-          };
-        } catch (err) {
-          console.error('Error creating group for cloned session:', err);
-        }
-      }
-    }
-
-    const newId = `session_${Date.now()}`;
-    const clonedSession: Conversation = {
-      ...sharedSession,
-      id: newId,
-      title: getNextVersionTitle(sharedSession.title),
-      userId: currentUser.uid,
-      isShared: false, // Clone of a shared session is private by default
-      sharedFromId: sharedSession.id,
-      groupId: targetGroupId || undefined,
-      sharedGroupData: targetSharedGroupData || undefined,
-      createdAt: new Date().toISOString()
-    };
-
-    try {
-      await setDoc(doc(db, 'clinical_conversations', newId), clonedSession);
-      // Remove share from URL
-      window.history.replaceState({}, '', window.location.pathname);
-      setSharedSession(null);
-      setActiveId(newId);
-    } catch (err) {
-      console.error('Error cloning shared session:', err);
-    }
-  };
-
-  // Update active conversation audio URL when selection changes
+  const activeConversationRaw = conversations.find((c) => c.id === activeId);
+  const activeGroup = sessionGroups.find(g => g.id === activeConversationRaw?.groupId) || null;
+  const activeSchema = useMemo(() => normalizeAnnotationSchema(activeConversationRaw?.schemaSnapshot?.categories ||
+    activeGroup?.settings?.annotationSchema || DEFAULT_ANNOTATION_SCHEMA), [activeConversationRaw?.schemaSnapshot, activeGroup?.settings?.annotationSchema]);
+  const activeAudioId = activeConversationRaw?.audioLocalId;
   useEffect(() => {
     setIsEditingTitle(false);
     setEditingTitleText('');
-    if (!activeId) {
-      setAudioUrl(undefined);
-      return;
-    }
-
-    const activeConv = conversations.find((c) => c.id === activeId) || (sharedSession?.id === activeId ? sharedSession : null);
-    if (!activeConv) return;
-
-    if (activeConv.audioLocalId) {
-      getAudioBlob(activeConv.audioLocalId).then((blob) => {
-        if (blob) {
-          setAudioUrl(URL.createObjectURL(blob));
-        } else {
-          setAudioUrl(undefined);
+    setAudioUrl(undefined);
+    let cancelled = false;
+    let objectUrl: string | undefined;
+    if (activeAudioId) {
+      getAudioBlob(activeAudioId).then(blob => {
+        if (!cancelled && blob) {
+          objectUrl = URL.createObjectURL(blob);
+          setAudioUrl(objectUrl);
         }
-      });
-    } else if (activeConv.audioDataUrl) {
-      setAudioUrl(activeConv.audioDataUrl);
-    } else {
-      setAudioUrl(undefined);
+      }).catch(err => { if (!cancelled) setWarningMessage(err.message); });
     }
-  }, [activeId, conversations, sharedSession]);
-
-  const activeConversationRaw = conversations.find((c) => c.id === activeId) || (sharedSession?.id === activeId ? sharedSession : null);
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [activeId, activeAudioId, audioRevision]);
 
   const activeConversation = useMemo(() => {
     if (!activeConversationRaw) return null;
     if (!activeConversationRaw.annotation) return activeConversationRaw;
 
-    const migrated = migrateToMentionsSchema(activeConversationRaw.annotation);
+    const migrated = normalizeEvidence(activeConversationRaw.annotation, activeSchema);
     return {
       ...activeConversationRaw,
       annotation: migrated
     };
-  }, [activeConversationRaw]);
+  }, [activeConversationRaw, activeSchema]);
 
-  const activeGroup = useMemo(() => {
-    if (!activeConversation) return null;
-    const userGroup = sessionGroups.find(g => g.id === activeConversation.groupId);
-    if (userGroup) return userGroup;
-    if (activeConversation.sharedGroupData) {
-      return {
-        id: activeConversation.sharedGroupData.id || activeConversation.groupId || 'shared_group',
-        name: activeConversation.sharedGroupData.name,
-        createdAt: '',
-        userId: activeConversation.userId || '',
-        settings: activeConversation.sharedGroupData.settings
-      } as SessionGroup;
-    }
-    return null;
-  }, [activeConversation, sessionGroups]);
-
-  const isReadOnly = !currentUser || activeConversation?.userId !== currentUser.uid;
+  const isReadOnly = false;
 
   // Create a new blank draft clinical session
   const handleCreateNew = async (title?: string, type: 'dialogue' | 'note' = 'dialogue', groupId?: string) => {
-    if (!currentUser) return;
-    const newId = `session_${Date.now()}`;
+    const newId = `session_${crypto.randomUUID()}`;
     const defaultTitle = (title && title.trim()) || (type === 'note' ? 'Draft Clinical Note' : 'Draft Dialogue Encounter');
     const newSession: Conversation = {
       id: newId,
@@ -628,26 +274,23 @@ export default function App() {
       hasAudio: false,
       status: 'draft',
       encounterType: type,
-      userId: currentUser.uid,
       groupId: groupId || null
     };
 
     try {
-      await setDoc(doc(db, 'clinical_conversations', newId), newSession);
+      await saveConversation(newId, newSession);
       setActiveId(newId);
     } catch (err) {
-      console.error('Error creating session in Firestore:', err);
+      console.error('Error creating session in local database:', err);
     }
   };
 
   // Delete clinical session
   const handleDelete = async (id: string) => {
     try {
-      const conv = conversations.find((c) => c.id === id);
-      if (conv?.audioLocalId) {
-        await deleteAudioBlob(conv.audioLocalId);
-      }
-      await deleteDoc(doc(db, 'clinical_conversations', id));
+      const checkpoints = await listCheckpoints(id);
+      if (checkpoints.length && !window.confirm(`Delete this session and its ${checkpoints.length} saved checkpoint(s)? Download any checkpoints you want to keep first. This cannot be undone.`)) return;
+      await deleteConversation(id);
       if (activeId === id) {
         setActiveId(null);
       }
@@ -661,7 +304,7 @@ export default function App() {
     const trimmed = newTitle.trim();
     if (!trimmed) return;
     try {
-      await setDoc(doc(db, 'clinical_conversations', id), {
+      await saveConversation(id, {
         title: trimmed
       }, { merge: true });
     } catch (err) {
@@ -678,10 +321,7 @@ export default function App() {
       const oldSegments = activeConversation?.transcriptSegments || [];
       const reconciledSegments = reconcileSegmentsWithExisting(rawParsedSegments, oldSegments);
 
-      const updateData: any = { rawTranscript: text };
-      if (reconciledSegments && reconciledSegments.length > 0) {
-        updateData.transcriptSegments = reconciledSegments;
-      }
+      const updateData: any = { rawTranscript: text, transcriptSegments: reconciledSegments };
 
       // Realign mentions and entities across the changed/split/inserted segments
       const currentMentions = activeConversation?.annotation?.mentions || [];
@@ -704,7 +344,7 @@ export default function App() {
         }
       }
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), updateData, { merge: true });
+      return await saveConversation(activeId, updateData, { merge: true });
     } catch (err) {
       console.error('Error updating transcript:', err);
     }
@@ -742,7 +382,7 @@ export default function App() {
         }
       };
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), updateData, { merge: true });
+      await saveConversation(activeId, updateData, { merge: true });
     } catch (err) {
       console.error('Error splitting utterance:', err);
     }
@@ -772,198 +412,121 @@ export default function App() {
         }
       };
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), updateData, { merge: true });
+      await saveConversation(activeId, updateData, { merge: true });
     } catch (err) {
       console.error('Error changing speaker:', err);
     }
   };
 
-  // Save raw recorded audio to IndexedDB and update Firestore session
+  // Audio and its ownership metadata are committed together in SQLite.
   const handleAudioRecorded = async (blob: Blob, mimeType: string, speechToText?: string) => {
     if (!activeId) return;
-
-    const audioLocalId = `audio_${Date.now()}`;
     try {
-      await saveAudioBlob(audioLocalId, blob);
-
-      // Create object URL for immediate local preview
-      setAudioUrl(URL.createObjectURL(blob));
-
-      // Update Firestore document with audio metadata and Speech dictation if any
-      const textToAppend = speechToText
-        ? (activeConversation?.rawTranscript ? `${activeConversation.rawTranscript}\n${speechToText}` : speechToText)
-        : activeConversation?.rawTranscript || '';
-
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
-        hasAudio: true,
-        audioLocalId,
-        rawTranscript: textToAppend
-      }, { merge: true });
+      await saveAudio(activeId, blob);
+      setAudioRevision(value => value + 1);
+      if (speechToText) {
+        const text = [activeConversation?.rawTranscript, speechToText].filter(Boolean).join('\n');
+        await handleTranscriptChange(text);
+      }
     } catch (err) {
-      console.error('Error saving audio record:', err);
+      console.error('Error saving audio:', err);
     }
   };
 
-  // Reset/Clear audio for active session
   const handleClearAudio = async () => {
-    if (!activeId || !activeConversation) return;
-
+    if (!activeId) return;
     try {
-      if (activeConversation.audioLocalId) {
-        await deleteAudioBlob(activeConversation.audioLocalId);
-      }
-
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
-        hasAudio: false,
-        audioLocalId: null,
-        audioDataUrl: null
-      }, { merge: true });
-
+      await saveAudio(activeId);
       setAudioUrl(undefined);
     } catch (err) {
       console.error('Error clearing audio:', err);
     }
   };
 
-  // Robust helper to extract detailed server diagnostics (JSON or HTML trace/Nginx block)
   const safelyParseResponse = async (response: Response): Promise<any> => {
-    const contentType = response.headers.get('content-type') || '';
-    
-    if (response.ok) {
-      if (contentType.includes('application/json')) {
-        try {
-          return await response.json();
-        } catch (jsonErr: any) {
-          throw new Error(`Failed to parse successful JSON response: ${jsonErr.message}`);
-        }
-      } else {
-        const rawText = await response.text();
-        if (rawText.includes('<title>Cookie check</title>') || rawText.includes('Cookie check')) {
-          throw new Error(`Third-Party Cookies Blocked: The browser blocked the security sandbox session cookie.\n\n👉 ACTION REQUIRED: Please click the "Open in new tab" button at the top-right of your AI Studio interface to bypass third-party cookie restrictions and run the clinical audio processors safely in a dedicated tab.`);
-        }
-        if (rawText.includes('Starting Server...') || rawText.includes('Starting Server') || rawText.includes('starting-screen')) {
-          setServerStatus('loading');
-          throw new Error(`The backend server is still initializing. Please wait a few seconds and try again.`);
-        }
-        throw new Error(`Server returned status 200 but content is not JSON:\n${rawText.slice(0, 500)}`);
-      }
-    } else {
-      if (response.status === 413) {
-        throw new Error(`HTTP Error 413: Request Entity Too Large.\n\n👉 MITIGATION: The uploaded file exceeds the secure gateway limit. Please record your session directly through our "Record Audio" interface (which uses our high-performance client-side compressor to shrink audio up to 90%), or select a shorter/more compressed audio file.`);
-      }
-      
-      let errorMsg = `HTTP Error ${response.status}: ${response.statusText}`;
-      if (contentType.includes('application/json')) {
-        try {
-          const jsonError = await response.json();
-          return jsonError;
-        } catch {
-          // fallback
-        }
-      }
-      
-      try {
-        const rawText = await response.text();
-        if (rawText.includes('<title>Cookie check</title>') || rawText.includes('Cookie check')) {
-          throw new Error(`Third-Party Cookies Blocked: The browser blocked the security sandbox session cookie.\n\n👉 ACTION REQUIRED: Please click the "Open in new tab" button at the top-right of your AI Studio interface to bypass third-party cookie restrictions and run the clinical audio processors safely in a dedicated tab.`);
-        }
-        const titleMatch = rawText.match(/<title>(.*?)<\/title>/i);
-        const bodyMatch = rawText.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-        const title = titleMatch ? titleMatch[1] : '';
-        let extractedBody = '';
-        if (bodyMatch) {
-          extractedBody = bodyMatch[1]
-            .replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, '')
-            .replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, '')
-            .replace(/<[^>]+>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-        } else {
-          extractedBody = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        }
-        
-        const previewText = extractedBody.slice(0, 800);
-        errorMsg = `Server error HTML [${response.status} ${response.statusText}]${title ? ` - ${title}` : ''}:\n${previewText}${extractedBody.length > 800 ? '...' : ''}`;
-      } catch (textErr: any) {
-        if (textErr.message && textErr.message.includes('Third-Party Cookies Blocked')) {
-          throw textErr;
-        }
-      }
-      
-      throw new Error(errorMsg);
-    }
+    const result = await response.json().catch(() => {
+      throw new Error('The server returned an invalid response. Please try again.');
+    });
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    return result;
   };
 
-  // Generate AI Annotations & Transcriptions using server-side Gemini API
-  const handleAnnotate = async () => {
-    if (!activeId || !activeConversation) return;
+  const handleAnnotate = async (text?: string) => {
+    if (!activeId || !activeConversation || annotatingIds.current.has(activeId)) return;
 
-    // Set processing status
-    await setDoc(doc(db, 'clinical_conversations', activeId), {
-      status: 'processing'
-    }, { merge: true });
-
+    annotatingIds.current.add(activeId);
+    let latestProgress: AnnotationProgress = { stage: 'preparing', utterances: [] };
+    const updateProgress = (progress: AnnotationProgress) => {
+      latestProgress = progress;
+      setAnnotationRuns(previous => ({ ...previous, [activeId]: progress }));
+    };
+    updateProgress(latestProgress);
     setWarningMessage(null);
-
     try {
+      const sourceConversation = text !== undefined && text !== activeConversation.rawTranscript
+        ? await handleTranscriptChange(text)
+        : activeConversation;
+      if (!sourceConversation) return;
+      if (sourceConversation.annotation) await createCheckpoint(activeId, 'Before AI regeneration', 'before-ai');
+      await saveConversation(activeId, { status: 'processing', annotationProgress: null }, { merge: true });
       let response;
-      const schemaToPass = normalizeAnnotationSchema(activeGroup?.settings?.annotationSchema || DEFAULT_ANNOTATION_SCHEMA);
-      if (activeConversation.audioLocalId) {
-        const blob = await getAudioBlob(activeConversation.audioLocalId);
+      const schemaToPass = activeSchema;
+      if (sourceConversation.audioLocalId && !sourceConversation.rawTranscript.trim()) {
+        const blob = await getAudioBlob(sourceConversation.audioLocalId);
         if (blob) {
           const formData = new FormData();
           formData.append('audio', blob, `audio.${blob.type.split('/')[1] || 'webm'}`);
           formData.append('audioMimeType', blob.type);
-          formData.append('transcript', activeConversation.rawTranscript || '');
-          formData.append('transcriptSegments', JSON.stringify(activeConversation.transcriptSegments || []));
+          formData.append('transcript', sourceConversation.rawTranscript || '');
+          formData.append('transcriptSegments', JSON.stringify(sourceConversation.transcriptSegments || []));
           formData.append('annotationSchema', JSON.stringify(schemaToPass));
-          formData.append('encounterType', activeConversation.encounterType || 'dialogue');
+          formData.append('encounterType', sourceConversation.encounterType || 'dialogue');
+          formData.append('encounterTime', JSON.stringify(sourceConversation.encounterTime || null));
           if (userAiConfig) {
             formData.append('aiConfig', JSON.stringify(userAiConfig));
           }
 
-          response = await fetch('/api/annotate', {
+          response = await apiFetch('/api/annotate', {
             method: 'POST',
+            headers: { Accept: 'application/x-ndjson' },
             body: formData
           });
         }
       }
 
       if (!response) {
-        response = await fetch('/api/annotate', {
+        response = await apiFetch('/api/annotate', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            Accept: 'application/x-ndjson'
           },
           body: JSON.stringify({
-            transcript: activeConversation.rawTranscript,
-            transcriptSegments: activeConversation.transcriptSegments || [],
+            transcript: sourceConversation.rawTranscript,
+            transcriptSegments: sourceConversation.transcriptSegments || [],
             audioBase64: '',
             audioMimeType: '',
             annotationSchema: schemaToPass,
             aiConfig: userAiConfig ? JSON.stringify(userAiConfig) : null,
-            encounterType: activeConversation.encounterType || 'dialogue'
+            encounterType: sourceConversation.encounterType || 'dialogue',
+            encounterTime: sourceConversation.encounterTime || null
           })
         });
       }
 
-      const result = await safelyParseResponse(response);
+      const result = await readAnnotationResponse(response, updateProgress);
 
       if (!result.success) {
         throw new Error(result.error || 'Server processing failed');
       }
 
-      // If using fallback mock, display warning banner
-      if (result.isMock && result.warning) {
-        setWarningMessage(result.warning);
-      }
 
       const { title, rawTranscript, transcriptSegments, entities, relations, clinicalNotes, mentions } = result.data;
 
       // Check if original transcript was in JSON / JSONL format to avoid scrambling it
-      const isOriginalJson = activeConversation.rawTranscript && isJsonOrJsonlFormat(activeConversation.rawTranscript);
+      const isOriginalJson = sourceConversation.rawTranscript && isJsonOrJsonlFormat(sourceConversation.rawTranscript);
 
-      let finalRawTranscript = rawTranscript || activeConversation.rawTranscript;
+      let finalRawTranscript = rawTranscript || sourceConversation.rawTranscript;
       let finalSegments = (transcriptSegments || []).map((seg: any, idx: number) => ({
         id: seg.id || `seg_${idx + 1}`,
         speaker: seg.speaker || "Unknown",
@@ -973,41 +536,52 @@ export default function App() {
 
       if (isOriginalJson) {
         // If original was JSON/JSONL, preserve original text and segments exactly
-        finalRawTranscript = activeConversation.rawTranscript;
-        finalSegments = (activeConversation.transcriptSegments && activeConversation.transcriptSegments.length > 0)
-          ? activeConversation.transcriptSegments
-          : parseTranscriptToSegments(activeConversation.rawTranscript, activeConversation.encounterType || 'dialogue');
+        finalRawTranscript = sourceConversation.rawTranscript;
+        finalSegments = (sourceConversation.transcriptSegments && sourceConversation.transcriptSegments.length > 0)
+          ? sourceConversation.transcriptSegments
+          : parseTranscriptToSegments(sourceConversation.rawTranscript, sourceConversation.encounterType || 'dialogue');
       } else if (finalSegments.length === 0 && finalRawTranscript) {
-        finalSegments = parseTranscriptToSegments(finalRawTranscript, activeConversation.encounterType || 'dialogue');
+        finalSegments = parseTranscriptToSegments(finalRawTranscript, sourceConversation.encounterType || 'dialogue');
       }
 
       // Preserve existing session title if already set rather than replacing with AI generated title
-      const existingTitle = activeConversation.title?.trim();
+      const existingTitle = sourceConversation.title?.trim();
       const finalTitle = existingTitle || title || 'Annotated Clinical Session';
 
-      // Clean up any undefined values in the payload before passing to Firestore
-      const updatePayload = JSON.parse(JSON.stringify({
+      const updatePayload: Partial<Conversation> = {
         title: finalTitle,
         rawTranscript: finalRawTranscript,
         transcriptSegments: finalSegments,
         annotation: {
+          evidenceVersion: 2,
           entities: entities || [],
           relations: [], // Separated altogether from Generate AI Annotations
           clinicalNotes: clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] },
           mentions: mentions || []
         },
-        status: 'annotated'
-      }));
+        status: 'annotated',
+        annotationProgress: result.progress || null
+      };
 
-      // Update Firestore with the structured annotations returned by Gemini
-      await setDoc(doc(db, 'clinical_conversations', activeId), updatePayload, { merge: true });
+      // Update local database with the structured annotations returned by Gemini
+      await saveConversation(activeId, updatePayload, { merge: true });
 
     } catch (err: any) {
       console.error('Medical Annotation Failure:', err);
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
-        status: 'failed'
-      }, { merge: true });
-      setWarningMessage(err.message || 'Annotation failed. Please confirm connection or try again.');
+      const failedProgress: AnnotationProgress = {
+        ...latestProgress, stage: 'failed',
+        error: err.message || 'Annotation failed. Please confirm connection or try again.',
+        utterances: latestProgress.utterances.map(item => item.status === 'in_progress' ? { ...item, status: 'pending' } : item)
+      };
+      updateProgress(failedProgress);
+      await saveConversation(activeId, { status: 'failed', annotationProgress: failedProgress }, { merge: true }).catch(() => {});
+    } finally {
+      annotatingIds.current.delete(activeId);
+      setAnnotationRuns(previous => {
+        const next = { ...previous };
+        delete next[activeId];
+        return next;
+      });
     }
   };
 
@@ -1027,7 +601,7 @@ export default function App() {
     setWarningMessage(null);
 
     try {
-      const response = await fetch('/api/relations', {
+      const response = await apiFetch('/api/relations', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -1047,19 +621,16 @@ export default function App() {
         throw new Error(result.error || 'Failed to generate knowledge graph relations');
       }
 
-      if (result.isMock && result.warning) {
-        setWarningMessage(result.warning);
-      }
 
       const generatedRelations = result.data?.relations || [];
 
-      // Update Firestore with the generated relations
+      // Update local database with the generated relations
       const updatedAnnotation = {
         ...activeConversation.annotation,
         relations: generatedRelations
       };
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
+      await saveConversation(activeId, {
         annotation: updatedAnnotation
       }, { merge: true });
 
@@ -1095,7 +666,7 @@ export default function App() {
         formData.append('aiConfig', JSON.stringify(userAiConfig));
       }
 
-      const response = await fetch('/api/diarize', {
+      const response = await apiFetch('/api/diarize', {
         method: 'POST',
         body: formData
       });
@@ -1106,14 +677,11 @@ export default function App() {
         throw new Error(result.error || 'Diarization processing failed');
       }
 
-      if (result.isMock && result.warning) {
-        setWarningMessage(result.warning);
-      }
 
       const { jsonlText, segments } = result.data;
 
-      // Update Firestore document with the diarized transcript text and segmented list
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
+      // Update local database document with the diarized transcript text and segmented list
+      await saveConversation(activeId, {
         rawTranscript: jsonlText,
         transcriptSegments: segments || []
       }, { merge: true });
@@ -1133,12 +701,14 @@ export default function App() {
     try {
       // If we don't have existing annotations, create empty structures
       const emptyAnnotation = {
+        evidenceVersion: 2 as const,
         entities: [],
         relations: [],
+        mentions: [],
         clinicalNotes: { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] }
       };
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
+      await saveConversation(activeId, {
         annotation: activeConversation.annotation || emptyAnnotation,
         status: 'annotated'
       }, { merge: true });
@@ -1164,153 +734,57 @@ export default function App() {
         (rel: any) => validEntityIds.has(rel.source) && validEntityIds.has(rel.target)
       );
 
-      // Filter mentions to only keep ones pointing to valid entity IDs
-      let baseMentions: any[] = [];
-      if (updatedMentions !== undefined) {
-        baseMentions = updatedMentions;
-      } else if (activeConversation.annotation.mentions !== undefined) {
-        baseMentions = activeConversation.annotation.mentions;
-      } else if (updatedEntities.some(e => e.textSpan && e.textSpan.lineIndex >= 0)) {
-        baseMentions = updatedEntities
-          .filter(e => e.textSpan && e.textSpan.lineIndex >= 0)
-          .map(e => ({
-            id: `m_${e.id}`,
-            textSpan: e.textSpan!,
-            entityType: e.type,
-            entityId: e.id
-          }));
-      }
+      const baseMentions = updatedMentions ?? activeConversation.annotation.mentions ?? [];
+      // Delete evidence with its owner, but preserve deliberately unlinked legacy mentions.
+      const filteredMentions = baseMentions.filter(m => !m.target || validEntityIds.has(m.target.entityId));
 
-      const filteredMentions = baseMentions.filter((m: any) => validEntityIds.has(m.entityId));
-
-      // Deep copy and strip undefined values for Firestore compatibility
-      const cleanAnnotation = JSON.parse(JSON.stringify({
+      const deletedIds = new Set(activeConversation.annotation.entities.filter(entity => !validEntityIds.has(entity.id)).map(entity => entity.id));
+      const cleanAnnotation = reconcileEvidenceWithNotes(unlinkDeletedProcedures({
+        evidenceVersion: 2,
         entities: updatedEntities,
         relations: filteredRelations,
         clinicalNotes: updatedNotes,
         mentions: filteredMentions
-      }));
+      }, deletedIds), activeSchema);
 
-      await setDoc(doc(db, 'clinical_conversations', activeId), {
+      await saveConversation(activeId, {
         annotation: cleanAnnotation
       }, { merge: true });
     } catch (err) {
       console.error('Error updating curated annotations:', err);
+      setWarningMessage(err instanceof Error ? err.message : 'Could not save annotation changes.');
     }
   };
 
-  if (authLoading) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center font-sans">
-        <div className="w-12 h-12 rounded-full border-4 border-blue-600/30 border-t-blue-600 animate-spin mb-4" />
-        <p className="text-xs text-slate-500 font-medium tracking-tight">Securing clinical workspace...</p>
-      </div>
-    );
-  }
-
-  if (shareError) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center px-4 font-sans">
-        <div className="w-full max-w-md bg-white border border-rose-100 shadow-xl rounded-2xl p-8 text-center space-y-4">
-          <ShieldAlert className="w-12 h-12 text-rose-500 mx-auto" />
-          <h2 className="text-lg font-bold text-slate-900 font-sans">Sharing Authorization Failed</h2>
-          <p className="text-xs text-slate-500">{shareError}</p>
-          <button
-            onClick={() => {
-              setShareError(null);
-              window.history.replaceState({}, '', window.location.pathname);
-            }}
-            className="px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-lg shadow cursor-pointer"
-          >
-            Return to Workspace
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!currentUser && !sharedSession && !loadingShared) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center px-4 font-sans antialiased">
-        <div className="w-full max-w-md bg-white border border-slate-200/80 shadow-xl rounded-2xl p-8 space-y-6">
-          <div className="flex flex-col items-center text-center space-y-2">
-            <div className="w-12 h-12 bg-blue-600 rounded-xl flex items-center justify-center text-white text-2xl font-black shadow-lg shadow-blue-500/10">
-              C
-            </div>
-            <h1 className="text-xl font-bold tracking-tight text-slate-900 mt-3 font-sans">
-              ClinGraph Annotator
-            </h1>
-            <p className="text-xs text-slate-500 leading-normal max-w-xs">
-              Convert doctor-patient conversations and medical documents into structured knowledge graphs and standardized UMLS annotations.
-            </p>
-          </div>
-
-          <div className="border-t border-slate-100 pt-5 space-y-3">
-            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider text-center">
-              Features
-            </div>
-            <ul className="space-y-2 text-xs text-slate-600">
-              <li className="flex items-start gap-2">
-                <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Secure user-specific clinical session tracking</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Google-backed sign-in and HIPAA-compliant architecture</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Instant link-based session cloning & versioning</span>
-              </li>
-              <li className="flex items-start gap-2">
-                <Check className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Automated concept mapping (RxNorm, SNOMED, ICD-10)</span>
-              </li>
-            </ul>
-          </div>
-
-          <button
-            onClick={handleGoogleSignIn}
-            className="w-full h-11 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl shadow-md transition-all cursor-pointer flex items-center justify-center gap-2"
-          >
-            <LogIn className="w-4 h-4" />
-            <span>Sign In with Google</span>
-          </button>
-
-          <div className="text-center">
-            <span className="text-[10px] text-slate-400 font-medium">
-              HIPAA compliant data transmission. Saved locally to your private workspace.
-            </span>
-          </div>
-        </div>
-      </div>
-    );
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center text-slate-500">Loading workspace...</div>;
   }
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 flex flex-col antialiased">
       {/* Header Navigation */}
-      <nav className="h-14 bg-white border-b border-slate-200 flex items-center justify-between px-6 shrink-0 shadow-sm sticky top-0 z-40">
-        <div className="flex items-center gap-4">
+      <nav className="app-header" aria-label="Workspace navigation">
+        <div className="flex items-center gap-3 min-w-0">
           <button
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="p-1.5 hover:bg-slate-100 text-slate-600 hover:text-slate-900 rounded-lg transition-colors cursor-pointer mr-1"
+            className="icon-button"
             title={isSidebarOpen ? "Hide session sidebar" : "Show session sidebar"}
           >
             {isSidebarOpen ? <PanelLeftClose className="w-5 h-5" /> : <PanelLeftOpen className="w-5 h-5" />}
           </button>
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center text-white font-bold">C</div>
-          <h1 className="text-sm md:text-base font-semibold tracking-tight text-slate-900">
-            ClinGraph <span className="text-slate-400 font-normal">/ Annotator v2.4</span>
-          </h1>
+          <div className="brand-mark"><Network className="w-5 h-5" strokeWidth={1.8} /></div>
+          <div>
+            <h1 className="text-lg font-semibold tracking-tight text-slate-900">ClinGraph</h1>
+            <p className="text-2xs text-slate-500 hidden sm:block">Clinical annotation workspace</p>
+          </div>
 
           {/* Server Status Indicator */}
-          <div className="flex items-center gap-1.5 ml-3 md:ml-4 px-2 py-0.5 rounded-full bg-slate-50 border border-slate-200/60 font-mono text-[10px] shadow-sm select-none">
+          <div className="hidden md:flex items-center gap-2 ml-5 pl-5 border-l border-slate-200 text-xs select-none">
             {serverStatus === 'ready' && (
               <>
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="text-emerald-700 font-bold hidden sm:inline">Server Ready</span>
-                <span className="text-emerald-700 font-bold sm:hidden">Ready</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                <span className="text-emerald-700 font-semibold hidden sm:inline">Server Ready</span>
+                <span className="text-emerald-700 font-semibold sm:hidden">Ready</span>
               </>
             )}
             {(serverStatus === 'loading' || serverStatus === 'checking') && (
@@ -1322,95 +796,61 @@ export default function App() {
             {serverStatus === 'error' && (
               <>
                 <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
-                <span className="text-rose-700 font-bold">Offline</span>
+                <span className="text-rose-700 font-semibold">Offline</span>
               </>
             )}
           </div>
         </div>
         <div className="flex items-center gap-2 md:gap-3">
+          {storageMode === 'firebase' && <button type="button" onClick={() => setIsArchiveOpen(true)} className="btn btn-secondary">Legacy archive</button>}
           {/* Universal API Key Button visible for everyone */}
           <button
             id="byok-settings-header-btn"
             onClick={openSettingsModal}
-            className={`h-9 px-3 rounded-xl transition-all cursor-pointer flex items-center gap-1.5 border text-xs font-semibold shadow-2xs ${
-              hasUserConfiguredKeys
-                ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
-                : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
-            }`}
+            className="btn btn-secondary"
             title="Configure your own Gemini or OpenAI API keys (Bring Your Own Model)"
           >
-            <Key className={`w-3.5 h-3.5 ${hasUserConfiguredKeys ? 'text-emerald-600' : 'text-amber-700'}`} />
-            <span>{hasUserConfiguredKeys ? 'API Keys Active' : 'Set API Keys'}</span>
-            {!hasUserConfiguredKeys && (
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse ml-0.5" />
-            )}
+            <Settings2 className="w-4 h-4" />
+            <span>AI Settings</span>
+            {hasUserConfiguredKeys && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />}
           </button>
 
-          {currentUser ? (
-            <div className="flex items-center gap-2 md:gap-3">
-              <div className="hidden md:flex flex-col text-right">
-                <span className="text-xs font-semibold text-slate-800 leading-none">
-                  {currentUser.displayName || 'Clinician'}
-                </span>
-                <span className="text-[10px] text-slate-400 leading-none mt-0.5 font-mono">
-                  {currentUser.email}
-                </span>
-              </div>
-              {currentUser.photoURL ? (
-                <img
-                  src={currentUser.photoURL}
-                  alt={currentUser.displayName || 'User'}
-                  className="w-8 h-8 rounded-full border border-slate-200 shadow-sm"
-                  referrerPolicy="no-referrer"
-                />
-              ) : (
-                <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-xs font-bold border border-blue-200">
-                  {currentUser.email?.charAt(0).toUpperCase() || 'C'}
-                </div>
-              )}
-              <button
-                onClick={handleSignOut}
-                className="p-1.5 hover:bg-slate-100 text-slate-500 hover:text-slate-800 rounded-lg transition-all cursor-pointer"
-                title="Sign Out"
-              >
-                <LogOut className="w-4 h-4" />
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={handleGoogleSignIn}
-              className="h-9 px-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl flex items-center gap-2 cursor-pointer transition-all shadow-sm"
-            >
-              <LogIn className="w-4 h-4" />
-              <span className="hidden sm:inline">Sign In with Google</span>
-            </button>
-          )}
+          <span className="hidden lg:inline text-xs text-slate-500">{storageMode === 'firebase' ? accountName : 'Local workspace · No login'}</span>
+          {onSignOut && <button type="button" onClick={onSignOut} className="btn btn-secondary">Sign out</button>}
         </div>
       </nav>
+      {isArchiveOpen && <LegacyArchive onClose={() => setIsArchiveOpen(false)} />}
+
+      {storageError && (
+        <div role="alert" className="bg-rose-50 border-b border-rose-200 px-6 py-3 text-sm text-rose-800">
+          Workspace error: {storageError}. Your last action may not have been saved.
+          <button className="ml-3 underline cursor-pointer" onClick={() => { void reload().catch(() => {}); }}>Reload saved data</button>
+        </div>
+      )}
 
       {/* Global dismissible hint banner when no keys are set */}
       {!hasUserConfiguredKeys && !isDismissedKeyBanner && (
-        <div className="bg-amber-50/90 border-b border-amber-200/80 px-4 py-2.5 text-xs text-amber-900 flex items-center justify-between gap-3 shrink-0">
+        <div className="workspace-hint">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className="p-1 bg-amber-200/60 text-amber-800 rounded-md shrink-0">
-              <Key className="w-3.5 h-3.5" />
+            <div className="text-brand-600 shrink-0">
+              <Info className="w-4 h-4" />
             </div>
-            <span className="truncate">
-              <strong>API Keys Unset:</strong> The default server Gemini key has been unset. You can set your own API key in the popup to run live Gemini models, or use the local clinical rule demo.
+            <span>
+              <strong className="font-medium text-slate-700">Ready for manual annotation.</strong> <span className="hidden sm:inline">Connect a model to enable AI annotation and transcription.</span>
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={openSettingsModal}
-              className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer shadow-2xs"
+              className="text-xs font-semibold text-brand-700 hover:underline whitespace-nowrap"
             >
-              Set Keys in Popup
+              Configure AI
             </button>
             <button
               type="button"
               onClick={() => setIsDismissedKeyBanner(true)}
-              className="text-amber-700 hover:text-amber-950 p-1 cursor-pointer transition-colors"
+              className="icon-button"
               title="Dismiss banner"
             >
               <X className="w-3.5 h-3.5" />
@@ -1420,18 +860,18 @@ export default function App() {
       )}
 
       {/* Main Layout Workspace */}
-      <main className="flex-1 w-full max-w-none px-4 md:px-6 py-4 md:py-6 flex flex-col lg:flex-row overflow-hidden gap-6">
+      <main className="workspace-layout">
         {/* Animated Desktop Sidebar */}
         <AnimatePresence initial={false}>
           {isSidebarOpen && (
             <motion.div
-              initial={{ width: 0, opacity: 0, marginRight: 0 }}
-              animate={{ width: 320, opacity: 1, marginRight: 24 }}
-              exit={{ width: 0, opacity: 0, marginRight: 0 }}
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 272, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
               transition={{ type: 'spring', stiffness: 350, damping: 35 }}
-              className="hidden lg:flex flex-col h-full shrink-0 overflow-hidden"
+              className="hidden lg:flex flex-col shrink-0 sticky top-24"
             >
-              <div className="w-[320px] h-full">
+              <div className="w-[272px]">
                 <ConversationList
                   conversations={conversations}
                   selectedId={activeId}
@@ -1458,7 +898,7 @@ export default function App() {
 
         {/* Mobile sidebar (no desktop spring animation, simple conditional layout) */}
         {isSidebarOpen && (
-          <div className="lg:hidden w-full flex flex-col shrink-0 mb-4">
+          <div className="lg:hidden w-full flex flex-col shrink-0">
             <ConversationList
               conversations={conversations}
               selectedId={activeId}
@@ -1482,13 +922,14 @@ export default function App() {
         )}
 
         {/* Content Panel */}
-        <div className="flex-1 flex flex-col gap-6 h-full overflow-y-auto">
+        <div className="workspace-content">
           {activeConversation ? (
             <div className="space-y-6">
               {/* Encounter Header Banner */}
-              <div className="bg-white border border-slate-100 rounded-2xl p-5 shadow-sm">
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3.5">
+              <div className="panel session-panel">
+                <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
+                    <p className="eyebrow mb-2">{activeConversation.encounterType === 'note' ? 'Clinical document' : 'Clinical encounter'}</p>
                     {!isReadOnly && isEditingTitle ? (
                       <div className="flex items-center gap-2 max-w-lg mb-1">
                         <input
@@ -1507,7 +948,7 @@ export default function App() {
                               setIsEditingTitle(false);
                             }
                           }}
-                          className="text-base font-bold text-slate-900 bg-white border border-blue-400 rounded-lg px-2.5 py-1 focus:ring-2 focus:ring-blue-500 focus:outline-none w-full shadow-xs"
+                          className="text-base font-semibold text-slate-900 bg-white border border-brand-400 rounded-lg px-2.5 py-1 focus:ring-2 focus:ring-brand-500 focus:outline-none w-full shadow-xs"
                           placeholder="Session title..."
                           autoFocus
                         />
@@ -1519,7 +960,7 @@ export default function App() {
                             }
                             setIsEditingTitle(false);
                           }}
-                          className="p-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors cursor-pointer shrink-0 shadow-xs"
+                          className="p-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg transition-colors cursor-pointer shrink-0 shadow-xs"
                           title="Save title"
                         >
                           <Check className="w-4 h-4" />
@@ -1535,7 +976,7 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="flex items-center gap-2 group/title">
-                        <h2 className="text-lg font-bold text-slate-900 truncate">
+                        <h2 className="text-2xl font-semibold tracking-tight text-slate-900 truncate">
                           {activeConversation.title || 'Untitled Session'}
                         </h2>
                         {!isReadOnly && (
@@ -1545,7 +986,7 @@ export default function App() {
                               setEditingTitleText(activeConversation.title || '');
                               setIsEditingTitle(true);
                             }}
-                            className="p-1 text-slate-400 hover:text-blue-600 hover:bg-slate-100 rounded-md transition-all cursor-pointer opacity-70 group-hover/title:opacity-100"
+                            className="p-1 text-slate-500 hover:text-brand-600 hover:bg-slate-100 rounded-md transition-all cursor-pointer opacity-70 group-hover/title:opacity-100"
                             title="Rename Session"
                           >
                             <Edit2 className="w-3.5 h-3.5" />
@@ -1554,7 +995,7 @@ export default function App() {
                       </div>
                     )}
                     <div className="flex flex-wrap items-center gap-y-1.5 gap-x-4 mt-1">
-                      <p className="text-xs text-slate-400 flex items-center gap-1">
+                      <p className="text-xs text-slate-500 flex items-center gap-1">
                         <span>Status:</span>
                         <span className={`font-semibold capitalize ${
                           activeConversation.status === 'annotated' ? 'text-green-500' :
@@ -1566,7 +1007,7 @@ export default function App() {
 
                       {/* Group Assignment Dropdown */}
                       {!isReadOnly ? (
-                        <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                        <div className="flex items-center gap-1.5 text-xs text-slate-500">
                           <Folder className="w-3.5 h-3.5 text-amber-500" />
                           <span>Group:</span>
                           <select
@@ -1577,19 +1018,12 @@ export default function App() {
                               const targetGroup = sessionGroups.find(g => g.id === targetGroupId);
                               try {
                                 const updateData: any = { groupId: targetGroupId };
-                                if (activeConversation.isShared) {
-                                  updateData.sharedGroupData = targetGroup ? {
-                                    id: targetGroup.id,
-                                    name: targetGroup.name,
-                                    settings: targetGroup.settings || {}
-                                  } : null;
-                                }
-                                await setDoc(doc(db, 'clinical_conversations', activeConversation.id), updateData, { merge: true });
+                                await saveConversation(activeConversation.id, updateData, { merge: true });
                               } catch (err) {
                                 console.error('Error assigning group:', err);
                               }
                             }}
-                            className="bg-slate-100 hover:bg-slate-200 border border-slate-200/60 rounded px-2 py-0.5 font-bold text-slate-700 focus:outline-none cursor-pointer text-[11px] transition-colors"
+                            className="bg-slate-100 hover:bg-slate-200 border border-slate-200/60 rounded px-2 py-0.5 font-semibold text-slate-700 focus:outline-none cursor-pointer text-2xs transition-colors"
                           >
                             <option value="">No Group / Unassigned</option>
                             {sessionGroups.map(g => (
@@ -1599,7 +1033,7 @@ export default function App() {
                         </div>
                       ) : (
                         (activeGroup || activeConversation.groupId || activeConversation.sharedGroupData) && (
-                          <div className="flex items-center gap-1 text-xs text-slate-400">
+                          <div className="flex items-center gap-1 text-xs text-slate-500">
                             <Folder className="w-3.5 h-3.5 text-amber-500" />
                             <span>Group:</span>
                             <span className="font-semibold text-slate-600">
@@ -1611,71 +1045,46 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button onClick={() => setIsHistoryOpen(true)} disabled={activeConversation.status === 'processing' || isDiarizing}
+                      className="btn btn-secondary">
+                      <History className="w-4 h-4" /><span>Annotation history</span>
+                    </button>
                     <button
                       onClick={() => setIsExportJsonlOpen(true)}
-                      className="h-9 px-3.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-semibold text-xs rounded-xl border border-indigo-200/80 flex items-center gap-2 cursor-pointer transition-all shadow-xs"
+                      className="btn btn-secondary"
                       title="Export annotated dataset (JSONL)"
                     >
-                      <FileCode className="w-4 h-4 text-indigo-600" />
+                      <FileCode className="w-4 h-4" />
                       <span>Export JSONL</span>
                     </button>
 
-                    {/* Read-only cloning buttons versus share buttons */}
-                    {isReadOnly ? (
-                      <div className="flex items-center gap-2">
-                        {currentUser ? (
-                          <button
-                            onClick={handleCloneShared}
-                            className="h-9 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs rounded-xl shadow-md flex items-center gap-2 cursor-pointer transition-all hover:scale-[1.02]"
-                          >
-                            <Copy className="w-4 h-4" />
-                            <span>Clone to My Account</span>
-                          </button>
-                        ) : (
-                          <button
-                            onClick={handleGoogleSignIn}
-                            className="h-9 px-4 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-xl shadow-md flex items-center gap-2 cursor-pointer transition-all"
-                          >
-                            <LogIn className="w-4 h-4" />
-                            <span>Sign In to Clone</span>
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <button
-                        onClick={async () => {
-                          const groupForSession = sessionGroups.find(g => g.id === activeConversation.groupId) || activeGroup;
-                          const sharedGroupData = groupForSession ? {
-                            id: groupForSession.id,
-                            name: groupForSession.name,
-                            settings: groupForSession.settings || {}
-                          } : null;
-
-                          try {
-                            await setDoc(doc(db, 'clinical_conversations', activeConversation.id), {
-                              isShared: true,
-                              sharedGroupData: sharedGroupData
-                            }, { merge: true });
-                            
-                            // Generate link
-                            const link = `${window.location.origin}${window.location.pathname}?share=${activeConversation.id}`;
-                            setSharedLinkUrl(link);
-                            setIsShareModalOpen(true);
-                          } catch (err) {
-                            console.error('Error sharing session:', err);
-                          }
-                        }}
-                        className="h-9 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-xl border border-slate-200/80 flex items-center gap-2 cursor-pointer transition-all"
-                      >
-                        <Share2 className="w-4 h-4 text-slate-500" />
-                        <span>Share Session</span>
-                      </button>
-                    )}
+                    <button
+                      onClick={() => {
+                        setSharedLinkUrl(`${window.location.origin}${window.location.pathname}?session=${activeConversation.id}`);
+                        setIsShareModalOpen(true);
+                      }}
+                      className="btn btn-secondary"
+                    >
+                      <Share2 className="w-4 h-4" />
+                      <span>Session Link</span>
+                    </button>
                   </div>
                 </div>
 
-                <div className="mt-4 border-t border-slate-50 pt-4.5 space-y-4">
+                <div className="mt-5 border-t border-slate-100 pt-5 space-y-5">
+                  {activeConversation.schemaSnapshot && <div className="text-xs bg-brand-50 border border-brand-200 rounded-lg p-3 space-y-2">
+                    <p>This restored session uses its captured schema ({activeConversation.schemaSnapshot.version.slice(7, 19)}), independent of group settings.</p>
+                    <button disabled={activeConversation.status === 'processing'} className="underline disabled:opacity-40" onClick={async () => {
+                      if (!window.confirm('Switch this working session to the current group/default schema? A checkpoint will preserve the current version first.')) return;
+                      try {
+                        await createCheckpoint(activeConversation.id, 'Before switching to group/default schema');
+                        await saveConversation(activeConversation.id, { schemaSnapshot: null }, { merge: true });
+                      } catch (err) { setWarningMessage(err instanceof Error ? err.message : 'Could not switch schema'); }
+                    }}>Use current group/default schema</button>
+                  </div>}
+                  <EncounterTimeEditor key={`encounter-time:${activeConversation.id}`} value={activeConversation.encounterTime}
+                    onSave={async encounterTime => { await saveConversation(activeConversation.id, { encounterTime }, { merge: true }); }} />
                   {/* Audio Recorder Input - only for dialogue sessions */}
                   {activeConversation.encounterType !== 'note' && (
                     <AudioRecorder
@@ -1688,6 +1097,7 @@ export default function App() {
 
                   {/* Transcript Text Input Area */}
                   <ConversationEditor
+                    key={`transcript:${activeConversation.id}`}
                     rawTranscript={activeConversation.rawTranscript}
                     onTranscriptChange={handleTranscriptChange}
                     onFocusEditor={() => {
@@ -1699,7 +1109,8 @@ export default function App() {
                     onManualAnnotate={handleManualAnnotate}
                     isDiarizing={isDiarizing}
                     hasAudio={activeConversation.hasAudio}
-                    status={activeConversation.status}
+                    status={annotationRuns[activeConversation.id] ? 'processing' : activeConversation.status}
+                    annotationProgress={annotationRuns[activeConversation.id] || activeConversation.annotationProgress}
                     warningMessage={warningMessage}
                     encounterType={activeConversation.encounterType || 'dialogue'}
                     isReadOnly={isReadOnly}
@@ -1712,73 +1123,51 @@ export default function App() {
 
               {/* Annotation & Knowledge Graph Dashboard */}
               {activeConversation.status === 'annotated' && activeConversation.annotation && (
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
                   {/* Left Column (Interactive Visualization - 7 Cols) */}
-                  <div className="lg:col-span-7 relative">
+                  <div className="xl:col-span-7 min-w-0 relative">
                     <div className="space-y-6">
                       {/* View Switch tabs */}
-                    <div className="bg-white border border-slate-100 rounded-2xl p-4 shadow-sm flex flex-col gap-4">
-                      <div className="flex items-center justify-between border-b border-slate-50 pb-3">
+                    <div className="panel p-5 flex flex-col gap-4">
+                      <div className="annotation-toolbar">
                         <div className="flex items-center gap-3">
-                          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 font-mono">
-                            Structured Graph Exploration
+                          <h3 className="section-heading">
+                            Explore annotations
                           </h3>
                           {activeTab === 'graph' && activeConversation.annotation && (
-                            <span className="text-[11px] font-medium text-slate-500">
-                              ({activeConversation.annotation.entities?.length || 0} entities, {activeConversation.annotation.relations?.length || 0} relations)
+                            <span className="text-2xs font-medium text-slate-500">
+                              ({activeConversation.annotation.entities?.length || 0} entities, {(activeConversation.annotation.relations?.length || 0) + getProcedureRelations(activeConversation.annotation.entities).length} relations)
                             </span>
                           )}
                         </div>
-                        <div className="flex items-center gap-2">
-                          {activeTab === 'graph' && !isReadOnly && (
-                            <button
-                              onClick={handleGenerateRelations}
-                              disabled={isGeneratingRelations || !activeConversation.annotation?.entities?.length}
-                              className="flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                              title={!activeConversation.annotation?.entities?.length ? "Extract clinical entities first in dialogue view" : "Generate Knowledge Graph relations between extracted entities"}
-                            >
-                              {isGeneratingRelations ? (
-                                <>
-                                  <svg className="animate-spin h-3.5 w-3.5 text-blue-600" fill="none" viewBox="0 0 24 24">
-                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                  </svg>
-                                  <span>Generating Relations...</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Share2 className="w-3.5 h-3.5 text-blue-600" />
-                                  <span>{activeConversation.annotation?.relations?.length ? 'Regenerate Relations' : 'Generate Relations'}</span>
-                                </>
-                              )}
-                            </button>
-                          )}
-                          <div className="flex bg-slate-100 p-0.5 rounded-lg">
+                        <div className="flex flex-wrap items-center gap-2 w-full">
+                          <div className="view-switcher" role="group" aria-label="Annotation view">
                             <button
                               onClick={() => setActiveTab('dialogue')}
-                              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md cursor-pointer transition-colors ${
-                                activeTab === 'dialogue'
-                                  ? 'bg-white text-blue-600 shadow-sm'
-                                  : 'text-slate-500 hover:text-slate-800'
-                              }`}
+                              className="view-tab"
+                              aria-pressed={activeTab === 'dialogue'}
                             >
                               {activeConversation.encounterType === 'note' ? (
-                                <FileText className="w-4 h-4 text-indigo-500" />
+                                <FileText className="w-4 h-4" />
                               ) : (
-                                <MessageSquare className="w-4 h-4 text-blue-500" />
+                                <MessageSquare className="w-4 h-4" />
                               )}
                               <span>{activeConversation.encounterType === 'note' ? 'Document Text' : 'Dialogue'}</span>
                             </button>
                             <button
-                              onClick={() => setActiveTab('graph')}
-                              className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md cursor-pointer transition-colors ${
-                                activeTab === 'graph'
-                                  ? 'bg-white text-blue-600 shadow-sm'
-                                  : 'text-slate-500 hover:text-slate-800'
-                              }`}
+                              onClick={() => setActiveTab('evidence')}
+                              className="view-tab"
+                              aria-pressed={activeTab === 'evidence'}
                             >
-                              <Brain className="w-4 h-4 text-blue-500" />
-                              <span>Knowledge Graph</span>
+                              <Network className="w-4 h-4" /> Evidence Graph
+                            </button>
+                            <button
+                              onClick={() => setActiveTab('graph')}
+                              className="view-tab"
+                              aria-pressed={activeTab === 'graph'}
+                            >
+                              <Share2 className="w-4 h-4" />
+                              <span>Entity Relations</span>
                             </button>
                           </div>
                         </div>
@@ -1786,6 +1175,7 @@ export default function App() {
 
                       {activeTab === 'dialogue' ? (
                         <RawTranscriptView
+                          key={activeConversation.id}
                           segments={activeConversation.transcriptSegments}
                           entities={activeConversation.annotation.entities}
                           mentions={activeConversation.annotation.mentions || []}
@@ -1796,9 +1186,21 @@ export default function App() {
                           onUpdateNotes={handleUpdateNotes}
                           clinicalNotes={activeConversation.annotation.clinicalNotes}
                           encounterType={activeConversation.encounterType || 'dialogue'}
-                          annotationSchema={activeGroup?.settings?.annotationSchema}
+                          annotationSchema={activeSchema}
                           onSplitUtterance={handleSplitUtterance}
                           onChangeSpeaker={handleChangeSpeaker}
+                        />
+                      ) : activeTab === 'evidence' ? (
+                        <EvidenceGraph
+                          sessionId={activeConversation.id}
+                          title={activeConversation.title}
+                          annotation={activeConversation.annotation}
+                          encounterTime={activeConversation.encounterTime}
+                          onSelectEvidence={(entityId, mentionId) => {
+                            setSelectedEntityId(entityId);
+                            setSelectedMentionId(mentionId);
+                            setActiveTab('dialogue');
+                          }}
                         />
                       ) : (
                         <KnowledgeGraph
@@ -1817,9 +1219,10 @@ export default function App() {
                   </div>
 
                   {/* Right Column (Clinical Categorization list - 5 Cols) */}
-                  <div className="lg:col-span-5 relative min-h-[400px] lg:min-h-0">
-                    <div className="lg:absolute lg:inset-0 overflow-y-auto lg:pr-2 pb-6">
+                  <div className="xl:col-span-5 relative min-w-0 min-h-[400px] xl:min-h-0">
+                    <div className="xl:absolute xl:inset-0 overflow-y-auto xl:pr-1 pb-6">
                       <ClinicalNotesView
+                        key={activeConversation.id}
                         clinicalNotes={activeConversation.annotation.clinicalNotes}
                         entities={activeConversation.annotation.entities}
                         relations={activeConversation.annotation.relations || []}
@@ -1831,8 +1234,9 @@ export default function App() {
                         onSelectMention={setSelectedMentionId}
                         isReadOnly={isReadOnly}
                         segments={activeConversation.transcriptSegments || []}
-                        annotationSchema={activeGroup?.settings?.annotationSchema}
+                        annotationSchema={activeSchema}
                         encounterType={activeConversation.encounterType || 'dialogue'}
+                        encounterTime={activeConversation.encounterTime}
                       />
                     </div>
                   </div>
@@ -1840,13 +1244,14 @@ export default function App() {
               )}
             </div>
           ) : (
-            <div className="bg-white border border-slate-200 rounded-2xl p-10 text-center shadow-sm flex-1 flex flex-col items-center justify-center min-h-[400px]">
-              <div className="p-4 bg-blue-50 text-blue-600 rounded-2xl mb-4">
-                <Brain className="w-10 h-10 animate-pulse" />
+            <div className="panel welcome-panel">
+              <div className="p-5 bg-brand-50 text-brand-600 rounded-2xl mb-6 border border-brand-100">
+                <Network className="w-10 h-10" strokeWidth={1.5} />
               </div>
-              <h3 className="text-base font-semibold tracking-tight text-slate-800">Welcome to the Clinical Annotator</h3>
-              <p className="text-xs text-slate-500 max-w-md mt-2 leading-relaxed">
-                Start by choosing an existing session from the collection panel or click "New Session" to transcribe a new audio encounter and generate an entity-relation clinical graph.
+              <p className="eyebrow mb-3">From conversation to connected evidence</p>
+              <h2 className="text-3xl font-semibold tracking-tight text-slate-900">A clearer picture of every encounter.</h2>
+              <p className="text-sm text-slate-500 max-w-md mt-4 leading-relaxed">
+                Bring your clinical notes and conversations together. Annotate the details, connect the evidence, and explore the relationships.
               </p>
               <button
                 onClick={() => {
@@ -1854,28 +1259,39 @@ export default function App() {
                   setNewSessionType('dialogue');
                   setIsCreateModalOpen(true);
                 }}
-                className="mt-6 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-4 py-2 rounded-lg shadow-sm transition-colors cursor-pointer"
+                className="btn btn-primary mt-7 px-5"
               >
-                Create New Session
+                <Plus className="w-4 h-4" /> Create New Session <ArrowRight className="w-4 h-4 ml-2" />
               </button>
+              <div className="welcome-steps">
+                {[
+                  { icon: FileText, title: '01  Add a source', description: 'Paste a note, upload audio, or record a conversation.' },
+                  { icon: Edit2, title: '02  Annotate details', description: 'Mark clinical entities and link them to their evidence.' },
+                  { icon: Network, title: '03  Connect the picture', description: 'Explore relationships and export your annotations.' },
+                ].map(({ icon: Icon, title, description }) => <div key={title}>
+                  <Icon className="w-5 h-5 text-brand-600 mb-3" strokeWidth={1.7} />
+                  <h3 className="text-xs font-semibold text-slate-800">{title}</h3>
+                  <p className="text-xs text-slate-500 leading-relaxed mt-2">{description}</p>
+                </div>)}
+              </div>
             </div>
           )}
         </div>
       </main>
 
       {/* Bottom Status Bar */}
-      <footer className="h-8 bg-slate-800 text-white flex items-center px-4 justify-between text-[10px] shrink-0 font-mono relative z-10">
+      <footer className="app-footer">
         <div className="flex gap-4">
           <span className="flex items-center gap-1.5">
             <span className={`w-1.5 h-1.5 rounded-full ${
-              activeConversation?.status === 'processing' ? 'bg-amber-400 animate-pulse' : 'bg-green-400'
+              activeConversation?.status === 'processing' ? 'bg-amber-500 animate-pulse' : serverStatus === 'error' ? 'bg-rose-500' : 'bg-brand-500'
             }`}></span>
-            <span>NLP Engine Active</span>
+            <span>{serverStatus === 'error' ? 'Server offline' : activeConversation?.status === 'processing' ? 'Processing encounter' : storageMode === 'firebase' ? 'Firebase workspace' : 'Local workspace'}</span>
           </span>
         </div>
         <div className="flex gap-4">
-           <span>Encounter Length: {activeConversation?.rawTranscript?.length || 0} chars</span>
-           <span>Entities: {activeConversation?.annotation?.entities?.length || 0}</span>
+           <span>{(activeConversation?.rawTranscript?.length || 0).toLocaleString()} characters</span>
+           <span>{activeConversation?.annotation?.entities?.length || 0} entities</span>
          </div>
       </footer>
 
@@ -1889,7 +1305,7 @@ export default function App() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               onClick={() => setIsCreateModalOpen(false)}
-              className="absolute inset-0 bg-slate-900/45 backdrop-blur-xs"
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-xs"
             />
 
             {/* Modal Card */}
@@ -1898,16 +1314,17 @@ export default function App() {
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.95, opacity: 0, y: 15 }}
               transition={{ type: 'spring', duration: 0.35 }}
-              className="relative bg-white rounded-2xl shadow-xl border border-slate-100 max-w-md w-full p-6 space-y-5 overflow-hidden"
+              role="dialog" aria-modal="true" aria-labelledby="new-session-title"
+              className="dialog-surface relative bg-white border border-slate-200 max-w-md w-full p-6 space-y-5"
             >
               <div className="flex items-center justify-between pb-3 border-b border-slate-100">
                 <div className="flex items-center gap-2">
-                  <Sparkles className="w-4.5 h-4.5 text-blue-600" />
-                  <h3 className="text-sm font-semibold text-slate-800">New Clinical Session</h3>
+                  <Sparkles className="w-4.5 h-4.5 text-brand-600" />
+                  <h3 id="new-session-title" className="text-base font-semibold text-slate-800">New Clinical Session</h3>
                 </div>
                 <button
                   onClick={() => setIsCreateModalOpen(false)}
-                  className="text-slate-400 hover:text-slate-600 transition-colors p-1 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  className="icon-button" aria-label="Close new session"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -1925,7 +1342,7 @@ export default function App() {
                     placeholder={newSessionType === 'note' ? 'e.g. Cardiopulmonary Referral, SOAP Note' : 'e.g. Dr. Evans follow-up, Sarah Review'}
                     value={newSessionTitle}
                     onChange={(e) => setNewSessionTitle(e.target.value)}
-                    className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                    className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-brand-500"
                   />
                 </div>
 
@@ -1937,14 +1354,15 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setNewSessionType('dialogue')}
+                      aria-pressed={newSessionType === 'dialogue'}
                       className={`text-left border p-3.5 rounded-xl transition-all flex items-start gap-3 cursor-pointer ${
                         newSessionType === 'dialogue'
-                          ? 'border-blue-600 bg-blue-50/20 shadow-sm'
+                          ? 'border-brand-600 bg-brand-50/20 shadow-sm'
                           : 'border-slate-100 hover:border-slate-200 bg-white'
                       }`}
                     >
                       <div className={`p-2 rounded-lg shrink-0 ${
-                        newSessionType === 'dialogue' ? 'bg-blue-100 text-blue-600' : 'bg-slate-50 text-slate-500'
+                        newSessionType === 'dialogue' ? 'bg-brand-100 text-brand-600' : 'bg-slate-50 text-slate-500'
                       }`}>
                         <MessageSquare className="w-4 h-4" />
                       </div>
@@ -1952,10 +1370,10 @@ export default function App() {
                         <div className="flex items-center gap-1.5">
                           <span className="text-xs font-semibold text-slate-800">Diarized Audio / Dialogue</span>
                           {newSessionType === 'dialogue' && (
-                            <Check className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                            <Check className="w-3.5 h-3.5 text-brand-600 shrink-0" />
                           )}
                         </div>
-                        <p className="text-[10.5px] text-slate-400 mt-1 leading-normal">
+                        <p className="text-2xs text-slate-500 mt-1 leading-normal">
                           For verbal encounters (patient & clinician discussions). Supports recording or uploading medical audio and extracting transcripts.
                         </p>
                       </div>
@@ -1965,14 +1383,15 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setNewSessionType('note')}
+                      aria-pressed={newSessionType === 'note'}
                       className={`text-left border p-3.5 rounded-xl transition-all flex items-start gap-3 cursor-pointer ${
                         newSessionType === 'note'
-                          ? 'border-indigo-600 bg-indigo-50/20 shadow-sm'
+                          ? 'border-brand-600 bg-brand-50/20 shadow-sm'
                           : 'border-slate-100 hover:border-slate-200 bg-white'
                       }`}
                     >
                       <div className={`p-2 rounded-lg shrink-0 ${
-                        newSessionType === 'note' ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-50 text-slate-500'
+                        newSessionType === 'note' ? 'bg-brand-100 text-brand-600' : 'bg-slate-50 text-slate-500'
                       }`}>
                         <FileText className="w-4 h-4" />
                       </div>
@@ -1980,10 +1399,10 @@ export default function App() {
                         <div className="flex items-center gap-1.5">
                           <span className="text-xs font-semibold text-slate-800">Clinical Note / Unstructured Document</span>
                           {newSessionType === 'note' && (
-                            <Check className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                            <Check className="w-3.5 h-3.5 text-brand-600 shrink-0" />
                           )}
                         </div>
-                        <p className="text-[10.5px] text-slate-400 mt-1 leading-normal">
+                        <p className="text-2xs text-slate-500 mt-1 leading-normal">
                           For typed documents, SOAP notes, discharge summaries, or referral letters. Skips the audio requirement and parses text layout directly.
                         </p>
                       </div>
@@ -1997,7 +1416,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setIsCreateModalOpen(false)}
-                  className="px-3.5 py-2 text-xs font-semibold text-slate-600 hover:text-slate-800 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  className="btn btn-secondary"
                 >
                   Cancel
                 </button>
@@ -2008,11 +1427,7 @@ export default function App() {
                     setIsCreateModalOpen(false);
                     setSelectedGroupIdForCreation(null);
                   }}
-                  className={`px-4 py-2 text-xs font-semibold text-white rounded-lg shadow-sm cursor-pointer transition-colors ${
-                    newSessionType === 'note'
-                      ? 'bg-indigo-600 hover:bg-indigo-700'
-                      : 'bg-blue-600 hover:bg-blue-700'
-                  }`}
+                  className="btn btn-primary"
                 >
                   Create Session
                 </button>
@@ -2032,7 +1447,7 @@ export default function App() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               onClick={() => setIsShareModalOpen(false)}
-              className="absolute inset-0 bg-slate-900/45 backdrop-blur-xs"
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-xs"
             />
 
             {/* Modal Card */}
@@ -2041,16 +1456,17 @@ export default function App() {
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.95, opacity: 0, y: 15 }}
               transition={{ type: 'spring', duration: 0.35 }}
-              className="relative bg-white rounded-2xl shadow-xl border border-slate-100 max-w-md w-full p-6 space-y-4 overflow-hidden text-left"
+              role="dialog" aria-modal="true" aria-labelledby="session-link-title"
+              className="dialog-surface relative bg-white border border-slate-200 max-w-md w-full p-6 space-y-4 text-left"
             >
               <div className="flex items-center justify-between pb-3 border-b border-slate-100">
                 <div className="flex items-center gap-2">
-                  <Share2 className="w-4.5 h-4.5 text-blue-600" />
-                  <h3 className="text-sm font-semibold text-slate-800 font-sans">Share Clinical Session</h3>
+                  <Share2 className="w-4.5 h-4.5 text-brand-600" />
+                  <h3 id="session-link-title" className="text-base font-semibold text-slate-800">{storageMode === 'firebase' ? 'Session Link' : 'Local Session Link'}</h3>
                 </div>
                 <button
                   onClick={() => setIsShareModalOpen(false)}
-                  className="text-slate-400 hover:text-slate-600 transition-colors p-1 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  className="icon-button" aria-label="Close session link"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -2058,7 +1474,9 @@ export default function App() {
 
               <div className="space-y-3">
                 <p className="text-xs text-slate-500 leading-relaxed font-sans">
-                  Anyone with this link will be able to view a read-only preview of this clinical session, its interactive graph, and standardized UMLS annotations. They can also clone it into their private workspace to modify it.
+                  {storageMode === 'firebase'
+                    ? 'This link opens the session when you are signed in to your account.'
+                    : 'This link reopens the session on this computer while ClinGraph is running. To transfer annotations to another computer, use Export JSONL.'}
                 </p>
 
                 <div className="flex items-center gap-2 bg-slate-50 border border-slate-200/80 rounded-xl p-2 min-w-0">
@@ -2066,7 +1484,7 @@ export default function App() {
                     type="text"
                     readOnly
                     value={sharedLinkUrl}
-                    className="flex-1 text-[11px] font-mono bg-transparent outline-none text-slate-600 select-all min-w-0"
+                    className="flex-1 text-2xs font-mono bg-transparent outline-none text-slate-600 select-all min-w-0"
                   />
                   <button
                     onClick={() => {
@@ -2079,12 +1497,12 @@ export default function App() {
                     {copiedShareLink ? (
                       <>
                         <Check className="w-3.5 h-3.5 text-emerald-500" />
-                        <span className="text-emerald-600 text-[11px]">Copied!</span>
+                        <span className="text-emerald-600 text-2xs">Copied!</span>
                       </>
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        <span className="text-[11px]">Copy Link</span>
+                        <span className="text-2xs">Copy Link</span>
                       </>
                     )}
                   </button>
@@ -2114,7 +1532,7 @@ export default function App() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               onClick={() => setIsSettingsOpen(false)}
-              className="absolute inset-0 bg-slate-900/45 backdrop-blur-xs"
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-xs"
             />
 
             {/* Modal Card */}
@@ -2123,40 +1541,41 @@ export default function App() {
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.95, opacity: 0, y: 15 }}
               transition={{ type: 'spring', duration: 0.35 }}
-              className="relative bg-white rounded-2xl shadow-2xl border border-slate-200/80 max-w-xl w-full p-6 space-y-4 overflow-hidden text-left"
+              role="dialog" aria-modal="true" aria-labelledby="ai-settings-title"
+              className="dialog-surface relative bg-white border border-slate-200 max-w-2xl w-full p-6 space-y-4 text-left flex flex-col"
             >
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center justify-between gap-3 pb-4 border-b border-slate-100 shrink-0">
                 <div className="flex items-center gap-2">
-                  <Key className="w-5 h-5 text-blue-600 animate-pulse" />
+                  <Settings2 className="w-5 h-5 text-brand-600 shrink-0" />
                   <div>
-                    <h3 className="text-sm font-bold text-slate-900 font-sans">Bring Your Own Model (BYOM)</h3>
-                    <p className="text-[10px] text-slate-400 font-medium">Customize your transcription & clinical entity recognition on the go</p>
+                    <h3 id="ai-settings-title" className="text-base font-semibold text-slate-900">AI Settings</h3>
+                    <p className="text-xs text-slate-500 mt-1">Connect a model for transcription and clinical annotation.</p>
                   </div>
                 </div>
                 <button
                   onClick={() => setIsSettingsOpen(false)}
-                  className="text-slate-400 hover:text-slate-600 transition-colors p-1.5 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  className="icon-button" aria-label="Close AI settings"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
-              <div className="space-y-4 max-h-[440px] overflow-y-auto pr-1">
+              <div className="space-y-4 min-h-0 max-h-[60dvh] overflow-y-auto pr-1">
                 {/* Information Callout Banner */}
-                <div className="p-3.5 bg-blue-50/80 border border-blue-200/70 rounded-xl text-xs text-blue-900 space-y-1.5">
-                  <div className="flex items-center gap-1.5 font-bold text-blue-950">
-                    <Info className="w-4 h-4 text-blue-600 shrink-0" />
-                    <span>Bring Your Own Key (BYOK) Configuration</span>
+                <div className="p-3.5 bg-brand-50/80 border border-brand-200/70 rounded-xl text-xs text-brand-900 space-y-1.5">
+                  <div className="flex items-center gap-1.5 font-semibold text-brand-950">
+                    <Info className="w-4 h-4 text-brand-600 shrink-0" />
+                    <span>Your model, your API key</span>
                   </div>
-                  <p className="text-[11px] text-blue-850 leading-relaxed">
-                    The default server Gemini API key has been unset. You can provide your own personal Google Gemini API key or OpenAI key below. Keys are stored locally in your browser (and synced to your profile if signed in).
+                  <p className="text-xs text-brand-800 leading-relaxed">
+                    Configure Gemini or an OpenAI-compatible endpoint for optional AI features. Settings and keys are saved {storageMode === 'firebase' ? 'privately to your account' : 'in your local database'}. The selected provider receives the text or audio you submit for processing.
                   </p>
-                  <div className="pt-0.5 flex flex-wrap items-center gap-3 text-[11px]">
+                  <div className="pt-0.5 flex flex-wrap items-center gap-3 text-2xs">
                     <a
                       href="https://aistudio.google.com/apikey"
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-semibold underline decoration-blue-300"
+                      className="inline-flex items-center gap-1 text-brand-700 hover:text-brand-900 font-semibold underline decoration-brand-300"
                     >
                       <span>Get a free Gemini API key from Google AI Studio</span>
                       <ExternalLink className="w-3 h-3" />
@@ -2169,7 +1588,7 @@ export default function App() {
                   (localConfig.transcription.apiKey && !localConfig.annotation.apiKey) ||
                   (localConfig.annotation.apiKey && localConfig.transcription.apiKey && localConfig.annotation.apiKey !== localConfig.transcription.apiKey)) && (
                   <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200/80 rounded-xl text-xs">
-                    <span className="text-[11px] text-slate-600 font-medium">Have a single Gemini key for both?</span>
+                    <span className="text-2xs text-slate-600 font-medium">Have a single Gemini key for both?</span>
                     <button
                       type="button"
                       onClick={() => {
@@ -2180,27 +1599,27 @@ export default function App() {
                           annotation: { ...localConfig.annotation, apiKey: keyToCopy }
                         });
                       }}
-                      className="px-2.5 py-1 bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 rounded-lg font-semibold text-[11px] flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
+                      className="px-2.5 py-1 bg-white hover:bg-brand-50 text-brand-700 border border-brand-200 rounded-lg font-semibold text-2xs flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
                     >
-                      <Copy className="w-3 h-3 text-blue-600" />
+                      <Copy className="w-3 h-3 text-brand-600" />
                       <span>Sync Key to Both</span>
                     </button>
                   </div>
                 )}
 
                 {/* Section 1: Speech Transcription */}
-                <div className="p-4 bg-slate-50/50 border border-slate-200/60 rounded-xl space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">1. Audio Transcription & Diarization</span>
-                    <span className="text-[10px] text-blue-600 font-medium bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100">Speech-to-Text</span>
+                <div className="p-4 bg-slate-50/50 border border-slate-200 rounded-lg space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="section-heading">Audio transcription</span>
+                    <span className="text-2xs text-brand-600 font-medium bg-brand-50 px-2 py-0.5 rounded-full border border-brand-100">Speech-to-Text</span>
                   </div>
-                  <p className="text-[10.5px] text-slate-400 leading-normal">
+                  <p className="text-2xs text-slate-500 leading-normal">
                     Specify the model used when you record clinical dialogues or upload raw files.
                   </p>
 
-                  <div className="grid grid-cols-2 gap-3.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                     <div>
-                      <label className="block text-[11px] font-bold text-slate-500 mb-1">Provider</label>
+                      <label className="block text-2xs font-semibold text-slate-500 mb-1">Provider</label>
                       <select
                         value={localConfig.transcription.provider}
                         onChange={(e) => {
@@ -2214,7 +1633,7 @@ export default function App() {
                           }
                           setLocalConfig({ ...localConfig, transcription: updated });
                         }}
-                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all cursor-pointer font-medium"
+                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-brand-500 outline-none transition-all cursor-pointer font-medium"
                       >
                         <option value="gemini">Google Gemini (Standard)</option>
                         <option value="openai">OpenAI / Custom API (Whisper)</option>
@@ -2222,7 +1641,7 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-[11px] font-bold text-slate-500 mb-1">Model Name</label>
+                      <label className="block text-2xs font-semibold text-slate-500 mb-1">Model Name</label>
                       <input
                         type="text"
                         value={localConfig.transcription.model}
@@ -2231,7 +1650,7 @@ export default function App() {
                           transcription: { ...localConfig.transcription, model: e.target.value }
                         })}
                         placeholder={localConfig.transcription.provider === 'gemini' ? 'gemini-3.1-flash-lite' : 'whisper-1'}
-                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all font-medium"
+                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-brand-500 outline-none transition-all font-medium"
                       />
                     </div>
                   </div>
@@ -2239,7 +1658,7 @@ export default function App() {
                   {localConfig.transcription.provider === 'openai' && (
                     <div className="space-y-3 pt-1">
                       <div>
-                        <label className="block text-[11px] font-bold text-slate-500 mb-1">API Base URL</label>
+                        <label className="block text-2xs font-semibold text-slate-500 mb-1">API Base URL</label>
                         <input
                           type="text"
                           value={localConfig.transcription.baseUrl}
@@ -2248,17 +1667,17 @@ export default function App() {
                             transcription: { ...localConfig.transcription, baseUrl: e.target.value }
                           })}
                           placeholder="https://api.openai.com/v1"
-                          className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-600 font-mono outline-none focus:border-blue-500 transition-all"
+                          className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-600 font-mono outline-none focus:border-brand-500 transition-all"
                         />
                       </div>
                     </div>
                   )}
 
                   <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    <label className="block text-2xs font-semibold text-slate-700 mb-1">
                       {localConfig.transcription.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
-                      <span className="font-normal text-slate-400 ml-1.5 text-[10px]">
-                        {localConfig.transcription.provider === 'gemini' ? '(Optional override; leave empty for demo)' : '(Required for OpenAI)'}
+                      <span className="font-normal text-slate-500 ml-1.5 text-2xs">
+                        {localConfig.transcription.provider === 'gemini' ? '(Or set GEMINI_API_KEY in .env)' : '(Optional for local endpoints)'}
                       </span>
                     </label>
                     <input
@@ -2268,25 +1687,25 @@ export default function App() {
                         ...localConfig,
                         transcription: { ...localConfig.transcription, apiKey: e.target.value }
                       })}
-                      placeholder={localConfig.transcription.provider === 'gemini' ? 'AIzaSy... (leave empty for demo)' : 'sk-...'}
-                      className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-blue-500 transition-all"
+                      placeholder={localConfig.transcription.provider === 'gemini' ? 'AIzaSy...' : 'sk-...'}
+                      className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-brand-500 transition-all"
                     />
                   </div>
                 </div>
 
                 {/* Section 2: Clinical Annotation */}
-                <div className="p-4 bg-slate-50/50 border border-slate-200/60 rounded-xl space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">2. Entity Recognition & UMLS Annotation</span>
-                    <span className="text-[10px] text-indigo-600 font-medium bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">Reasoning LLM</span>
+                <div className="p-4 bg-slate-50/50 border border-slate-200 rounded-lg space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="section-heading">Clinical annotation</span>
+                    <span className="text-2xs text-brand-600 font-medium bg-brand-50 px-2 py-0.5 rounded-full border border-brand-100">Reasoning LLM</span>
                   </div>
-                  <p className="text-[10.5px] text-slate-400 leading-normal">
+                  <p className="text-2xs text-slate-500 leading-normal">
                     Specify the model used to extract clinical entities, SNOMED/RxNorm/ICD-10 nodes, and construct knowledge graphs.
                   </p>
 
-                  <div className="grid grid-cols-2 gap-3.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                     <div>
-                      <label className="block text-[11px] font-bold text-slate-500 mb-1">Provider</label>
+                      <label className="block text-2xs font-semibold text-slate-500 mb-1">Provider</label>
                       <select
                         value={localConfig.annotation.provider}
                         onChange={(e) => {
@@ -2300,7 +1719,7 @@ export default function App() {
                           }
                           setLocalConfig({ ...localConfig, annotation: updated });
                         }}
-                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all cursor-pointer font-medium"
+                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-brand-500 outline-none transition-all cursor-pointer font-medium"
                       >
                         <option value="gemini">Google Gemini (Standard)</option>
                         <option value="openai">OpenAI / Custom API (GPT-4o/Llama)</option>
@@ -2308,7 +1727,7 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="block text-[11px] font-bold text-slate-500 mb-1">Model Name</label>
+                      <label className="block text-2xs font-semibold text-slate-500 mb-1">Model Name</label>
                       <input
                         type="text"
                         value={localConfig.annotation.model}
@@ -2317,15 +1736,39 @@ export default function App() {
                           annotation: { ...localConfig.annotation, model: e.target.value }
                         })}
                         placeholder={localConfig.annotation.provider === 'gemini' ? 'gemini-3.1-flash-lite' : 'gpt-4o'}
-                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-blue-500 outline-none transition-all font-medium"
+                        className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 focus:border-brand-500 outline-none transition-all font-medium"
                       />
                     </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <label htmlFor="annotation-concurrency" className="text-xs font-semibold text-slate-700">Parallel utterances</label>
+                      <input
+                        id="annotation-concurrency"
+                        type="number"
+                        min={1}
+                        max={MAX_ANNOTATION_CONCURRENCY}
+                        step={1}
+                        value={localConfig.annotation.concurrency}
+                        aria-invalid={!annotationConcurrencyValid}
+                        aria-describedby={`annotation-concurrency-help${annotationConcurrencyValid ? '' : ' annotation-concurrency-error'}`}
+                        onChange={event => setLocalConfig({ ...localConfig, annotation: {
+                          ...localConfig.annotation, concurrency: event.target.value === '' ? '' : Number(event.target.value)
+                        } })}
+                        className="h-9 w-20 shrink-0 rounded-lg border border-slate-200 px-2.5 text-xs text-slate-700 outline-none focus:border-brand-500"
+                      />
+                    </div>
+                    <p id="annotation-concurrency-help" className="text-2xs text-slate-500 leading-normal">
+                      Utterances processed at once (1–32). Higher values may reach your provider’s rate limits. Changes apply to new annotation runs.
+                    </p>
+                    {!annotationConcurrencyValid && <p id="annotation-concurrency-error" role="alert" className="text-xs text-rose-700">{ANNOTATION_CONCURRENCY_ERROR}</p>}
                   </div>
 
                   {localConfig.annotation.provider === 'openai' && (
                     <div className="space-y-3 pt-1">
                       <div>
-                        <label className="block text-[11px] font-bold text-slate-500 mb-1">API Base URL</label>
+                        <label className="block text-2xs font-semibold text-slate-500 mb-1">API Base URL</label>
                         <input
                           type="text"
                           value={localConfig.annotation.baseUrl}
@@ -2334,17 +1777,17 @@ export default function App() {
                             annotation: { ...localConfig.annotation, baseUrl: e.target.value }
                           })}
                           placeholder="https://api.openai.com/v1"
-                          className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-600 font-mono outline-none focus:border-blue-500 transition-all"
+                          className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-600 font-mono outline-none focus:border-brand-500 transition-all"
                         />
                       </div>
                     </div>
                   )}
 
                   <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    <label className="block text-2xs font-semibold text-slate-700 mb-1">
                       {localConfig.annotation.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
-                      <span className="font-normal text-slate-400 ml-1.5 text-[10px]">
-                        {localConfig.annotation.provider === 'gemini' ? '(Optional override; leave empty for demo)' : '(Required for OpenAI)'}
+                      <span className="font-normal text-slate-500 ml-1.5 text-2xs">
+                        {localConfig.annotation.provider === 'gemini' ? '(Or set GEMINI_API_KEY in .env)' : '(Optional for local endpoints)'}
                       </span>
                     </label>
                     <input
@@ -2354,38 +1797,40 @@ export default function App() {
                         ...localConfig,
                         annotation: { ...localConfig.annotation, apiKey: e.target.value }
                       })}
-                      placeholder={localConfig.annotation.provider === 'gemini' ? 'AIzaSy... (leave empty for demo)' : 'sk-...'}
-                      className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-blue-500 transition-all"
+                      placeholder={localConfig.annotation.provider === 'gemini' ? 'AIzaSy...' : 'sk-...'}
+                      className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-brand-500 transition-all"
                     />
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between pt-3 border-t border-slate-100">
-                <div className="text-[11px]">
+              {settingsSaveError && <p role="alert" className="text-xs text-rose-700">{settingsSaveError}</p>}
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-100 shrink-0">
+                <div className="text-2xs">
                   {(localConfig.annotation?.apiKey || localConfig.transcription?.apiKey) ? (
                     <span className="text-emerald-700 font-semibold flex items-center gap-1">
                       <Check className="w-3.5 h-3.5" />
                       <span>Custom API key configured</span>
                     </span>
                   ) : (
-                    <span className="text-amber-700 font-medium">
-                      No keys set — local demo mode active
+                    <span className="text-slate-500 font-medium">
+                      No keys set — manual annotation is available
                     </span>
                   )}
                 </div>
-                <div className="flex items-center gap-2.5">
+                <div className="flex items-center gap-2 ml-auto">
                   <button
                     type="button"
                     onClick={() => setIsSettingsOpen(false)}
-                    className="px-4 py-2 text-xs font-semibold text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 rounded-xl cursor-pointer transition-colors"
+                    className="btn btn-secondary"
                   >
                     Cancel
                   </button>
                   <button
                     type="button"
                     onClick={handleSaveSettings}
-                    className="px-4.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl shadow-md shadow-blue-500/10 cursor-pointer transition-all flex items-center gap-1.5"
+                    disabled={!annotationConcurrencyValid}
+                    className="btn btn-primary"
                   >
                     <Check className="w-4 h-4" />
                     <span>Save Configuration</span>
@@ -2396,6 +1841,14 @@ export default function App() {
           </div>
         )}
       </AnimatePresence>
+
+      {isHistoryOpen && activeConversation && <AnnotationHistory key={activeConversation.id}
+        conversation={activeConversation} onClose={() => setIsHistoryOpen(false)}
+        listCheckpoints={listCheckpoints} getCheckpoint={getCheckpoint} createCheckpoint={createCheckpoint} restoreCheckpoint={restoreCheckpoint}
+        onRestored={restored => {
+          setIsHistoryOpen(false); setSelectedEntityId(null); setSelectedMentionId(null);
+          setActiveGroupId(restored.groupId || null); setActiveId(restored.id); setActiveTab('dialogue');
+        }} />}
 
       <ExportJsonlModal
         isOpen={isExportJsonlOpen}

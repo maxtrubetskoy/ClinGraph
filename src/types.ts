@@ -1,3 +1,9 @@
+import type { TemporalValue } from './utils/temporal';
+import type { TrajectoryValue } from './utils/trajectory';
+import { partOfAttribute, type ProcedureReferenceValue } from './utils/procedureReferences';
+import { diagnosticAssessmentAttribute, observationStatusAttribute, isObservationCategory } from './utils/observationStatus';
+import { mentionContextDefaults } from './utils/mentionContext';
+
 export interface TranscriptSegment {
   id: string;
   speaker: string;
@@ -38,7 +44,30 @@ export interface Entity {
   description?: string;
   textSpan?: TextSpan;
   umlsMapping?: UmlsMapping;
+  categoryId?: string;
+  attributes?: EntityAttribute[];
 }
+
+/** An attribute instance belongs to one entity, with identity independent of its value. */
+export interface EntityAttribute {
+  id: string;
+  name: string;
+  value: unknown;
+  valueType?: 'temporal' | 'trajectory' | 'procedure-reference';
+  temporalMode?: 'event' | 'duration';
+  /** Lossless provenance when a legacy observation status is moved to a clinical assessment. */
+  migration?: {
+    kind: 'observation-status'; originalName: string; originalValue: unknown;
+    review?: { decision: 'retained-as-context' } | {
+      decision: 'mapped-to-assessment'; assessmentAttributeId: string; assessmentValue: string;
+      previousAssessmentValue: unknown; movedMentionIds: string[];
+    };
+  };
+}
+
+export type EvidenceTarget =
+  | { kind: 'entity'; entityId: string }
+  | { kind: 'attribute'; entityId: string; attributeId: string };
 
 export interface Relation {
   id: string;
@@ -48,15 +77,19 @@ export interface Relation {
 }
 
 export interface ClinicalSymptom {
+  trajectory?: TrajectoryValue | string | null;
   entityId: string;
   name: string;
   severity: string; // e.g. "Mild", "Moderate", "Severe", "None / Denied", "Unspecified"
   status?: string;   // e.g. "Active", "Resolved", "Refuted", "Unconfirmed", "Unspecified"
-  onset?: string;
+  onset?: TemporalValue | string | null;
+  resolutionTime?: TemporalValue | string | null;
+  duration?: TemporalValue | string | null;
   details?: string;
 }
 
 export interface ClinicalCondition {
+  trajectory?: TrajectoryValue | string | null;
   entityId: string;
   name: string;
   status: string; // e.g. "Active", "Chronic", "History of", "Differential Diagnosis", "Refuted", "Unspecified"
@@ -80,9 +113,12 @@ export interface ClinicalFollowUp {
 }
 
 export interface ClinicalMeasurement {
+  partOf?: ProcedureReferenceValue | null;
+  trajectory?: TrajectoryValue | string | null;
   entityId: string;
   name: string; // e.g. "eGFR", "Blood Pressure", "Target Blood Pressure"
   value?: string; // e.g. "58", "140/90"
+  effectiveTime?: TemporalValue | string | null;
   status?: string; // e.g. "Stable", "Decreased", "Elevated", "Target"
   details?: string;
 }
@@ -109,7 +145,9 @@ export interface ClinicalCategory {
 
 export interface AnnotationAttribute {
   name: string;
-  type: 'text' | 'select' | 'boolean';
+  displayName?: string;
+  type: 'text' | 'textarea' | 'number' | 'select' | 'boolean' | 'temporal' | 'trajectory' | 'procedure-reference';
+  temporalMode?: 'event' | 'duration';
   choices?: string[]; // If type is 'select'
   hint?: string;
 }
@@ -131,7 +169,8 @@ export const DEFAULT_ANNOTATION_SCHEMA: AnnotationCategory[] = [
     attributes: [
       { name: 'name', type: 'text', hint: 'The medical name of the condition or disease' },
       { name: 'status', type: 'select', choices: ['Unassigned', 'Active', 'Chronic', 'History of', 'Differential Diagnosis', 'Refuted', 'Unspecified'], hint: 'Clinical status or presence (use "Refuted" for ruled-out or screened and denied conditions)' },
-      { name: 'details', type: 'text', hint: 'Additional context, specifications, or notes' }
+      { name: 'details', type: 'text', hint: 'Additional context, specifications, or notes' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -143,8 +182,11 @@ export const DEFAULT_ANNOTATION_SCHEMA: AnnotationCategory[] = [
       { name: 'name', type: 'text', hint: 'The physical symptom or sign' },
       { name: 'severity', type: 'select', choices: ['Unassigned', 'Mild', 'Moderate', 'Severe', 'None / Denied', 'Unspecified'], hint: 'The intensity of the symptom' },
       { name: 'status', type: 'select', choices: ['Unassigned', 'Active', 'Resolved', 'Refuted', 'Unconfirmed', 'Unspecified'], hint: 'Clinical presence or verification status (use "Refuted" when screened and denied/absent)' },
-      { name: 'onset', type: 'text', hint: 'When the symptom started or duration' },
-      { name: 'details', type: 'text', hint: 'Additional characterization of the symptom' }
+      { name: 'onset', type: 'temporal', temporalMode: 'event', hint: 'When the symptom started; preserve relative or uncertain timing' },
+      { name: 'resolutionTime', type: 'temporal', temporalMode: 'event', hint: 'When the symptom ended; missing is not the same as ongoing' },
+      { name: 'duration', type: 'temporal', temporalMode: 'duration', hint: 'How long symptoms lasted, not an onset date' },
+      { name: 'details', type: 'text', hint: 'Additional characterization of the symptom' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -178,8 +220,11 @@ export const DEFAULT_ANNOTATION_SCHEMA: AnnotationCategory[] = [
     attributes: [
       { name: 'name', type: 'text', hint: 'Vital sign or lab test name' },
       { name: 'value', type: 'text', hint: 'Result or value with units' },
+      partOfAttribute(),
+      { name: 'effectiveTime', type: 'temporal', temporalMode: 'event', hint: 'When measured or the sample was collected, not when documented' },
       { name: 'status', type: 'select', choices: ['Unassigned', 'Stable', 'Elevated', 'Decreased', 'Target', 'Abnormal'], hint: 'General trend or clinical interpretation' },
-      { name: 'details', type: 'text', hint: 'Refining details or target goals' }
+      { name: 'details', type: 'text', hint: 'Refining details or target goals' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -206,7 +251,8 @@ export const FHIR_ANNOTATION_SCHEMA: AnnotationCategory[] = [
       { name: 'clinicalStatus', type: 'select', choices: ['unassigned', 'active', 'recurrence', 'relapse', 'inactive', 'remission', 'resolved', 'unspecified'], hint: 'unassigned | active | recurrence | relapse | inactive | remission | resolved' },
       { name: 'verificationStatus', type: 'select', choices: ['unassigned', 'unconfirmed', 'provisional', 'differential', 'confirmed', 'refuted', 'entered-in-error'], hint: 'unassigned | unconfirmed | provisional | differential | confirmed | refuted' },
       { name: 'severity', type: 'select', choices: ['unassigned', 'mild', 'moderate', 'severe', 'unspecified'], hint: 'unassigned | mild | moderate | severe' },
-      { name: 'onset', type: 'text', hint: 'Estimated onset dateTime, age, or period' }
+      { name: 'onset', type: 'text', hint: 'Estimated onset dateTime, age, or period' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -216,9 +262,14 @@ export const FHIR_ANNOTATION_SCHEMA: AnnotationCategory[] = [
     typeHint: 'Use for patient-reported physical symptoms, somatic complaints, bodily signs, or temporary sensations (e.g. \'spierkrampen\' / \'kramp\', \'duizeligheid\' / dizziness, \'moeheid\' / fatigue, \'vroege verzadiging\' / early satiety, nausea, headache, pain). Do NOT map to AllergyIntolerance or Condition.',
     attributes: [
       { name: 'name', type: 'text', hint: 'The physical symptom or subjective complaint' },
+      { name: 'onset', type: 'temporal', temporalMode: 'event', hint: 'When the symptom started; preserve relative or uncertain timing' },
+      { name: 'resolutionTime', type: 'temporal', temporalMode: 'event', hint: 'When the symptom ended; missing is not the same as ongoing' },
+      { name: 'duration', type: 'temporal', temporalMode: 'duration', hint: 'How long symptoms lasted, not an onset date' },
       { name: 'severity', type: 'select', choices: ['unassigned', 'mild', 'moderate', 'severe', 'unspecified'], hint: 'unassigned | mild | moderate | severe' },
-      { name: 'status', type: 'select', choices: ['unassigned', 'registered', 'preliminary', 'final', 'refuted', 'unknown'], hint: 'unassigned | registered | preliminary | final | refuted' },
-      { name: 'details', type: 'text', hint: 'Any additional details or context' }
+      observationStatusAttribute(),
+      diagnosticAssessmentAttribute(),
+      { name: 'details', type: 'text', hint: 'Any additional details or context' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -228,10 +279,14 @@ export const FHIR_ANNOTATION_SCHEMA: AnnotationCategory[] = [
     typeHint: 'Use strictly for objective, quantitative physical vital signs, laboratory values, or anatomical measurements (e.g. \'grootte van de nieren\' / \'kidney size\', blood pressure: 140/90, heart rate: 72, creatinine: 1.2, eGFR: 58). Do NOT use for subjective patient-reported complaints/symptoms (like \'vroege verzadiging\', cramps, nausea, pain, which belong under FHIR Observation (Symptom)), or formal medical diagnoses (Conditions).',
     attributes: [
       { name: 'name', type: 'text', hint: 'Observation code or display name (e.g., Blood Pressure, Body Temperature)' },
-      { name: 'status', type: 'select', choices: ['unassigned', 'registered', 'preliminary', 'final', 'amended', 'corrected', 'cancelled', 'entered-in-error', 'unknown'], hint: 'unassigned | registered | preliminary | final | amended | corrected' },
+      observationStatusAttribute(),
+      diagnosticAssessmentAttribute(),
       { name: 'category', type: 'select', choices: ['unassigned', 'vital-signs', 'laboratory', 'imaging', 'social-history', 'exam', 'therapy', 'activity'], hint: 'unassigned | vital-signs | laboratory | imaging | social-history' },
       { name: 'value', type: 'text', hint: 'The absolute result value with units (e.g., 120/80 mmHg, 37.5 C)' },
-      { name: 'interpretation', type: 'select', choices: ['Unassigned', 'Normal', 'High', 'Low', 'Critical High', 'Critical Low', 'Abnormal', 'Unspecified'], hint: 'Unassigned | Normal | High | Low | Critical High | Critical Low | Abnormal' }
+      partOfAttribute(),
+      { name: 'effectiveTime', type: 'temporal', temporalMode: 'event', hint: 'When measured or the sample was collected, not when documented' },
+      { name: 'interpretation', type: 'select', choices: ['Unassigned', 'Normal', 'High', 'Low', 'Critical High', 'Critical Low', 'Abnormal', 'Unspecified'], hint: 'Unassigned | Normal | High | Low | Critical High | Critical Low | Abnormal' },
+      { name: 'trajectory', type: 'trajectory', hint: 'Explicit clinical change (improved, worsened, unchanged) with a comparison time; never infer benefit from a numeric rise/fall' }
     ]
   },
   {
@@ -242,7 +297,8 @@ export const FHIR_ANNOTATION_SCHEMA: AnnotationCategory[] = [
     attributes: [
       { name: 'name', type: 'text', hint: 'Social factor or observation code (e.g., Tobacco Smoking Status, Alcohol Consumption, Substance Use, Employment Status, Living Situation)' },
       { name: 'value', type: 'text', hint: 'Observed status or quantity (e.g., Former smoker, Current every day smoker, Never smoker, 1-2 drinks/week, Non-drinker, Denies illicit drug use, Lives with spouse)' },
-      { name: 'status', type: 'select', choices: ['unassigned', 'final', 'preliminary', 'amended', 'registered', 'entered-in-error', 'unknown'], hint: 'unassigned | final | preliminary | amended' },
+      observationStatusAttribute(),
+      diagnosticAssessmentAttribute(),
       { name: 'category', type: 'select', choices: ['unassigned', 'social-history'], hint: 'unassigned | social-history' },
       { name: 'details', type: 'text', hint: 'Additional context, pack-years, cessation date, frequency, or lifestyle details' }
     ]
@@ -380,24 +436,34 @@ export interface Mention {
   segmentId?: string;
   textSpan: TextSpan;
   entityType: EntityType;
+  /** Owning entity for navigation; target alone determines what this mention supports. */
   entityId: string | null;
+  target?: EvidenceTarget | null;
+  /** Independent of target: a name/reference is not itself a clinical claim. */
+  evidenceRole?: import('./utils/mentionContext').MentionEvidenceRole;
   speaker?: string;
   /** 0-based word index across concatenated segment texts, invariant to speaker/utterance splits */
   globalStartWord?: number;
   /** 0-based word index of the last word in the mention */
   globalEndWord?: number;
   polarity?: 'unassigned' | 'positive' | 'negative' | 'neutral' | string;
-  certainty?: 'unassigned' | 'certain' | 'uncertain' | 'hypothetical' | string;
-  temporality?: 'unassigned' | 'current' | 'past' | 'future' | string;
+  /** Speaker commitment to the supported claim, NOT annotation/linking confidence. */
+  certainty?: 'unassigned' | 'not_applicable' | 'certain' | 'uncertain' | 'hypothetical' | string;
+  /** Time of the supported claim; a bare reference defaults to not_applicable. */
+  temporality?: 'unassigned' | 'not_applicable' | 'current' | 'past' | 'future' | string;
   experiencer?: 'unassigned' | 'patient' | 'family' | 'other' | string;
-  function?: 'unassigned' | 'asserted' | 'questioned' | 'hypothetical' | 'explanatory' | string;
-  /** The entity attribute this mention supports (e.g. "value" for "145", "severity" for "moderate", "dosage" for "20mg", "status", "onset") */
+  /** Speech function; on a reference it is contextual and never asserts a finding. */
+  function?: 'unassigned' | 'not_applicable' | 'asserted' | 'questioned' | 'hypothetical' | 'explanatory' | string;
+  /** Legacy import field. Migrated to target.attributeId; never written in version 2. */
   supportedAttribute?: string;
   canonicalName?: string;
   description?: string;
 }
 
 export interface AnnotationData {
+  mentionContextVersion?: 1;
+  evidenceVersion?: 2;
+  observationStatusVersion?: 1;
   entities: Entity[];
   relations: Relation[];
   clinicalNotes: ClinicalCategory;
@@ -420,14 +486,22 @@ export function normalizeAnnotationSchema(schema: AnnotationCategory[]): Annotat
   return schema.map(cat => {
     const systemDefault = systemDefaultsMap.get(cat.id);
     if (systemDefault) {
-      // Merge attributes so existing user sessions get updated options (like 'refuted', 'unassigned') and new attributes
-      const existingAttrs = cat.attributes && cat.attributes.length > 0 ? cat.attributes.map(a => ({ ...a })) : [...systemDefault.attributes];
+      // Merge schema updates without mutating either saved settings or the system defaults.
+      const existingAttrs = (cat.attributes?.length ? cat.attributes : systemDefault.attributes).map(a => ({ ...a }));
       
       // Ensure any default attribute (e.g. status) is present
       systemDefault.attributes.forEach(defAttr => {
         const found = existingAttrs.find(a => a.name.toLowerCase() === defAttr.name.toLowerCase());
-        if (!found) {
+        if (found && isObservationCategory(cat.id) && ['status', 'diagnosticAssessment'].includes(defAttr.name)) {
+          // These roles have fixed meanings; do not re-merge obsolete refuted workflow choices.
+          Object.assign(found, defAttr, { choices: [...(defAttr.choices || [])] });
+        } else if (!found) {
           existingAttrs.push({ ...defAttr });
+        } else if (defAttr.type === 'temporal' || defAttr.type === 'trajectory' || defAttr.type === 'procedure-reference') {
+          found.type = defAttr.type;
+          if (defAttr.type === 'procedure-reference') Object.assign(found, defAttr);
+          if (defAttr.temporalMode !== undefined) found.temporalMode = defAttr.temporalMode;
+          else delete found.temporalMode;
         } else if (defAttr.type === 'select' && defAttr.choices) {
           // Merge choices and ensure 'unassigned' / 'Unassigned' is present and placed first
           const rawChoices = Array.from(new Set([...defAttr.choices, ...(found.choices || [])]));
@@ -575,15 +649,12 @@ export function migrateToMentionsSchema(annotation: any): {
     };
   }
 
-  // If mentions already exist, return as is (ensuring all have default attributes if missing)
-  if (annotation.mentions && annotation.mentions.length > 0) {
+  // An explicit empty list is authoritative: deleting the last mention must not recreate it.
+  if (Array.isArray(annotation.mentions)) {
     const updatedMentions = annotation.mentions.map((m: any) => ({
-      speaker: 'patient',
-      polarity: 'unassigned',
-      certainty: 'unassigned',
-      temporality: 'unassigned',
+      speaker: 'unassigned',
+      ...mentionContextDefaults(m.evidenceRole),
       experiencer: 'unassigned',
-      function: 'unassigned',
       ...m
     }));
     return {
@@ -626,7 +697,7 @@ export function migrateToMentionsSchema(annotation: any): {
         textSpan: ent.textSpan,
         entityType: ent.type,
         entityId: canonical.id,
-        speaker: 'patient',
+        speaker: ent.textSpan.speaker || 'unassigned',
         polarity: 'unassigned',
         certainty: 'unassigned',
         temporality: 'unassigned',
@@ -709,27 +780,73 @@ export function migrateToMentionsSchema(annotation: any): {
   };
 }
 
+export interface AnnotationUtteranceProgress {
+  /** Original, zero-based transcript index, including any blank segments. */
+  lineIndex: number;
+  status: 'pending' | 'in_progress' | 'complete' | 'skipped';
+  error?: string;
+}
+
+export interface AnnotationProgress {
+  requestId?: string;
+  stage: 'preparing' | 'extracting' | 'clustering' | 'complete' | 'failed';
+  /** Nonblank utterances only; blank text never triggers an extraction request. */
+  utterances: AnnotationUtteranceProgress[];
+  error?: string;
+}
+
 export interface Conversation {
   id: string;
   title: string;
   createdAt: string;
+  /** Actual clinical encounter time; never inferred from workspace creation time. */
+  encounterTime?: TemporalValue | null;
   rawTranscript: string;
   transcriptSegments: TranscriptSegment[];
   hasAudio: boolean;
-  audioLocalId?: string; // Key to local IndexedDB storage
+  audioLocalId?: string; // Conversation ID owning audio in the local database
   audioDataUrl?: string; // Backup small base64 data url if IndexedDB is not used
   annotation?: AnnotationData;
+  annotationProgress?: AnnotationProgress | null;
+  /** Session-local schema on a restored copy; takes precedence over group settings. */
+  schemaSnapshot?: AnnotationSchemaSnapshot | null;
+  restoredFrom?: { conversationId: string; checkpointId: string; version: number; schemaVersion: string };
   status: 'draft' | 'processing' | 'annotated' | 'failed';
   encounterType?: 'dialogue' | 'note';
   userId?: string;
   isShared?: boolean;
   sharedFromId?: string;
-  groupId?: string; // Links this session to a SessionGroup
+  groupId?: string | null; // Links this session to a SessionGroup
   sharedGroupData?: {
     id?: string;
     name: string;
     settings?: SessionGroupSettings;
   };
+}
+
+export interface AnnotationSchemaSnapshot {
+  /** SHA-256 of the complete schema, with object keys sorted for stable identity. */
+  version: string;
+  categories: AnnotationCategory[];
+}
+
+export interface AnnotationCheckpointSummary {
+  id: string;
+  conversationId: string;
+  version: number;
+  createdAt: string;
+  label: string;
+  reason: 'manual' | 'before-ai';
+  schemaVersion: string;
+  entityCount: number;
+  mentionCount: number;
+}
+
+export interface AnnotationCheckpoint extends AnnotationCheckpointSummary {
+  snapshotFormatVersion: 1;
+  schema: AnnotationSchemaSnapshot;
+  snapshot: Pick<Conversation, 'title' | 'rawTranscript' | 'transcriptSegments' | 'annotation' |
+    'encounterTime' | 'encounterType' | 'status' | 'createdAt' | 'groupId' | 'restoredFrom'>;
 }
 
 export interface SessionGroupSettings {
@@ -744,7 +861,7 @@ export interface SessionGroup {
   id: string;
   name: string;
   createdAt: string;
-  userId: string;
+  userId?: string; // Firebase owner; unused by the local SQLite workspace
   settings?: SessionGroupSettings;
 }
 
@@ -757,6 +874,5 @@ export interface ModelConfig {
 
 export interface UserAiConfig {
   transcription: ModelConfig;
-  annotation: ModelConfig;
+  annotation: ModelConfig & { concurrency?: number };
 }
-

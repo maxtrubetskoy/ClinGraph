@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+test-results/
+playwright-report/
+.firebase/
+*service-account*.json
+*credentials*.json

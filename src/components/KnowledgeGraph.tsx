@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, MouseEvent } from 'react';
+import { getProcedureRelations } from '../utils/procedureReferences';
+import { getMentionAttributeName } from '../utils/evidence';
+import { useState, useEffect, useRef, useMemo, MouseEvent } from 'react';
 import { Entity, Relation, EntityType, Mention } from '../types';
 import { Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Info, Download, FileCode, Share2, Sparkles } from 'lucide-react';
 import { generateJsonlContent, downloadJsonlFile } from '../utils/exportJsonl';
@@ -44,6 +46,7 @@ export default function KnowledgeGraph({
 }: KnowledgeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [nodes, setNodes] = useState<GraphNode[]>([]);
+  const graphRelations = useMemo(() => [...relations, ...getProcedureRelations(entities)], [relations, entities]);
   const [links, setLinks] = useState<GraphLink[]>([]);
   const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
@@ -107,7 +110,7 @@ export default function KnowledgeGraph({
       };
     });
 
-    const newLinks: GraphLink[] = relations.map(rel => ({
+    const newLinks: GraphLink[] = graphRelations.map(rel => ({
       id: rel.id,
       source: rel.source,
       target: rel.target,
@@ -118,7 +121,7 @@ export default function KnowledgeGraph({
     setLinks(newLinks);
     setZoom(1);
     setPan({ x: 0, y: 0 });
-  }, [entities, relations]);
+  }, [entities, graphRelations]);
 
   // Force-directed layout simulation
   useEffect(() => {
@@ -127,6 +130,7 @@ export default function KnowledgeGraph({
     const width = containerRef.current?.clientWidth || 600;
     const height = containerRef.current?.clientHeight || 400;
 
+    let framesRemaining = 240;
     const runSimulation = () => {
       setNodes(prevNodes => {
         if (prevNodes.length === 0) return prevNodes;
@@ -170,9 +174,10 @@ export default function KnowledgeGraph({
         }
 
         // 2. Attraction force along links
+        const nodesById = new Map(updatedNodes.map(node => [node.id, node]));
         links.forEach(link => {
-          const sourceNode = updatedNodes.find(n => n.id === link.source);
-          const targetNode = updatedNodes.find(n => n.id === link.target);
+          const sourceNode = nodesById.get(link.source);
+          const targetNode = nodesById.get(link.target);
 
           if (sourceNode && targetNode) {
             const dx = targetNode.x - sourceNode.x;
@@ -230,7 +235,10 @@ export default function KnowledgeGraph({
         return updatedNodes;
       });
 
-      simulationRef.current = requestAnimationFrame(runSimulation);
+      // Stop the quadratic repulsion loop after settling; restart when links or dragging change.
+      if (--framesRemaining > 0 || draggedNodeId) {
+        simulationRef.current = requestAnimationFrame(runSimulation);
+      }
     };
 
     simulationRef.current = requestAnimationFrame(runSimulation);
@@ -315,9 +323,11 @@ export default function KnowledgeGraph({
         name: e.name,
         type: e.type,
         description: e.description,
-        textSpan: e.textSpan
+        textSpan: e.textSpan,
+        attributes: e.attributes
       })),
-      relations: relations.map(r => ({
+      relations: graphRelations.map(r => ({
+        ...r,
         id: r.id,
         source: r.source,
         target: r.target,
@@ -440,11 +450,11 @@ export default function KnowledgeGraph({
   return (
     <div 
       className={`relative border border-slate-200 bg-slate-50/50 rounded-xl flex flex-col transition-all duration-300 ${
-        isFullscreen ? 'fixed inset-4 z-50 bg-white shadow-2xl' : 'h-[calc(100vh-200px)] max-h-[calc(100vh-8rem)] min-h-[400px] w-full'
+        isFullscreen ? 'fixed inset-4 z-50 bg-white shadow-xl' : 'h-[calc(100vh-200px)] max-h-[calc(100vh-8rem)] min-h-[400px] w-full'
       }`}
     >
       {/* Graph Toolbar */}
-      <div className="absolute top-4 left-4 z-10 flex gap-2">
+      <div className="relative z-10 flex flex-wrap items-center gap-2 p-3 bg-white border-b border-slate-200 rounded-t-xl">
         <button
           onClick={() => setZoom(prev => Math.min(prev + 0.15, 3))}
           className="p-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 rounded-lg shadow-sm transition-colors cursor-pointer"
@@ -475,7 +485,7 @@ export default function KnowledgeGraph({
         </button>
         <button
           onClick={exportGraphJson}
-          className="flex items-center gap-1.5 px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-600 hover:text-blue-700 border border-blue-200 rounded-lg shadow-sm transition-all cursor-pointer font-semibold text-xs ml-2"
+          className="btn btn-secondary"
           title="Export Graph JSON"
         >
           <Download className="w-3.5 h-3.5" />
@@ -483,10 +493,10 @@ export default function KnowledgeGraph({
         </button>
         <button
           onClick={exportGraphJsonl}
-          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg shadow-sm transition-all cursor-pointer font-semibold text-xs ml-1"
+          className="btn btn-secondary"
           title="Export Entities & Mentions to JSONL format"
         >
-          <FileCode className="w-3.5 h-3.5 text-indigo-600" />
+          <FileCode className="w-3.5 h-3.5" />
           <span>Export JSONL</span>
         </button>
 
@@ -494,7 +504,7 @@ export default function KnowledgeGraph({
           <button
             onClick={onGenerateRelations}
             disabled={isGeneratingRelations || entities.length === 0}
-            className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-lg shadow-sm transition-all cursor-pointer font-semibold text-xs ml-2 disabled:opacity-50 disabled:cursor-not-allowed border border-blue-600"
+            className="btn btn-primary"
             title={entities.length === 0 ? "Extract clinical entities first in dialogue view" : "Generate Knowledge Graph relations between extracted entities"}
           >
             {isGeneratingRelations ? (
@@ -516,16 +526,16 @@ export default function KnowledgeGraph({
       </div>
 
       {/* Informative banner when entities exist but relations have not been generated yet */}
-      {entities.length > 0 && relations.length === 0 && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-10 bg-white/95 backdrop-blur border border-blue-200 rounded-xl px-4 py-3 shadow-md flex items-center gap-3 max-w-md pointer-events-auto">
-          <div className="p-2 bg-blue-50 border border-blue-100 rounded-lg text-blue-600 shrink-0">
+      {entities.length > 0 && graphRelations.length === 0 && (
+        <div className="relative z-10 bg-brand-50/60 border-b border-brand-100 px-4 py-3 flex flex-wrap items-center gap-3">
+          <div className="p-2 bg-white border border-brand-100 rounded-lg text-brand-600 shrink-0">
             <Share2 className="w-4 h-4" />
           </div>
           <div className="flex-1 min-w-0">
             <h5 className="text-xs font-semibold text-slate-800">
               Relations Not Generated ({entities.length} entities available)
             </h5>
-            <p className="text-[11px] text-slate-500 mt-0.5">
+            <p className="text-2xs text-slate-500 mt-0.5">
               Knowledge graph relation generation is separated from entity annotation.
             </p>
           </div>
@@ -533,7 +543,7 @@ export default function KnowledgeGraph({
             <button
               onClick={onGenerateRelations}
               disabled={isGeneratingRelations}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold shrink-0 cursor-pointer shadow-sm transition-all disabled:opacity-50"
+              className="btn btn-primary"
             >
               <Sparkles className="w-3.5 h-3.5 fill-white/20" />
               <span>{isGeneratingRelations ? 'Generating...' : 'Generate Now'}</span>
@@ -545,17 +555,17 @@ export default function KnowledgeGraph({
       {/* Empty state when no entities exist */}
       {entities.length === 0 && (
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none p-6 text-center z-10">
-          <div className="p-3 bg-white/80 border border-slate-200 rounded-2xl shadow-sm text-slate-400 mb-3">
-            <Share2 className="w-6 h-6 text-blue-400" />
+          <div className="p-3 bg-white/80 border border-slate-200 rounded-2xl shadow-sm text-slate-500 mb-3">
+            <Share2 className="w-6 h-6 text-brand-500" />
           </div>
           <p className="text-sm font-semibold text-slate-700">No Clinical Entities Available</p>
           <p className="text-xs text-slate-500 mt-1 max-w-xs">
-            Run "Generate AI Annotations" first in the dialogue view to extract clinical entities before generating knowledge graph relations.
+            Add entities in the dialogue view, manually or with AI, then connect them with relations.
           </p>
         </div>
       )}
 
-      <div className="absolute top-4 right-4 z-10 bg-white/95 backdrop-blur px-3 py-1.5 border border-slate-200 rounded-lg shadow-sm text-[10px] font-mono text-slate-500 max-w-xs pointer-events-none hidden md:block">
+      <div className="px-4 py-2 text-2xs text-slate-500">
         Drag nodes to reorganize. Click node to inspect details.
       </div>
 
@@ -736,7 +746,7 @@ export default function KnowledgeGraph({
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h4 className="text-sm font-semibold text-slate-800">{activeSelectedNode.name}</h4>
-              <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+              <span className="text-2xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-slate-100 text-slate-600">
                 {activeSelectedNode.type}
               </span>
             </div>
@@ -745,13 +755,13 @@ export default function KnowledgeGraph({
             </p>
             {activeSelectedEntity?.umlsMapping?.cui && (
               <div className="mt-2.5 pt-2 border-t border-slate-100 flex flex-wrap gap-1 items-center">
-                <span className="text-[8px] font-bold text-slate-400 uppercase tracking-wider mr-1.5 font-mono">UMLS Codes:</span>
+                <span className="text-2xs font-semibold text-slate-500 uppercase tracking-wider mr-1.5 font-sans">UMLS Codes:</span>
                 
                 <a
                   href={`https://uts.nlm.nih.gov/uts/umls/concept/${activeSelectedEntity.umlsMapping.cui}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-800 border border-slate-200 transition-colors"
+                  className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-800 border border-slate-200 transition-colors"
                   title={`UMLS Concept Unique Identifier (CUI): ${activeSelectedEntity.umlsMapping.preferredName}`}
                   onClick={e => e.stopPropagation()}
                 >
@@ -763,7 +773,7 @@ export default function KnowledgeGraph({
                     href={`https://terminologie.nictiz.nl/art-decor/snomed-ct?conceptId=${activeSelectedEntity.umlsMapping.snomed}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 hover:bg-purple-100 hover:text-purple-900 border border-purple-100 transition-colors"
+                    className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 hover:bg-purple-100 hover:text-purple-900 border border-purple-100 transition-colors"
                     title="SNOMED-CT Code"
                     onClick={e => e.stopPropagation()}
                   >
@@ -776,7 +786,7 @@ export default function KnowledgeGraph({
                     href={`https://mor.nlm.nih.gov/RxNav/search?searchBy=NameOrCode&searchTerm=${activeSelectedEntity.umlsMapping.rxnorm}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 hover:bg-sky-100 hover:text-sky-900 border border-sky-100 transition-colors"
+                    className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 hover:bg-sky-100 hover:text-sky-900 border border-sky-100 transition-colors"
                     title="RxNorm Code"
                     onClick={e => e.stopPropagation()}
                   >
@@ -789,7 +799,7 @@ export default function KnowledgeGraph({
                     href={`https://icd.who.int/browse10/2019/en#/${activeSelectedEntity.umlsMapping.icd10}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-900 border border-emerald-100 transition-colors"
+                    className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-900 border border-emerald-100 transition-colors"
                     title="ICD-10 Code"
                     onClick={e => e.stopPropagation()}
                   >
@@ -801,18 +811,18 @@ export default function KnowledgeGraph({
 
             {(() => {
               const entityMentions = (mentions || []).filter(m => m.entityId === activeSelectedEntity?.id);
-              const supportedAttrMentions = entityMentions.filter(m => Boolean(m.supportedAttribute && m.textSpan?.text));
+              const supportedAttrMentions = entityMentions.filter(m => Boolean(getMentionAttributeName(m, entities) && m.textSpan?.text));
               if (supportedAttrMentions.length === 0) return null;
               return (
                 <div className="mt-2 pt-2 border-t border-slate-100 flex flex-wrap gap-1.5 items-center">
-                  <span className="text-[8px] font-bold text-slate-400 uppercase tracking-wider mr-1.5 font-mono">Supported Attributes:</span>
+                  <span className="text-2xs font-semibold text-slate-500 uppercase tracking-wider mr-1.5 font-sans">Supported Attributes:</span>
                   {supportedAttrMentions.map((m, idx) => (
                     <span
                       key={idx}
-                      className="inline-flex items-center text-[9px] font-mono font-bold px-2 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
-                      title={`Mention "${m.textSpan?.text}" grounds attribute "${m.supportedAttribute}"`}
+                      className="inline-flex items-center text-2xs font-mono font-semibold px-2 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
+                      title={`Mention "${m.textSpan?.text}" grounds attribute "${getMentionAttributeName(m, entities)}"`}
                     >
-                      <span className="text-violet-500 uppercase mr-1">{m.supportedAttribute}:</span>
+                      <span className="text-violet-500 uppercase mr-1">{getMentionAttributeName(m, entities)}:</span>
                       "{m.textSpan?.text}"
                     </span>
                   ))}
@@ -822,7 +832,7 @@ export default function KnowledgeGraph({
           </div>
           <button
             onClick={() => onSelectEntity(null)}
-            className="text-[10px] text-slate-400 hover:text-slate-600 font-medium cursor-pointer"
+            className="text-2xs text-slate-500 hover:text-slate-600 font-medium cursor-pointer"
           >
             Clear Selection
           </button>

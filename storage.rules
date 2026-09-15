@@ -1,0 +1,7 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Workspace objects are served only through the API after ownership checks.
+    match /{object=**} { allow read, write: if false; }
+  }
+}

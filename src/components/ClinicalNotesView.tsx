@@ -1,7 +1,22 @@
+import TemporalEditor from './TemporalEditor';
+import TrajectoryEditor from './TrajectoryEditor';
+import { trajectoryError } from '../utils/trajectory';
+import LegacyStatusReview from './LegacyStatusReview';
+import { resolveLegacyStatus } from '../utils/legacyStatusReview';
+import { observationStatusReview } from '../utils/observationStatus';
+import { mentionRoleLabel, mentionContextLabel, setMentionEvidenceRole, summarizeEntityClaims, type MentionEvidenceRole } from '../utils/mentionContext';
+import { formatAttributeValue } from '../utils/attributeValues';
+import ProcedureReferenceEditor from './ProcedureReferenceEditor';
+import { temporalError } from '../utils/temporal';
+import type { TemporalValue } from '../utils/temporal';
 import React, { useState, useEffect, useRef } from 'react';
 import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
 import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers, Syringe, Users, ClipboardCheck, FileCode, HeartHandshake } from 'lucide-react';
+import { getMentionAttributeName, retargetMention, sameEvidenceTarget } from '../utils/evidence';
 import ExportJsonlModal from './ExportJsonlModal';
+
+const mentionFieldLabelClass = 'text-2xs font-semibold text-slate-500 uppercase font-sans';
+const mentionFieldSelectClass = 'w-full text-2xs font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-brand-400 cursor-pointer';
 
 interface ClinicalNotesViewProps {
   clinicalNotes?: ClinicalCategory;
@@ -17,10 +32,13 @@ interface ClinicalNotesViewProps {
   segments?: any[];
   annotationSchema?: AnnotationCategory[];
   encounterType?: 'dialogue' | 'note';
+  encounterTime?: TemporalValue | null;
 }
 
 export function getCategoryForEntity(ent: Entity, activeSchema: AnnotationCategory[]): AnnotationCategory | null {
   if (!ent || !ent.type) return null;
+  const explicitCategory = activeSchema.find(category => category.id === ent.categoryId);
+  if (explicitCategory) return explicitCategory;
   const typeLower = (ent.type || '').toLowerCase().trim();
   const nameLower = (ent.name || '').toLowerCase().trim();
 
@@ -97,7 +115,7 @@ function isSupportEntity(ent: Entity, activeSchema: AnnotationCategory[]): boole
 }
 
 // Retrieves an attribute value from a clinical note item safely,
-// resolving case differences, trimming, and checking clinical aliases (e.g. status <-> clinicalStatus).
+// resolving case differences and equivalent field names, never conflating different status roles.
 export function getResolvedAttributeValue(item: Record<string, any>, attr: AnnotationAttribute): any {
   if (!item || !attr) return undefined;
 
@@ -114,11 +132,14 @@ export function getResolvedAttributeValue(item: Record<string, any>, attr: Annot
     return item[keyMatch];
   }
 
+  // Temporal roles are not interchangeable: duration must never fill onset.
+  if (attr.type === 'temporal' || attr.type === 'trajectory' || attr.type === 'procedure-reference') return null;
+
   // 3. Clinical alias lookup
   const aliasMap: Record<string, string[]> = {
-    clinicalstatus: ['status', 'clinical_status', 'conditionstatus', 'clinicalStatus', 'verificationstatus', 'state'],
-    status: ['clinicalstatus', 'clinicalStatus', 'clinical_status', 'verificationstatus', 'state'],
-    verificationstatus: ['verification_status', 'status', 'clinicalstatus', 'clinicalStatus'],
+    clinicalstatus: ['clinical_status', 'conditionstatus'],
+    status: [],
+    verificationstatus: ['verification_status'],
     severity: ['intensity', 'grade'],
     details: ['description', 'notes', 'comment', 'note'],
     description: ['details', 'notes', 'comment', 'note'],
@@ -191,7 +212,8 @@ export default function ClinicalNotesView({
   isReadOnly = false,
   segments = [],
   annotationSchema,
-  encounterType = 'dialogue'
+  encounterType = 'dialogue',
+  encounterTime
 }: ClinicalNotesViewProps) {
   const activeSchema = React.useMemo(() => {
     const base = annotationSchema && annotationSchema.length > 0 ? annotationSchema : DEFAULT_ANNOTATION_SCHEMA;
@@ -205,156 +227,68 @@ export default function ClinicalNotesView({
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showExportJsonlModal, setShowExportJsonlModal] = useState(false);
 
+  const renderAttributeEvidence = (entityId: string) => {
+    const entity = entities.find(e => e.id === entityId);
+    const linkedAttributes = (entity?.attributes || []).map(attribute => ({
+      ...attribute,
+      evidence: mentions.filter(m => m.target?.kind === 'attribute' && m.target.attributeId === attribute.id)
+    })).filter(attribute => attribute.evidence.length > 0);
+    if (!linkedAttributes.length) return null;
+    return <div className="mt-2 border-t border-violet-100 pt-2 space-y-2" data-testid={`attribute-evidence-${entityId}`}>
+      <p className="text-2xs font-semibold text-violet-700">Attribute evidence</p>
+      {linkedAttributes.map(attribute => <div key={attribute.id} className="text-xs">
+        <span className="font-semibold">{attribute.name}: </span>
+        <span>{formatAttributeValue(attribute.value, entities)}</span>
+        <div className="flex flex-wrap gap-1 mt-1">
+          {attribute.evidence.map(mention => <button key={mention.id} type="button"
+            className="px-2 py-1 rounded border border-violet-200 text-violet-800 bg-violet-50 cursor-pointer"
+            onClick={event => { event.stopPropagation(); onSelectEntity(entityId); onSelectMention?.(mention.id); }}>
+            “{mention.textSpan.text}”
+          </button>)}
+        </div>
+      </div>)}
+    </div>;
+  };
+
   const renderEntityConflictsAndSummary = (entityId: string) => {
-    const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
-    if (entityMentions.length === 0) return null;
-
-    // 1. Gather all functions
-    const functions = entityMentions.map(m => m.function || 'asserted');
-    const funcCounts: { [key: string]: number } = {};
-    functions.forEach(f => { funcCounts[f] = (funcCounts[f] || 0) + 1; });
-    const funcSummary = Object.entries(funcCounts)
-      .map(([f, count]) => `${count} ${f === 'explanatory' ? 'general/explanatory' : f}`)
-      .join(', ');
-
-    // Filter mentions for entity summary calculation to only asserted patient-specific mentions
-    const summaryMentions = entityMentions.filter(m => {
-      const isAsserted = (m.function || 'asserted') === 'asserted';
-      const isPatientSpecific = (m.experiencer || 'patient') === 'patient';
-      return isAsserted && isPatientSpecific;
-    });
-
-    // 2. Gather temporalities (calculated only from summaryMentions)
-    const temporalities = summaryMentions.map(m => m.temporality || 'current');
-    const tempCounts: { [key: string]: number } = {};
-    temporalities.forEach(t => { tempCounts[t] = (tempCounts[t] || 0) + 1; });
-    const hasTempConflict = Object.keys(tempCounts).length > 1;
-    const tempSummary = Object.entries(tempCounts)
-      .map(([t, count]) => `${count} ${t}`)
-      .join(', ');
-
-    // 3. Gather polarities (calculated only from summaryMentions)
-    const polarities = summaryMentions.map(m => m.polarity || 'positive');
-    const polCounts: { [key: string]: number } = {};
-    polarities.forEach(p => { polCounts[p] = (polCounts[p] || 0) + 1; });
-    const hasPolConflict = Object.keys(polCounts).length > 1;
-    const polSummary = Object.entries(polCounts)
-      .map(([p, count]) => `${count} ${p}`)
-      .join(', ');
-
-    // Determine effective polarity with fallback to all entity mentions
-    let effectivePolarity = polarities[0];
-    if (!effectivePolarity) {
-      if (entityMentions.some(m => m.polarity === 'negative')) {
-        effectivePolarity = 'negative';
-      } else if (entityMentions.some(m => m.function === 'questioned')) {
-        effectivePolarity = 'unconfirmed';
-      } else {
-        effectivePolarity = 'positive';
-      }
-    }
-
-    // 4. Gather certainties (calculated only from summaryMentions)
-    const certainties = summaryMentions.map(m => m.certainty || 'certain');
-    const certCounts: { [key: string]: number } = {};
-    certainties.forEach(c => { certCounts[c] = (certCounts[c] || 0) + 1; });
-    const hasCertConflict = Object.keys(certCounts).length > 1;
-    const certSummary = Object.entries(certCounts)
-      .map(([c, count]) => `${count} ${c}`)
-      .join(', ');
-
-    const hasAnyConflict = hasTempConflict || hasPolConflict || hasCertConflict;
-
+    const summary = summarizeEntityClaims(mentions || [], entityId);
+    if (!summary.directCount) return null;
+    const fields = [['Temporality', summary.temporality], ['Polarity', summary.polarity], ['Certainty', summary.certainty]] as const;
     return (
-      <div className="mt-2 p-2 bg-slate-50 border border-slate-200 rounded-lg text-[10px] space-y-1">
-        <div className="flex items-center justify-between font-medium text-slate-500">
-          <div className="flex items-center gap-1 flex-wrap">
-            <span className="font-bold text-indigo-600 font-mono">{entityMentions.length} mentions</span>
-            <span>·</span>
-            <span className="text-slate-600">{funcSummary}</span>
+      <div data-testid={`entity-claim-summary-${entityId}`} className="mt-2 p-2 bg-slate-50 border border-slate-200 rounded-lg text-2xs space-y-1">
+        <p className="font-semibold">Direct entity evidence only</p>
+        <p>{summary.referenceCount} name/reference · {summary.claimCount} asserted patient claims · {summary.unassignedCount} role unassigned</p>
+        {summary.unassignedCount > 0 && <p className="text-amber-700">Unassigned roles are excluded from claim summaries. Existing context labels are retained for review.</p>}
+        {summary.claimCount === 0 ? <p className="text-slate-500">No asserted patient-specific entity claims. Attribute evidence does not assert the whole entity.</p> : (
+          <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-1">
+            {fields.map(([label, field]) => <span key={label} className={field.conflict ? 'text-amber-700' : 'text-slate-600'}>
+              {label}: {field.text}{field.conflict && ' (differing claims)'}
+            </span>)}
           </div>
-          {hasAnyConflict && (
-            <span className="text-[9px] bg-amber-50 text-amber-700 font-bold px-1.5 py-0.5 rounded flex items-center gap-1 border border-amber-200">
-              <span className="w-1 h-1 rounded-full bg-amber-500 animate-ping"></span>
-              Conflict detected
-            </span>
-          )}
-        </div>
-        
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 text-slate-400 font-mono text-[9px] pt-1 border-t border-slate-100">
-          <div>
-            <span className="text-slate-500 font-semibold">Temporality:</span>{' '}
-            <span className={hasTempConflict ? 'text-amber-600 font-bold' : 'text-slate-600'}>
-              {hasTempConflict ? tempSummary : (temporalities[0] || 'current')}
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-500 font-semibold">Polarity:</span>{' '}
-            <span className={
-              hasPolConflict 
-                ? 'text-rose-600 font-bold' 
-                : (effectivePolarity === 'negative' 
-                    ? 'text-rose-600 font-bold' 
-                    : (effectivePolarity === 'unconfirmed' 
-                        ? 'text-amber-600 font-semibold' 
-                        : 'text-slate-600'))
-            }>
-              {hasPolConflict ? polSummary : (effectivePolarity === 'negative' ? 'negative (denied)' : effectivePolarity)}
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-500 font-semibold">Certainty:</span>{' '}
-            <span className={hasCertConflict ? 'text-purple-600 font-bold' : 'text-slate-600'}>
-              {hasCertConflict ? certSummary : (certainties[0] || 'certain')}
-            </span>
-          </div>
-        </div>
-
-        {(() => {
-          const supportedAttrMentions = entityMentions.filter(m => Boolean(m.supportedAttribute && m.textSpan?.text));
-          if (supportedAttrMentions.length === 0) return null;
-          return (
-            <div className="flex items-center gap-1.5 pt-1 border-t border-slate-100 flex-wrap">
-              <span className="text-slate-500 font-semibold font-mono text-[9px]">Supported Attributes:</span>
-              {supportedAttrMentions.map((m, idx) => (
-                <span key={idx} className="bg-violet-50 text-violet-700 font-bold px-1.5 py-0.2 rounded border border-violet-200 font-mono text-[9px]" title={`Mention "${m.textSpan?.text}" supports attribute ${m.supportedAttribute}`}>
-                  <span className="text-violet-500 mr-1 uppercase">{m.supportedAttribute}:</span>
-                  "{m.textSpan?.text}"
-                </span>
-              ))}
-            </div>
-          );
-        })()}
+        )}
       </div>
     );
   };
 
   const renderMentionsSubWindow = (entityId: string) => {
     const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
-    
+
     if (entityMentions.length === 0) {
       return (
-        <div className="mt-3 pt-3 border-t border-slate-100 text-[11px] text-slate-400 italic">
+        <div className="mt-3 pt-3 border-t border-slate-100 text-2xs text-slate-500 italic">
           No explicit dialogue or document mentions mapped.
         </div>
       );
     }
 
     const parentEntity = entities.find(e => e.id === entityId);
-    const parentCategory = activeSchema.find(c => c.id === parentEntity?.type || c.entityType.toLowerCase() === parentEntity?.type?.toLowerCase());
-    const categoryAttributes = parentCategory?.attributes?.map(a => a.name) || [];
-    const allSuggestedAttributes = Array.from(new Set([
-      ...categoryAttributes,
-      'value', 'severity', 'dosage', 'status', 'onset', 'frequency', 'details'
-    ]));
-
     return (
       <div className="mt-3 pt-3 border-t border-slate-100 space-y-3 animate-fadeIn">
-        <div className="text-[10px] font-bold text-slate-400 uppercase font-mono tracking-wider flex items-center justify-between">
-          <span>Mentions ({entityMentions.length})</span>
-          <span className="text-[9px] text-indigo-500 font-medium">Click a mention card to trace in transcript</span>
+        <div className="text-2xs font-semibold text-slate-500 uppercase font-sans tracking-wider flex items-center justify-between">
+          <span>Entity and attribute evidence ({entityMentions.length})</span>
+          <span className="text-2xs text-brand-500 font-medium">Click a mention card to trace in transcript</span>
         </div>
-        
+
         <div className="space-y-2.5">
           {entityMentions.map((mention, mIdx) => {
             const isMentionSelected = selectedMentionId === mention.id;
@@ -380,14 +314,11 @@ export default function ClinicalNotesView({
             const isExceptionTemporality = mention.temporality && mention.temporality !== 'current';
             const isExceptionExperiencer = mention.experiencer && mention.experiencer !== 'patient';
 
-            const handleAttributeChange = (field: 'speaker' | 'polarity' | 'certainty' | 'temporality' | 'experiencer' | 'function' | 'supportedAttribute', value: string) => {
+            const handleAttributeChange = (field: 'speaker' | 'polarity' | 'certainty' | 'temporality' | 'experiencer' | 'function' | 'evidenceRole', value: string) => {
               if (isReadOnly) return;
               const updatedMentions = (mentions || []).map(m => {
                 if (m.id === mention.id) {
-                  if (field === 'supportedAttribute') {
-                    const trimmed = value.trim();
-                    return { ...m, supportedAttribute: trimmed ? trimmed : undefined };
-                  }
+                  if (field === 'evidenceRole') return setMentionEvidenceRole(m, value as MentionEvidenceRole);
                   return { ...m, [field]: value };
                 }
                 return m;
@@ -422,9 +353,9 @@ export default function ClinicalNotesView({
               <div
                 key={mention.id || mIdx}
                 id={`mention-card-${mention.id}`}
-                className={`border rounded-lg p-2.5 space-y-2 transition-all duration-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/10 group ${
+                className={`border rounded-lg p-2.5 space-y-2 transition-all duration-200 cursor-pointer hover:border-brand-300 hover:bg-brand-50/10 group ${
                   isMentionSelected
-                    ? 'bg-indigo-50/80 border-indigo-500 ring-2 ring-indigo-100 shadow-sm'
+                    ? 'bg-brand-50/80 border-brand-500 ring-2 ring-brand-100 shadow-sm'
                     : 'bg-slate-50/80 border-slate-150'
                 }`}
                 onClick={(e) => {
@@ -437,10 +368,10 @@ export default function ClinicalNotesView({
                 {isMentionSelected ? (
                   <>
                     {/* Header with segment reference and Delete action */}
-                    <div className="flex items-center justify-between text-[10px] gap-2">
+                    <div className="flex items-center justify-between text-2xs gap-2">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span className="font-mono text-slate-500 bg-slate-200/60 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
-                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                          <span className="w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse"></span>
                           {encounterType === 'note' ? `Section ${resolvedLineIndex + 1}` : `Segment U-${resolvedLineIndex}`}
                         </span>
                         <span className="font-semibold italic text-slate-700 truncate" title={mention.textSpan.text}>
@@ -451,7 +382,7 @@ export default function ClinicalNotesView({
                         <button
                           type="button"
                           onClick={handleDeleteThisMention}
-                          className="flex items-center gap-1 text-[9px] font-semibold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200/80 px-2 py-0.5 rounded transition-all cursor-pointer shrink-0"
+                          className="flex items-center gap-1 text-2xs font-semibold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200/80 px-2 py-0.5 rounded transition-all cursor-pointer shrink-0"
                           title="Delete this specific mention highlight (retains parent entity)"
                         >
                           <Trash2 className="w-3 h-3 text-rose-500" />
@@ -462,9 +393,9 @@ export default function ClinicalNotesView({
 
                     {/* Speaker Info Bar (Static by default, editable on secondary action) */}
                     {encounterType !== 'note' && (
-                      <div className="flex items-center justify-between text-[10px] bg-slate-100/80 px-2 py-1 rounded-md" onClick={e => e.stopPropagation()}>
+                      <div className="flex items-center justify-between text-2xs bg-slate-100/80 px-2 py-1 rounded-md" onClick={e => e.stopPropagation()}>
                         <div className="flex items-center gap-1.5 text-slate-600">
-                          <span className="font-semibold uppercase tracking-wider text-[8px] text-slate-400 font-mono">Speaker:</span>
+                          <span className="font-semibold uppercase tracking-wider text-2xs text-slate-500 font-sans">Speaker:</span>
                           {isCorrectingSpeaker ? (
                             <select
                               value={(mention.speaker || derivedSpeaker || 'unassigned').toLowerCase()}
@@ -472,7 +403,7 @@ export default function ClinicalNotesView({
                                 handleAttributeChange('speaker', e.target.value);
                                 setCorrectingSpeakerMentionId(null);
                               }}
-                              className="text-[9px] font-bold bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                              className="text-2xs font-semibold bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-800 focus:outline-none focus:ring-1 focus:ring-brand-400"
                             >
                               <option value="unassigned">Unassigned</option>
                               <option value="patient">Patient (derived)</option>
@@ -481,10 +412,10 @@ export default function ClinicalNotesView({
                               <option value="other">Other</option>
                             </select>
                           ) : (
-                            <span className="font-bold text-slate-800 capitalize flex items-center gap-1">
+                            <span className="font-semibold text-slate-800 capitalize flex items-center gap-1">
                               {speakerDisplay}
                               {isSpeakerCorrected && (
-                                <span className="text-[8px] text-indigo-500 font-medium normal-case bg-indigo-50 px-1 py-0.2 rounded font-mono">
+                                <span className="text-2xs text-brand-500 font-medium normal-case bg-brand-50 px-1 py-0.2 rounded font-mono">
                                   (corrected)
                                 </span>
                               )}
@@ -498,7 +429,7 @@ export default function ClinicalNotesView({
                                 e.stopPropagation();
                                 setCorrectingSpeakerMentionId(mention.id);
                               }}
-                              className="text-[9px] text-indigo-600 hover:text-indigo-800 font-semibold underline cursor-pointer"
+                              className="text-2xs text-brand-600 hover:text-brand-800 font-semibold underline cursor-pointer"
                             >
                               Correct Speaker
                             </button>
@@ -509,7 +440,7 @@ export default function ClinicalNotesView({
                                 e.stopPropagation();
                                 handleResetSpeaker();
                               }}
-                              className="text-[9px] text-rose-500 hover:text-rose-700 font-semibold underline cursor-pointer"
+                              className="text-2xs text-rose-500 hover:text-rose-700 font-semibold underline cursor-pointer"
                             >
                               Reset
                             </button>
@@ -518,18 +449,44 @@ export default function ClinicalNotesView({
                       </div>
                     )}
 
+                    <div className="rounded-md border border-brand-100 bg-white p-2 space-y-1" onClick={e => e.stopPropagation()}>
+                      <label className="flex flex-col gap-0.5">
+                        <span className={mentionFieldLabelClass}>Evidence role</span>
+                        <select aria-label={`Evidence role for ${mention.textSpan.text}`}
+                          value={mention.evidenceRole || 'unassigned'} disabled={isReadOnly}
+                          onChange={event => handleAttributeChange('evidenceRole', event.target.value)}
+                          className={`${mentionFieldSelectClass} ${
+                            !mention.evidenceRole || mention.evidenceRole === 'unassigned'
+                              ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
+                              : 'border-slate-200 text-slate-700'
+                          }`}>
+                          <option value="unassigned">Unassigned — not yet annotated</option>
+                          <option value="reference">Name / reference — identifies what is discussed</option>
+                          <option value="claim">Claim evidence — supports a statement or assessment</option>
+                        </select>
+                      </label>
+                      <p className="text-2xs text-slate-500">
+                        {mention.evidenceRole === 'reference'
+                          ? 'This span identifies a referent, not a finding. Defaults: neutral polarity and not-applicable temporality/claim certainty. Function may describe the surrounding question without making the name itself future or asserting a result.'
+                          : mention.evidenceRole === 'claim'
+                          ? 'Certainty describes the speaker’s commitment to this claim, not annotation confidence. An uncertain assessment can still be asserted. Context applies only to the evidence target below.'
+                          : 'Choose the role explicitly. Existing labels are retained; an unassigned role is not treated as a clinical assertion.'}
+                      </p>
+                    </div>
+
                     {/* Responsive attributes layout - wraps cleanly on narrow sidebars */}
                     <div className="flex flex-wrap gap-2" onClick={e => e.stopPropagation()}>
                       {/* Polarity */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
-                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Polarity</span>
+                        <span className={mentionFieldLabelClass}>Polarity</span>
                         <select
+                          aria-label={`Polarity for ${mention.textSpan.text}`}
                           value={(mention.polarity || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('polarity', e.target.value)}
-                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
-                            (mention.polarity || '').toLowerCase() === 'negative' 
-                              ? 'border-rose-200 text-rose-700 bg-rose-50/10 font-bold' 
+                          className={`${mentionFieldSelectClass} ${
+                            (mention.polarity || '').toLowerCase() === 'negative'
+                              ? 'border-rose-200 text-rose-700 bg-rose-50/10 font-semibold'
                               : (mention.polarity || '').toLowerCase() === 'unassigned' || !mention.polarity
                               ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
@@ -544,20 +501,22 @@ export default function ClinicalNotesView({
 
                       {/* Certainty */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
-                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Certainty</span>
+                        <span className={mentionFieldLabelClass}>Certainty</span>
                         <select
+                          aria-label={`Claim certainty for ${mention.textSpan.text}`}
                           value={(mention.certainty || 'unassigned').toLowerCase()}
-                          disabled={isReadOnly}
+                          disabled={isReadOnly || mention.evidenceRole === 'reference'}
                           onChange={(e) => handleAttributeChange('certainty', e.target.value)}
-                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                          className={`${mentionFieldSelectClass} ${
                             (mention.certainty || '').toLowerCase() === 'uncertain' || (mention.certainty || '').toLowerCase() === 'hypothetical'
-                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-bold' 
+                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-semibold'
                               : (mention.certainty || '').toLowerCase() === 'unassigned' || !mention.certainty
                               ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
                           <option value="unassigned">Unassigned</option>
+                          <option value="not_applicable">Not applicable — no certainty judgment</option>
                           <option value="certain">Certain</option>
                           <option value="uncertain">Uncertain</option>
                           <option value="hypothetical">Hypothetical</option>
@@ -566,20 +525,23 @@ export default function ClinicalNotesView({
 
                       {/* Temporality */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
-                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Temporality</span>
+                        <span className={mentionFieldLabelClass}>Temporality</span>
                         <select
+                          aria-label={`Temporality for ${mention.textSpan.text}`}
+                          title="Time of the supported claim, not the surrounding utterance. Not applicable means no clinical time applies; unassigned means not yet annotated."
                           value={(mention.temporality || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('temporality', e.target.value)}
-                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                          className={`${mentionFieldSelectClass} ${
                             (mention.temporality || '').toLowerCase() === 'past' || (mention.temporality || '').toLowerCase() === 'future'
-                              ? 'border-blue-200 text-blue-700 bg-blue-50/10 font-bold' 
+                              ? 'border-blue-200 text-blue-700 bg-blue-50/10 font-semibold'
                               : (mention.temporality || '').toLowerCase() === 'unassigned' || !mention.temporality
                               ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
                           <option value="unassigned">Unassigned</option>
+                          <option value="not_applicable">Not applicable — no claim time</option>
                           <option value="current">Current</option>
                           <option value="past">Past / History</option>
                           <option value="future">Future</option>
@@ -588,12 +550,13 @@ export default function ClinicalNotesView({
 
                       {/* Experiencer */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
-                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Experiencer</span>
+                        <span className={mentionFieldLabelClass}>Experiencer</span>
                         <select
+                          aria-label={`Experiencer for ${mention.textSpan.text}`}
                           value={(mention.experiencer || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('experiencer', e.target.value)}
-                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                          className={`${mentionFieldSelectClass} ${
                             (mention.experiencer || '').toLowerCase() === 'unassigned' || !mention.experiencer
                               ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
@@ -608,24 +571,26 @@ export default function ClinicalNotesView({
 
                       {/* Mention Function */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[110px]">
-                        <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Function</span>
+                        <span className={mentionFieldLabelClass}>Speech function</span>
                         <select
+                          aria-label={`Speech function for ${mention.textSpan.text}`}
                           value={(mention.function || 'unassigned').toLowerCase()}
                           disabled={isReadOnly}
                           onChange={(e) => handleAttributeChange('function', e.target.value)}
-                          className={`w-full text-[9px] font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 cursor-pointer ${
+                          className={`${mentionFieldSelectClass} ${
                             (mention.function || '').toLowerCase() === 'questioned'
-                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-bold'
+                              ? 'border-amber-200 text-amber-700 bg-amber-50/10 font-semibold'
                               : (mention.function || '').toLowerCase() === 'hypothetical'
-                              ? 'border-purple-200 text-purple-700 bg-purple-50/10 font-bold'
+                              ? 'border-purple-200 text-purple-700 bg-purple-50/10 font-semibold'
                               : (mention.function || '').toLowerCase() === 'explanatory'
-                              ? 'border-slate-350 text-slate-700 bg-slate-50/10 font-bold'
+                              ? 'border-slate-350 text-slate-700 bg-slate-50/10 font-semibold'
                               : (mention.function || '').toLowerCase() === 'unassigned' || !mention.function
                               ? 'border-dashed border-slate-300 text-slate-500 bg-slate-50/50 italic'
                               : 'border-slate-200 text-slate-700'
                           }`}
                         >
                           <option value="unassigned">Unassigned</option>
+                          <option value="not_applicable">Not applicable — no speech act to label</option>
                           <option value="asserted">Asserted</option>
                           <option value="questioned">Questioned</option>
                           <option value="hypothetical">Hypothetical</option>
@@ -633,79 +598,38 @@ export default function ClinicalNotesView({
                         </select>
                       </div>
 
-                      {/* Supported Entity Attribute (e.g. "value", "severity", "dosage") */}
                       <div className="flex flex-col gap-0.5 flex-1 min-w-[160px]">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[8px] font-bold text-slate-400 uppercase font-mono">Supported Attribute</span>
-                          {mention.supportedAttribute && !isReadOnly && (
-                            <button
-                              type="button"
-                              onClick={() => handleAttributeChange('supportedAttribute', '')}
-                              className="text-[8px] text-rose-500 hover:text-rose-700 font-semibold cursor-pointer"
-                              title="Clear supported attribute"
-                            >
-                              Clear
-                            </button>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <select
-                            value={allSuggestedAttributes.includes(mention.supportedAttribute || '') ? (mention.supportedAttribute || '') : (mention.supportedAttribute ? '__custom__' : '')}
-                            disabled={isReadOnly}
-                            onChange={(e) => {
-                              if (e.target.value === '__custom__') return;
-                              handleAttributeChange('supportedAttribute', e.target.value);
-                            }}
-                            className={`text-[9px] font-semibold bg-white border rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 flex-1 ${
-                              mention.supportedAttribute
-                                ? 'border-violet-300 text-violet-800 bg-violet-50/30 font-bold'
-                                : 'border-slate-200 text-slate-500'
-                            }`}
-                          >
-                            <option value="">-- None / Primary --</option>
-                            {allSuggestedAttributes.map(attr => (
-                              <option key={attr} value={attr}>
-                                attr: {attr.toUpperCase()}
-                              </option>
-                            ))}
-                            {mention.supportedAttribute && !allSuggestedAttributes.includes(mention.supportedAttribute) && (
-                              <option value="__custom__">Custom: {mention.supportedAttribute}</option>
-                            )}
-                          </select>
-                          <input
-                            type="text"
-                            value={mention.supportedAttribute || ''}
-                            disabled={isReadOnly}
-                            onChange={(e) => handleAttributeChange('supportedAttribute', e.target.value)}
-                            placeholder="or type attr..."
-                            className="w-20 text-[9px] font-semibold bg-white border border-slate-200 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 text-slate-700"
-                          />
-                        </div>
-                        <div className="flex flex-wrap gap-0.5 mt-0.5">
-                          {['value', 'severity', 'dosage', 'status'].map(attr => (
-                            <button
-                              key={attr}
-                              type="button"
-                              disabled={isReadOnly}
-                              onClick={() => handleAttributeChange('supportedAttribute', attr)}
-                              className={`text-[7.5px] px-1 py-0.2 rounded font-mono border transition-colors cursor-pointer ${
-                                mention.supportedAttribute === attr
-                                  ? 'bg-violet-600 text-white border-violet-600 font-bold'
-                                  : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
-                              }`}
-                            >
-                              {attr}
-                            </button>
+                        <span className={mentionFieldLabelClass}>Evidence target</span>
+                        <select
+                          aria-label={`Evidence target for ${mention.textSpan.text}`}
+                          value={mention.target?.kind === 'attribute' ? mention.target.attributeId : '__entity__'}
+                          disabled={isReadOnly}
+                          onChange={event => {
+                            const target = event.target.value === '__entity__'
+                              ? { kind: 'entity' as const, entityId }
+                              : { kind: 'attribute' as const, entityId, attributeId: event.target.value };
+                            onUpdateNotes(clinicalNotes, entities, relations,
+                              mentions.map(m => m.id === mention.id ? retargetMention(m, target) : m));
+                          }}
+                          className={`${mentionFieldSelectClass} border-slate-200 text-slate-700`}
+                        >
+                          <option value="__entity__">Entity itself</option>
+                          {(parentEntity?.attributes || []).map(attribute => (
+                            <option key={attribute.id} value={attribute.id}>
+                              {attribute.name}: {formatAttributeValue(attribute.value, entities)}
+                            </option>
                           ))}
-                        </div>
+                        </select>
                       </div>
                     </div>
 
                     {/* Apply to All Mentions Action */}
                     <div className="flex justify-end pt-1" onClick={e => e.stopPropagation()}>
                       <button
+                        disabled={isReadOnly || !mention.evidenceRole || mention.evidenceRole === 'unassigned'}
                         onClick={(e) => {
                           e.stopPropagation();
+                          if (isReadOnly || !mention.evidenceRole || mention.evidenceRole === 'unassigned') return;
                           const currentPolarity = mention.polarity || 'unassigned';
                           const currentCertainty = mention.certainty || 'unassigned';
                           const currentTemporality = mention.temporality || 'unassigned';
@@ -714,7 +638,7 @@ export default function ClinicalNotesView({
                           const currentSpeaker = mention.speaker;
 
                           const updatedMentions = (mentions || []).map(m => {
-                            if (m.entityId === mention.entityId) {
+                            if (sameEvidenceTarget(m, mention) && m.evidenceRole === mention.evidenceRole) {
                               return {
                                 ...m,
                                 polarity: currentPolarity,
@@ -729,10 +653,10 @@ export default function ClinicalNotesView({
                           });
                           onUpdateNotes(clinicalNotes, entities, relations, updatedMentions);
                         }}
-                        className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition-colors cursor-pointer"
+                        className="flex items-center gap-1 text-2xs font-semibold text-brand-600 bg-brand-50 hover:bg-brand-100 px-2 py-1 rounded transition-colors cursor-pointer"
                       >
                         <Layers className="w-2.5 h-2.5" />
-                        Apply these attributes to all {entityMentions.length} mentions
+                        Apply context to the same target and role
                       </button>
                     </div>
                   </>
@@ -740,24 +664,25 @@ export default function ClinicalNotesView({
                   /* Collapsed Card view */
                   <div className="flex items-center justify-between text-xs py-1">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded-md font-semibold text-[9px]">
+                      <span className="font-mono text-brand-600 bg-brand-50 px-1.5 py-0.5 rounded-md font-semibold text-2xs">
                         U-{resolvedLineIndex}
                       </span>
-                      <span className="text-slate-400 font-medium font-sans select-none">·</span>
-                      <span className="text-slate-700 font-bold capitalize text-[10px]">{speakerDisplay}</span>
-                      <span className="text-slate-400 font-medium font-sans select-none">·</span>
-                      <span className={`font-bold capitalize text-[10px] px-1 py-0.2 rounded ${
+                      <span className="text-slate-500 font-medium font-sans select-none">·</span>
+                      <span className="text-slate-700 font-semibold capitalize text-2xs">{speakerDisplay}</span>
+                      <span className="text-2xs text-brand-700 bg-brand-50 px-1 rounded">{mentionRoleLabel(mention.evidenceRole)}</span>
+                      <span className="text-slate-500 font-medium font-sans select-none">·</span>
+                      <span className={`font-semibold capitalize text-2xs px-1 py-0.2 rounded ${
                         functionDisplay === 'questioned' ? 'text-amber-600 bg-amber-50' :
                         functionDisplay === 'hypothetical' ? 'text-purple-600 bg-purple-50' :
-                        functionDisplay === 'explanatory' ? 'text-slate-600 bg-slate-100 font-medium' :
+                        ['explanatory', 'not_applicable'].includes(functionDisplay) ? 'text-slate-600 bg-slate-100 font-medium' :
                         functionDisplay === 'unassigned' ? 'text-slate-500 bg-slate-100 font-medium italic border border-dashed border-slate-300' :
                         'text-emerald-600 bg-emerald-50'
                       }`}>
-                        {functionDisplay === 'explanatory' ? 'General/explanatory' : functionDisplay}
+                        Function: {mentionContextLabel(functionDisplay)}
                       </span>
                       {/* Exception Badges */}
                       {isExceptionPolarity && (
-                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                        <span className={`text-2xs font-semibold px-1 py-0.2 rounded uppercase border ${
                           mention.polarity === 'negative'
                             ? 'bg-rose-50 text-rose-600 border-rose-100'
                             : mention.polarity === 'unassigned'
@@ -768,29 +693,29 @@ export default function ClinicalNotesView({
                         </span>
                       )}
                       {isExceptionCertainty && (
-                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                        <span className={`text-2xs font-semibold px-1 py-0.2 rounded uppercase border ${
                           mention.certainty === 'uncertain' || mention.certainty === 'hypothetical'
                             ? 'bg-amber-50 text-amber-600 border-amber-100'
                             : mention.certainty === 'unassigned'
                             ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
                             : 'bg-slate-100 text-slate-600 border-slate-200'
                         }`}>
-                          {mention.certainty}
+                          Certainty: {mentionContextLabel(mention.certainty)}
                         </span>
                       )}
                       {isExceptionTemporality && (
-                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                        <span className={`text-2xs font-semibold px-1 py-0.2 rounded uppercase border ${
                           mention.temporality === 'past' || mention.temporality === 'future'
                             ? 'bg-blue-50 text-blue-600 border-blue-100'
                             : mention.temporality === 'unassigned'
                             ? 'bg-slate-50 text-slate-500 border-dashed border-slate-300 italic'
                             : 'bg-slate-100 text-slate-600 border-slate-200'
                         }`}>
-                          {mention.temporality}
+                          Temporality: {mentionContextLabel(mention.temporality)}
                         </span>
                       )}
                       {isExceptionExperiencer && (
-                        <span className={`text-[8px] font-bold px-1 py-0.2 rounded uppercase border ${
+                        <span className={`text-2xs font-semibold px-1 py-0.2 rounded uppercase border ${
                           mention.experiencer === 'other'
                             ? 'bg-orange-50 text-orange-600 border-orange-100'
                             : mention.experiencer === 'unassigned'
@@ -800,21 +725,21 @@ export default function ClinicalNotesView({
                           {mention.experiencer === 'other' ? 'Other Experiencer' : mention.experiencer}
                         </span>
                       )}
-                      {mention.supportedAttribute && (
-                        <span className="text-[8px] font-bold px-1.5 py-0.2 rounded font-mono bg-violet-50 text-violet-700 border border-violet-200" title={`Supported Entity Attribute: ${mention.supportedAttribute}`}>
-                          attr: {mention.supportedAttribute}
+                      {getMentionAttributeName(mention, entities) && (
+                        <span className="text-2xs font-semibold px-1.5 py-0.2 rounded font-mono bg-violet-50 text-violet-700 border border-violet-200" title={`Supported Entity Attribute: ${getMentionAttributeName(mention, entities)}`}>
+                          attr: {getMentionAttributeName(mention, entities)}
                         </span>
                       )}
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
-                      <span className="text-[10px] text-slate-500 italic max-w-[140px] truncate select-none block" title={mention.textSpan.text}>
+                      <span className="text-2xs text-slate-500 italic max-w-[140px] truncate select-none block" title={mention.textSpan.text}>
                         "{mention.textSpan.text}"
                       </span>
                       {!isReadOnly && (
                         <button
                           type="button"
                           onClick={handleDeleteThisMention}
-                          className="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-all cursor-pointer"
+                          className="opacity-0 group-hover:opacity-100 p-1 text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded transition-all cursor-pointer"
                           title="Delete this mention (keeps entity)"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -916,19 +841,13 @@ export default function ClinicalNotesView({
               } else if (attr.name === 'details') {
                 newItem[attr.name] = ent.description || '';
               } else if (attr.type === 'select') {
-                const entMentions = mentions.filter(m => m.entityId === ent.id);
-                const hasNegative = entMentions.some(m => m.polarity === 'negative');
-                if (hasNegative && (attr.name === 'status' || attr.name === 'verificationStatus')) {
-                  const refutedChoice = (attr.choices || []).find(c => c.toLowerCase() === 'refuted');
-                  newItem[attr.name] = refutedChoice || (attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'refuted');
-                } else if (hasNegative && attr.name === 'severity') {
-                  const deniedChoice = (attr.choices || []).find(c => /none|denied/i.test(c));
-                  newItem[attr.name] = deniedChoice || 'Unspecified';
-                } else {
-                  newItem[attr.name] = attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'Unspecified';
-                }
+                // Defaults are not clinical conclusions; preserve known values without inferring from negation.
+                newItem[attr.name] = ent.attributes?.find(a => a.name === attr.name)?.value
+                  ?? attr.choices?.[0] ?? 'Unassigned';
               } else if (attr.type === 'boolean') {
                 newItem[attr.name] = false;
+              } else if (attr.type === 'procedure-reference') {
+                newItem[attr.name] = ent.attributes?.find(a => a.name === attr.name)?.value ?? null;
               } else {
                 newItem[attr.name] = '';
               }
@@ -985,6 +904,9 @@ export default function ClinicalNotesView({
 
   // Local Form States
   const [activeForm, setActiveForm] = useState<Record<string, any>>({});
+  const structuredFormInvalid = activeSchema.find(cat => cat.id === editingIndex?.category)?.attributes.some(attr =>
+    attr.type === 'trajectory' ? trajectoryError(activeForm[attr.name]) :
+    attr.type === 'temporal' && typeof activeForm[attr.name] !== 'string' && temporalError(activeForm[attr.name] ?? null));
   const [supportForm, setSupportForm] = useState<Partial<Entity>>({});
 
   const itemRefs = React.useRef<{ [key: string]: HTMLDivElement | null }>({});
@@ -1035,7 +957,7 @@ export default function ClinicalNotesView({
     setUmlsSearchResults([]);
 
     try {
-      const response = await fetch('/api/umls/search', {
+      const response = await apiFetch('/api/umls/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: umlsSearchQuery })
@@ -1066,7 +988,7 @@ export default function ClinicalNotesView({
   const handleSelectSearchResult = async (result: { cui: string; name: string }) => {
     setFetchCodesLoading(true);
     setUmlsEditError('');
-    
+
     // Set CUI and Preferred Name immediately
     setCustomUmlsMapping(prev => ({
       ...prev,
@@ -1079,7 +1001,7 @@ export default function ClinicalNotesView({
     }));
 
     try {
-      const response = await fetch('/api/umls/concept-codes', {
+      const response = await apiFetch('/api/umls/concept-codes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cui: result.cui })
@@ -1129,7 +1051,7 @@ export default function ClinicalNotesView({
     });
 
     onUpdateNotes(clinicalNotes, updatedEntities, relations);
-    
+
     // Update mappingState to 'success'
     setMappingStates(prev => ({ ...prev, [activeUmlsEditEntityId]: 'success' }));
     setActiveUmlsEditEntityId(null);
@@ -1147,7 +1069,7 @@ export default function ClinicalNotesView({
     });
 
     onUpdateNotes(clinicalNotes, updatedEntities, relations);
-    
+
     // Clear mapping state
     setMappingStates(prev => {
       const copy = { ...prev };
@@ -1161,7 +1083,7 @@ export default function ClinicalNotesView({
     setMappingStates(prev => ({ ...prev, [entityId]: 'loading' }));
 
     try {
-      const response = await fetch('/api/umls/map', {
+      const response = await apiFetch('/api/umls/map', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, type })
@@ -1202,7 +1124,7 @@ export default function ClinicalNotesView({
     } catch (err: any) {
       console.error(`Error mapping ${name}:`, err);
       setMappingStates(prev => ({ ...prev, [entityId]: 'error' }));
-      
+
       // Save error status on entity
       const updatedEntities = entities.map(ent => {
         if (ent.id === entityId) {
@@ -1242,7 +1164,7 @@ export default function ClinicalNotesView({
       setMappingStates(prev => ({ ...prev, [ent.id]: 'loading' }));
 
       try {
-        const response = await fetch('/api/umls/map', {
+        const response = await apiFetch('/api/umls/map', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: ent.name, type: ent.type })
@@ -1288,7 +1210,7 @@ export default function ClinicalNotesView({
 
     if (state === 'loading' || (mapping && mapping.loading)) {
       return (
-        <div className="flex items-center gap-1.5 mt-2 text-[10px] text-slate-400 font-mono">
+        <div className="flex items-center gap-1.5 mt-2 text-2xs text-slate-500 font-mono">
           <span className="w-2.5 h-2.5 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin"></span>
           <span>Connecting UMLS...</span>
         </div>
@@ -1303,7 +1225,7 @@ export default function ClinicalNotesView({
               e.stopPropagation();
               handleMapEntity(entityId, name, type);
             }}
-            className="flex items-center gap-1 text-[9px] font-semibold text-blue-600 hover:text-blue-700 hover:bg-blue-50 border border-blue-100 px-2 py-0.5 rounded transition-all cursor-pointer bg-white"
+            className="flex items-center gap-1 text-2xs font-semibold text-blue-600 hover:text-blue-700 hover:bg-blue-50 border border-blue-100 px-2 py-0.5 rounded transition-all cursor-pointer bg-white"
           >
             <Link2 className="w-2.5 h-2.5" />
             <span>Map UMLS</span>
@@ -1313,7 +1235,7 @@ export default function ClinicalNotesView({
               e.stopPropagation();
               handleOpenUmlsEdit(entityId);
             }}
-            className="flex items-center gap-1 text-[9px] font-semibold text-slate-500 hover:text-slate-700 hover:bg-slate-50 border border-slate-200 px-1.5 py-0.5 rounded transition-all cursor-pointer bg-white"
+            className="flex items-center gap-1 text-2xs font-semibold text-slate-500 hover:text-slate-700 hover:bg-slate-50 border border-slate-200 px-1.5 py-0.5 rounded transition-all cursor-pointer bg-white"
             title="Search or define UMLS codes manually"
           >
             <Search className="w-2.5 h-2.5" />
@@ -1326,7 +1248,7 @@ export default function ClinicalNotesView({
     if (mapping.error) {
       return (
         <div className="flex flex-col gap-1.5 mt-2">
-          <div className="flex items-center justify-between gap-2 p-1.5 bg-rose-50 border border-rose-100 rounded text-[9px] text-rose-600 font-medium">
+          <div className="flex items-center justify-between gap-2 p-1.5 bg-rose-50 border border-rose-100 rounded text-2xs text-rose-600 font-medium">
             <div className="flex items-center gap-1 truncate">
               <ShieldAlert className="w-3.5 h-3.5 shrink-0 text-rose-500" />
               <span className="truncate">{mapping.error}</span>
@@ -1336,7 +1258,7 @@ export default function ClinicalNotesView({
                 e.stopPropagation();
                 handleMapEntity(entityId, name, type);
               }}
-              className="text-[9px] text-blue-600 hover:underline font-semibold shrink-0 cursor-pointer bg-transparent border-0"
+              className="text-2xs text-blue-600 hover:underline font-semibold shrink-0 cursor-pointer bg-transparent border-0"
             >
               Retry
             </button>
@@ -1347,7 +1269,7 @@ export default function ClinicalNotesView({
                 e.stopPropagation();
                 handleOpenUmlsEdit(entityId);
               }}
-              className="flex items-center gap-1 text-[9px] font-semibold text-slate-500 hover:text-slate-700 hover:bg-slate-50 border border-slate-200 px-2 py-0.5 rounded transition-all cursor-pointer bg-white"
+              className="flex items-center gap-1 text-2xs font-semibold text-slate-500 hover:text-slate-700 hover:bg-slate-50 border border-slate-200 px-2 py-0.5 rounded transition-all cursor-pointer bg-white"
             >
               <Search className="w-2.5 h-2.5" />
               <span>Search / Edit Manually</span>
@@ -1360,24 +1282,24 @@ export default function ClinicalNotesView({
     if (!mapping.cui) {
       return (
         <div className="mt-2 flex items-center justify-between gap-2 bg-slate-50 border border-slate-100 rounded px-1.5 py-1">
-          <span className="text-[9px] font-mono text-slate-400 italic">No UMLS match found</span>
+          <span className="text-2xs font-mono text-slate-500 italic">No UMLS match found</span>
           <div className="flex items-center gap-2">
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 handleMapEntity(entityId, name, type);
               }}
-              className="text-[9px] text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
+              className="text-2xs text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
             >
               Re-map
             </button>
-            <span className="text-slate-300 text-[9px]">|</span>
+            <span className="text-slate-300 text-2xs">|</span>
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 handleOpenUmlsEdit(entityId);
               }}
-              className="text-[9px] text-slate-500 hover:underline font-semibold cursor-pointer bg-transparent border-0"
+              className="text-2xs text-slate-500 hover:underline font-semibold cursor-pointer bg-transparent border-0"
             >
               Search/Edit
             </button>
@@ -1388,13 +1310,13 @@ export default function ClinicalNotesView({
 
     return (
       <div className="mt-2 pt-1.5 border-t border-dashed border-slate-100 flex flex-wrap gap-1 items-center" onClick={e => e.stopPropagation()}>
-        <span className="text-[8px] font-bold text-slate-400 uppercase tracking-wider mr-1 font-mono">UMLS:</span>
-        
+        <span className="text-2xs font-semibold text-slate-500 uppercase tracking-wider mr-1 font-sans">UMLS:</span>
+
         <a
           href={`https://uts.nlm.nih.gov/uts/umls/concept/${mapping.cui}`}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-800 border border-slate-200 transition-colors"
+          className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-800 border border-slate-200 transition-colors"
           title={`UMLS Concept Unique Identifier (CUI): ${mapping.preferredName}`}
         >
           <span>{mapping.cui}</span>
@@ -1405,7 +1327,7 @@ export default function ClinicalNotesView({
             href={`https://terminologie.nictiz.nl/art-decor/snomed-ct?conceptId=${mapping.snomed}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 hover:bg-purple-100 hover:text-purple-900 border border-purple-100 transition-colors"
+            className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 hover:bg-purple-100 hover:text-purple-900 border border-purple-100 transition-colors"
             title="SNOMED-CT Code"
           >
             <span>SNOMED: {mapping.snomed}</span>
@@ -1417,7 +1339,7 @@ export default function ClinicalNotesView({
             href={`https://mor.nlm.nih.gov/RxNav/search?searchBy=NameOrCode&searchTerm=${mapping.rxnorm}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 hover:bg-sky-100 hover:text-sky-900 border border-sky-100 transition-colors"
+            className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 hover:bg-sky-100 hover:text-sky-900 border border-sky-100 transition-colors"
             title="RxNorm Code"
           >
             <span>RxNorm: {mapping.rxnorm}</span>
@@ -1429,7 +1351,7 @@ export default function ClinicalNotesView({
             href={`https://icd.who.int/browse10/2019/en#/${mapping.icd10}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-900 border border-emerald-100 transition-colors"
+            className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-900 border border-emerald-100 transition-colors"
             title="ICD-10 (Dutch/General) Code"
           >
             <span>ICD-10: {mapping.icd10}</span>
@@ -1441,7 +1363,7 @@ export default function ClinicalNotesView({
             href={`https://loinc.org/${mapping.loinc}/`}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-0.5 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 hover:bg-amber-100 hover:text-amber-900 border border-amber-100 transition-colors"
+            className="inline-flex items-center gap-0.5 text-2xs font-mono font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 hover:bg-amber-100 hover:text-amber-900 border border-amber-100 transition-colors"
             title="LOINC Code"
           >
             <span>LOINC: {mapping.loinc}</span>
@@ -1454,18 +1376,18 @@ export default function ClinicalNotesView({
               e.stopPropagation();
               handleOpenUmlsEdit(entityId);
             }}
-            className="text-[8px] text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
+            className="text-2xs text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
             title="Edit UMLS codes manually"
           >
             Edit
           </button>
-          <span className="text-[8px] text-slate-300">|</span>
+          <span className="text-2xs text-slate-300">|</span>
           <button
             onClick={(e) => {
               e.stopPropagation();
               handleMapEntity(entityId, name, type);
             }}
-            className="text-[8px] text-slate-400 hover:text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
+            className="text-2xs text-slate-500 hover:text-blue-600 hover:underline font-semibold cursor-pointer bg-transparent border-0"
             title="Refresh UMLS mapping"
           >
             Re-map
@@ -1504,7 +1426,7 @@ export default function ClinicalNotesView({
       updatedNotes[category] = [];
     }
     updatedNotes[category] = (updatedNotes[category] as any[]).filter((_, idx) => idx !== index);
-    
+
     // Also clean up references in other categories if any existed
     activeSchema.forEach(cat => {
       if (cat.id !== category && updatedNotes[cat.id]) {
@@ -1547,15 +1469,6 @@ export default function ClinicalNotesView({
           }
         });
 
-        // Cross-sync status and clinicalStatus
-        if (initialForm.clinicalStatus && !initialForm.status) {
-          initialForm.status = initialForm.clinicalStatus;
-        }
-        if (initialForm.status && !initialForm.clinicalStatus && cat.attributes.some(a => a.name === 'clinicalStatus')) {
-          const clinAttr = cat.attributes.find(a => a.name === 'clinicalStatus');
-          const matched = clinAttr?.choices?.find(c => c.toLowerCase() === String(initialForm.status).toLowerCase());
-          initialForm.clinicalStatus = matched || initialForm.status;
-        }
       }
       setActiveForm(initialForm);
     }
@@ -1570,6 +1483,7 @@ export default function ClinicalNotesView({
 
   // Save Editing
   const saveEdit = (category: string, index: number) => {
+    if (category !== 'support' && structuredFormInvalid) return;
     const updatedNotes = { ...clinicalNotes };
     const updatedEntities = [...entities];
 
@@ -1621,12 +1535,6 @@ export default function ClinicalNotesView({
         name: primaryName,
       };
 
-      if (updatedItem.clinicalStatus !== undefined && updatedItem.status === undefined) {
-        updatedItem.status = updatedItem.clinicalStatus;
-      } else if (updatedItem.status !== undefined && updatedItem.clinicalStatus === undefined && cat.attributes.some(a => a.name === 'clinicalStatus')) {
-        updatedItem.clinicalStatus = updatedItem.status;
-      }
-
       if (primaryAttr.name === 'task' || updatedItem.task !== undefined) {
         updatedItem.task = primaryName;
       }
@@ -1650,7 +1558,7 @@ export default function ClinicalNotesView({
           .map(attr => {
             const val = updatedItem[attr.name];
             if (val === undefined || val === '' || val === null) return null;
-            return `${attr.name}: ${val}`;
+            return `${attr.name}: ${formatAttributeValue(val, entities)}`;
           })
           .filter(Boolean);
 
@@ -1670,7 +1578,7 @@ export default function ClinicalNotesView({
   const handleDeleteSupport = (entityId: string) => {
     const updatedNotes = { ...clinicalNotes };
     const updatedEntities = entities.filter(e => e.id !== entityId);
-    
+
     // Also clean up references in clinicalNotes arrays
     activeSchema.forEach(cat => {
       if (updatedNotes[cat.id]) {
@@ -1734,6 +1642,8 @@ export default function ClinicalNotesView({
         newItem[attr.name] = unassignedChoice || (attr.choices && attr.choices.length > 0 ? attr.choices[0] : 'unassigned');
       } else if (attr.type === 'boolean') {
         newItem[attr.name] = false;
+      } else if (attr.type === 'procedure-reference') {
+        newItem[attr.name] = null;
       } else {
         newItem[attr.name] = attr.name.toLowerCase().includes('status') ? 'unassigned' : '';
       }
@@ -1751,7 +1661,7 @@ export default function ClinicalNotesView({
       .map(attr => {
         const val = newItem[attr.name];
         if (val === undefined || val === '' || val === null) return null;
-        return `${attr.name}: ${val}`;
+        return `${attr.name}: ${formatAttributeValue(val, entities)}`;
       })
       .filter(Boolean);
 
@@ -1759,11 +1669,12 @@ export default function ClinicalNotesView({
       id: newId,
       name: defaultDisplayName,
       type: cat.entityType,
+      categoryId: cat.id,
       description: detailsParts.join(' | ') || `Added manually to ${cat.displayName}`
     });
 
     onUpdateNotes(updatedNotes, updatedEntities);
-    
+
     // Set to editing immediately
     const lastIndex = (updatedNotes[category] as any[]).length - 1;
     startEdit(category, lastIndex, (updatedNotes[category] as any[])[lastIndex]);
@@ -1776,7 +1687,7 @@ export default function ClinicalNotesView({
     if (id.includes('family') || id.includes('history')) return <Users className="w-4.5 h-4.5 text-teal-600" />;
     if (id.includes('condition') || id.includes('disorder') || id.includes('disease')) return <Activity className="w-4.5 h-4.5 text-emerald-600" />;
     if (id.includes('immunization') || id.includes('vaccine')) return <Syringe className="w-4.5 h-4.5 text-orange-600" />;
-    if (id.includes('medication') || id.includes('drug') || id.includes('treatment')) return <Pill className="w-4.5 h-4.5 text-indigo-600" />;
+    if (id.includes('medication') || id.includes('drug') || id.includes('treatment')) return <Pill className="w-4.5 h-4.5 text-brand-600" />;
     if (id.includes('procedure')) return <Activity className="w-4.5 h-4.5 text-violet-600" />;
     if (id.includes('follow') || id.includes('action') || id.includes('task') || id.includes('plan') || id.includes('servicerequest') || id.includes('request')) return <CalendarCheck className="w-4.5 h-4.5 text-rose-600" />;
     if (id.includes('diagnostic') || id.includes('report')) return <ClipboardCheck className="w-4.5 h-4.5 text-fuchsia-600" />;
@@ -1804,9 +1715,7 @@ export default function ClinicalNotesView({
         result.push({
           ...item,
           [primaryAttr.name]: item[primaryAttr.name] || resolvedName,
-          name: item[primaryAttr.name] || item.name || resolvedName,
-          task: item.task || item[primaryAttr.name] || resolvedName,
-          title: item.title || item[primaryAttr.name] || resolvedName
+          name: item[primaryAttr.name] || item.name || resolvedName
         });
       });
     };
@@ -1855,9 +1764,7 @@ export default function ClinicalNotesView({
           const primaryAttr = getPrimaryAttribute(cat);
           const newItem: any = {
             entityId: ent.id,
-            name: ent.name,
-            task: ent.name,
-            title: ent.name
+            name: ent.name
           };
           newItem[primaryAttr.name] = ent.name;
           if (ent.description) {
@@ -1877,20 +1784,20 @@ export default function ClinicalNotesView({
   const supportEnts = entities.filter(ent => isSupportEntity(ent, activeSchema));
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Clinical Workspace Header with Export JSONL & Clear All Buttons */}
-      <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 shadow-sm flex flex-wrap items-center justify-between gap-3">
+      <div className="panel px-4 py-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Layers className="w-4.5 h-4.5 text-slate-500" />
-          <span className="text-xs font-semibold text-slate-700 uppercase tracking-wider font-mono">Clinical Workspace</span>
+          <h3 className="section-heading">Clinical details</h3>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowExportJsonlModal(true)}
-            className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5 shadow-xs"
+            className="btn btn-secondary"
             title="Export entities, mentions, and relations to JSONL format"
           >
-            <FileCode className="w-3.5 h-3.5 text-indigo-600" />
+            <FileCode className="w-3.5 h-3.5" />
             <span>Export JSONL</span>
           </button>
 
@@ -1898,16 +1805,16 @@ export default function ClinicalNotesView({
             <>
               {showClearConfirm ? (
                 <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 px-2.5 py-1.5 rounded-lg animate-in fade-in duration-200">
-                  <span className="text-[10px] text-rose-700 font-medium">Delete all annotations?</span>
+                  <span className="text-2xs text-rose-700 font-medium">Delete all annotations?</span>
                   <button
                     onClick={handleClearAllAnnotations}
-                    className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[9px] rounded shadow-sm transition-all cursor-pointer"
+                    className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-2xs rounded shadow-sm transition-all cursor-pointer"
                   >
                     Yes, Clear
                   </button>
                   <button
                     onClick={() => setShowClearConfirm(false)}
-                    className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-[9px] rounded transition-all cursor-pointer"
+                    className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-semibold text-2xs rounded transition-all cursor-pointer"
                   >
                     Cancel
                   </button>
@@ -1915,10 +1822,10 @@ export default function ClinicalNotesView({
               ) : (
                 <button
                   onClick={() => setShowClearConfirm(true)}
-                  className="px-2.5 py-1.5 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 text-slate-500 border border-slate-200 rounded-lg text-[11px] font-semibold transition-all cursor-pointer flex items-center gap-1.5"
+                  className="px-2.5 py-1.5 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 text-slate-500 border border-slate-200 rounded-lg text-2xs font-semibold transition-all cursor-pointer flex items-center gap-1.5"
                   title="Delete all clinical annotated entities and relationships"
                 >
-                  <Trash2 className="w-3.5 h-3.5 text-slate-400 hover:text-rose-500 transition-colors" />
+                  <Trash2 className="w-3.5 h-3.5 text-slate-500 hover:text-rose-500 transition-colors" />
                   <span>Clear All Annotations</span>
                 </button>
               )}
@@ -1941,51 +1848,51 @@ export default function ClinicalNotesView({
               display: none !important;
             }
           `}} />
-          <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 text-indigo-800 text-xs flex items-start gap-3">
-            <ShieldAlert className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
+          <div className="bg-brand-50 border border-brand-100 rounded-xl p-4 text-brand-800 text-xs flex items-start gap-3">
+            <ShieldAlert className="w-4 h-4 text-brand-600 mt-0.5 shrink-0" />
             <div>
-              <span className="font-bold">Read-Only Mode:</span> This is a shared clinical session. You can explore the interactive knowledge graph and UMLS term mappings, but editing has been disabled. To customize this session, click the <strong className="text-indigo-950 font-bold">"Clone Session"</strong> button at the top right to copy it to your account!
+              <span className="font-semibold">Read-Only Mode:</span> This is a shared clinical session. You can explore the interactive knowledge graph and UMLS term mappings, but editing has been disabled. To customize this session, click the <strong className="text-brand-950 font-semibold">"Clone Session"</strong> button at the top right to copy it to your account!
             </div>
           </div>
         </>
       )}
       {/* UMLS Mapping Dashboard Control */}
-      <div className="bg-slate-900 text-white rounded-xl p-4.5 shadow-md border border-slate-800 flex flex-col gap-4">
+      <div className="panel p-4 flex flex-col gap-4">
         <div className="flex items-start gap-3">
-          <span className="p-1.5 bg-blue-500/20 text-blue-400 rounded-lg shrink-0 mt-0.5">
+          <span className="p-1.5 bg-brand-50 text-brand-600 rounded-lg shrink-0 mt-0.5">
             <Beaker className="w-4 h-4" />
           </span>
           <div className="min-w-0">
-            <h3 className="font-semibold text-xs leading-tight uppercase tracking-wider text-slate-300 font-mono">
+            <h3 className="section-heading">
               UMLS Terminology Mapping
             </h3>
-            <p className="text-[11px] text-slate-400 mt-1.5 leading-relaxed">
-              Standardize medical concepts: <strong className="text-sky-300 font-medium">RxNorm</strong> for drugs, <strong className="text-purple-300 font-medium">SNOMED-CT</strong> for symptoms, <strong className="text-emerald-300 font-medium">ICD-10</strong> for conditions, and <strong className="text-amber-300 font-medium">LOINC</strong> for lab measurements.
+            <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+              Standardize medical concepts with RxNorm, SNOMED-CT, ICD-10, and LOINC.
             </p>
           </div>
         </div>
-        
-        <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+
+        <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
           {isMappingAll ? (
             <div className="flex-1 flex items-center gap-3">
-              <div className="flex-1 bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                <div 
-                  className="bg-blue-500 h-1.5 transition-all duration-300" 
+              <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="bg-brand-500 h-1.5 transition-all duration-300"
                   style={{ width: `${(mapAllProgress.current / mapAllProgress.total) * 100}%` }}
                 ></div>
               </div>
-              <span className="text-[10px] text-slate-400 font-mono whitespace-nowrap shrink-0">
+              <span className="text-2xs text-slate-500 font-mono whitespace-nowrap shrink-0">
                 {mapAllProgress.current} of {mapAllProgress.total} mapped
               </span>
             </div>
           ) : (
             <>
-              <span className="text-[10px] text-slate-500 font-mono">
+              <span className="text-2xs text-slate-500 font-mono">
                 Automatic concept mapping
               </span>
               <button
                 onClick={handleMapAllEntities}
-                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-[11px] rounded-lg shadow-sm transition-all cursor-pointer flex items-center gap-1.5 shrink-0"
+                className="btn btn-secondary"
               >
                 <Link2 className="w-3 h-3" />
                 <span>Auto-Map All</span>
@@ -2001,7 +1908,7 @@ export default function ClinicalNotesView({
         const isCatEmpty = items.length === 0;
 
         return (
-          <div key={cat.id} className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm animate-fadeIn">
+          <div key={cat.id} className="panel p-4">
             <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <div className="p-1.5 bg-slate-50 border border-slate-100 rounded-lg">
@@ -2009,14 +1916,14 @@ export default function ClinicalNotesView({
                 </div>
                 <div>
                   <h3 className="text-sm font-semibold text-slate-800">{cat.displayName}</h3>
-                  <p className="text-[10px] text-slate-400 mt-0.5">Annotate details for {cat.displayName.toLowerCase()}</p>
+                  <p className="text-2xs text-slate-500 mt-0.5">Annotate details for {cat.displayName.toLowerCase()}</p>
                 </div>
               </div>
               {!isReadOnly && (
                 <button
                   onClick={() => handleAddNewItem(cat.id)}
                   title={`Add ${cat.displayName.endsWith('s') ? cat.displayName.slice(0, -1) : cat.displayName}`}
-                  className="p-1.5 text-indigo-600 hover:text-indigo-700 bg-indigo-50/70 hover:bg-indigo-100 rounded-lg transition-all cursor-pointer flex items-center justify-center shrink-0"
+                  className="icon-button text-brand-600 bg-brand-50"
                 >
                   <Plus className="w-4 h-4" />
                 </button>
@@ -2024,7 +1931,7 @@ export default function ClinicalNotesView({
             </div>
 
             {isCatEmpty ? (
-              <p className="text-xs text-slate-400 italic text-center py-4">No {cat.displayName.toLowerCase()} documented in annotations.</p>
+              <p className="text-xs text-slate-500 italic text-center py-4">No {cat.displayName.toLowerCase()} documented in annotations.</p>
             ) : (
               <div className="space-y-3">
                 {items.map((item, idx) => {
@@ -2042,12 +1949,23 @@ export default function ClinicalNotesView({
                       onClick={() => !isEditing && handleItemClick(item.entityId)}
                       className={`p-3 rounded-xl border transition-all duration-200 group relative ${
                         isEditing
-                          ? 'border-indigo-400 bg-indigo-50/10 ring-2 ring-indigo-50'
+                          ? 'border-brand-400 bg-brand-50/10 ring-2 ring-brand-50'
                           : isSelected
-                          ? 'border-indigo-400 bg-indigo-50/40 shadow-sm'
+                          ? 'border-brand-400 bg-brand-50/40 shadow-sm'
                           : 'border-slate-150 bg-slate-50/40 hover:border-slate-300 hover:bg-slate-50/80 cursor-pointer'
                       }`}
                     >
+                      {(entities.find(entity => entity.id === item.entityId)?.attributes || []).filter(attribute => observationStatusReview(attribute)).map(attribute => {
+                        const assessment = entities.find(entity => entity.id === item.entityId)?.attributes?.find(a => a.name.toLowerCase() === 'diagnosticassessment');
+                        return <LegacyStatusReview key={attribute.id} attribute={attribute} assessment={assessment}
+                          evidenceCount={mentions.filter(m => m.target?.kind === 'attribute' && m.target.entityId === item.entityId && m.target.attributeId === attribute.id).length}
+                          readOnly={isReadOnly} editing={isEditing}
+                          onResolve={async resolution => {
+                            const reviewed = resolveLegacyStatus({ evidenceVersion: 2, observationStatusVersion: 1,
+                              entities, mentions, relations, clinicalNotes }, item.entityId, attribute.id, resolution, activeSchema);
+                            await onUpdateNotes(reviewed.clinicalNotes, reviewed.entities, reviewed.relations, reviewed.mentions);
+                          }} />;
+                      })}
                       {isEditing ? (
                         <form
                           onSubmit={(e) => { e.preventDefault(); saveEdit(cat.id, idx); }}
@@ -2058,11 +1976,24 @@ export default function ClinicalNotesView({
                             {cat.attributes.map(attr => {
                               const attrDisplayName = attr.displayName || attr.name.replace(/([A-Z])/g, ' $1').replace(/^[a-z]/, (str: string) => str.toUpperCase()).trim();
                               return (
-                                <div key={attr.name} className="flex flex-col gap-1">
-                                  <span className="text-[10px] font-bold text-slate-400 uppercase font-mono tracking-wider min-h-[28px] flex items-end pb-1 leading-tight">
+                                <div key={attr.name} className={attr.type === 'temporal' || attr.type === 'trajectory' || attr.type === 'procedure-reference' ? 'flex flex-col gap-1 md:col-span-2' : 'flex flex-col gap-1'}>
+                                  <span className="text-2xs font-semibold text-slate-500 uppercase font-sans tracking-wider min-h-[28px] flex items-end pb-1 leading-tight">
                                     {attrDisplayName}
                                   </span>
-                                  {attr.type === 'select' ? (
+                                  {attr.type === 'procedure-reference' ? (
+                                    <ProcedureReferenceEditor value={activeForm[attr.name] ?? null} entities={entities}
+                                      onChange={value => setActiveForm({ ...activeForm, [attr.name]: value })} />
+                                  ) : attr.type === 'trajectory' ? (
+                                    <TrajectoryEditor label={attrDisplayName} value={activeForm[attr.name] ?? null}
+                                      context={{ encounterTime, entities }}
+                                      attributeId={entities.find(entity => entity.id === item.entityId)?.attributes?.find(a => a.name === attr.name)?.id}
+                                      onChange={value => setActiveForm({ ...activeForm, [attr.name]: value })} />
+                                  ) : attr.type === 'temporal' ? (
+                                    <TemporalEditor label={attrDisplayName} value={activeForm[attr.name] ?? null}
+                                      mode={attr.temporalMode} context={{ encounterTime, entities }}
+                                      attributeId={entities.find(entity => entity.id === item.entityId)?.attributes?.find(a => a.name === attr.name)?.id}
+                                      onChange={value => setActiveForm({ ...activeForm, [attr.name]: value })} />
+                                  ) : attr.type === 'select' ? (
                                     (() => {
                                       const rawVal = (activeForm[attr.name] !== undefined && activeForm[attr.name] !== '')
                                         ? activeForm[attr.name]
@@ -2070,22 +2001,17 @@ export default function ClinicalNotesView({
                                       const { selectedValue, options } = matchChoiceInsensitive(rawVal, attr.choices || [], 'unassigned');
                                       return (
                                         <select
+                                          aria-label={attrDisplayName}
                                           value={selectedValue}
                                           onChange={e => {
                                             const val = e.target.value;
                                             const nextForm = { ...activeForm, [attr.name]: val };
-                                            if (attr.name === 'clinicalStatus') nextForm.status = val;
-                                            if (attr.name === 'status' && cat.attributes.some(a => a.name === 'clinicalStatus')) {
-                                              const clinAttr = cat.attributes.find(a => a.name === 'clinicalStatus');
-                                              const match = clinAttr?.choices?.find(c => c.toLowerCase() === val.toLowerCase());
-                                              nextForm.clinicalStatus = match || val;
-                                            }
                                             setActiveForm(nextForm);
                                           }}
-                                          className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-indigo-400 focus:outline-none transition-colors shadow-sm cursor-pointer"
+                                          className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-brand-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-brand-400 focus:outline-none transition-colors shadow-sm cursor-pointer"
                                         >
                                           {options.map(choice => (
-                                            <option key={choice} value={choice}>{choice}</option>
+                                            <option key={choice} value={choice}>{choice === 'legacy_refuted' ? 'Legacy refuted — review needed' : choice}</option>
                                           ))}
                                         </select>
                                       );
@@ -2097,7 +2023,7 @@ export default function ClinicalNotesView({
                                           type="checkbox"
                                           checked={!!((activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : getResolvedAttributeValue(activeForm, attr))}
                                           onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.checked })}
-                                          className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-400 h-4 w-4"
+                                          className="rounded border-slate-300 text-brand-600 focus:ring-brand-400 h-4 w-4"
                                         />
                                         {attr.hint || `Is ${attrDisplayName}`}
                                       </label>
@@ -2106,7 +2032,7 @@ export default function ClinicalNotesView({
                                     <textarea
                                       value={(activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : (getResolvedAttributeValue(activeForm, attr) || '')}
                                       onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.value })}
-                                      className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 py-1.5 focus:ring-1 focus:ring-indigo-400 focus:outline-none min-h-[72px] bg-white transition-colors shadow-sm"
+                                      className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-brand-500 rounded-lg px-2.5 py-1.5 focus:ring-1 focus:ring-brand-400 focus:outline-none min-h-[72px] bg-white transition-colors shadow-sm"
                                       placeholder={attr.hint || `Enter ${attrDisplayName.toLowerCase()}`}
                                     />
                                   ) : (
@@ -2114,7 +2040,7 @@ export default function ClinicalNotesView({
                                       type={attr.type === 'number' ? 'number' : 'text'}
                                       value={(activeForm[attr.name] !== undefined && activeForm[attr.name] !== '') ? activeForm[attr.name] : (getResolvedAttributeValue(activeForm, attr) || '')}
                                       onChange={e => setActiveForm({ ...activeForm, [attr.name]: e.target.value })}
-                                      className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-indigo-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-indigo-400 focus:outline-none transition-colors shadow-sm"
+                                      className="w-full text-xs border border-slate-200 hover:border-slate-300 focus:border-brand-500 rounded-lg px-2.5 h-9 bg-white focus:ring-1 focus:ring-brand-400 focus:outline-none transition-colors shadow-sm"
                                       placeholder={attr.hint || `Enter ${attrDisplayName.toLowerCase()}`}
                                     />
                                   )}
@@ -2133,7 +2059,8 @@ export default function ClinicalNotesView({
                             </button>
                             <button
                               type="submit"
-                              className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 font-bold text-xs cursor-pointer shadow-sm transition-colors"
+                              disabled={Boolean(structuredFormInvalid)}
+                              className="disabled:opacity-40 px-3 py-1.5 bg-brand-600 text-white rounded-lg hover:bg-brand-500 font-semibold text-xs cursor-pointer shadow-sm transition-colors"
                             >
                               Save
                             </button>
@@ -2143,40 +2070,24 @@ export default function ClinicalNotesView({
                         <div className="space-y-1.5">
                           <div className="flex items-start justify-between gap-2">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-slate-800 font-bold text-xs">
+                              <span className="text-slate-800 font-semibold text-xs">
                                 {primaryValue}
                               </span>
-                              {(() => {
-                                const supportedAttrMentions = (mentions || [])
-                                  .filter(m => m.entityId === item.entityId && m.supportedAttribute && m.textSpan?.text);
-                                if (supportedAttrMentions.length === 0) return null;
-                                return (
-                                  <div className="flex flex-wrap gap-1 items-center">
-                                    {supportedAttrMentions.map((m, mIdx) => (
-                                      <span
-                                        key={mIdx}
-                                        className="text-[9px] font-mono font-bold bg-violet-50 text-violet-700 border border-violet-200 px-1.5 py-0.5 rounded"
-                                        title={`Mention "${m.textSpan?.text}" grounds attribute "${m.supportedAttribute}"`}
-                                      >
-                                        <span className="text-violet-500 uppercase mr-1">{m.supportedAttribute}:</span>
-                                        "{m.textSpan?.text}"
-                                      </span>
-                                    ))}
-                                  </div>
-                                );
-                              })()}
+
                             </div>
                             {!isReadOnly && (
                               <div className="flex gap-1 opacity-0 group-hover:opacity-100 hover:opacity-100 transition-opacity">
                                 <button
+                                  aria-label={`Edit ${primaryValue}`}
                                   onClick={(e) => { e.stopPropagation(); startEdit(cat.id, idx, item); }}
-                                  className="p-1 text-slate-400 hover:text-indigo-500 cursor-pointer"
+                                  className="p-1 text-slate-500 hover:text-brand-500 cursor-pointer"
                                 >
                                   <Edit2 className="w-3 h-3" />
                                 </button>
                                 <button
+                                  aria-label={`Delete ${primaryValue}`}
                                   onClick={(e) => { e.stopPropagation(); handleDelete(cat.id, idx, item.entityId); }}
-                                  className="p-1 text-slate-400 hover:text-rose-500 cursor-pointer"
+                                  className="p-1 text-slate-500 hover:text-rose-500 cursor-pointer"
                                 >
                                   <Trash2 className="w-3 h-3" />
                                 </button>
@@ -2199,21 +2110,22 @@ export default function ClinicalNotesView({
                                 return (
                                   <span
                                     key={attr.name}
-                                    className={`text-[9px] px-1.5 py-0.5 rounded-md font-medium border ${
+                                    className={`text-2xs px-1.5 py-0.5 rounded-md font-medium border ${
                                       isNegativeAttr
                                         ? 'bg-rose-50 text-rose-700 border-rose-200 font-semibold'
                                         : isBoldValue
-                                          ? 'bg-indigo-50/50 text-indigo-700 border-indigo-100 font-bold'
+                                          ? 'bg-brand-50/50 text-brand-700 border-brand-100 font-semibold'
                                           : 'bg-slate-100/50 text-slate-600 border-slate-200'
                                     }`}
                                   >
-                                    <span className="text-slate-400 font-mono font-medium">{attrDisplayName}:</span> {val === true ? 'Yes' : val === false ? 'No' : String(val)}
+                                    <span className="text-slate-500 font-mono font-medium">{attrDisplayName}:</span> {val === true ? 'Yes' : val === false ? 'No' : formatAttributeValue(val, entities)}
                                   </span>
                                 );
                               })}
                           </div>
 
                           {renderUmlsBadges(item.entityId, primaryValue, cat.entityType)}
+                          {renderAttributeEvidence(item.entityId)}
 
                           {isSelected && (
                             <>
@@ -2241,7 +2153,7 @@ export default function ClinicalNotesView({
             </div>
             <div>
               <h3 className="text-sm font-semibold text-slate-800">Clinical Attributes & Support Nodes</h3>
-              <p className="text-[10px] text-slate-400 mt-0.5">Dosages, Providers, Patients, or other helper terms</p>
+              <p className="text-2xs text-slate-500 mt-0.5">Dosages, Providers, Patients, or other helper terms</p>
             </div>
           </div>
           <button
@@ -2254,7 +2166,7 @@ export default function ClinicalNotesView({
         </div>
 
         {supportEnts.length === 0 ? (
-          <p className="text-xs text-slate-400 italic text-center py-4">No additional support attributes documented.</p>
+          <p className="text-xs text-slate-500 italic text-center py-4">No additional support attributes documented.</p>
         ) : (
           <div className="space-y-2.5">
             {supportEnts.map((ent, idx) => {
@@ -2276,7 +2188,7 @@ export default function ClinicalNotesView({
                     <div className="space-y-2.5" onClick={e => e.stopPropagation()}>
                       <div className="grid grid-cols-2 gap-2">
                         <div>
-                          <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Attribute Name</label>
+                          <label className="text-2xs font-semibold text-slate-500 uppercase font-sans">Attribute Name</label>
                           <input
                             type="text"
                             value={supportForm.name || ''}
@@ -2286,7 +2198,7 @@ export default function ClinicalNotesView({
                           />
                         </div>
                         <div>
-                          <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Entity Type</label>
+                          <label className="text-2xs font-semibold text-slate-500 uppercase font-sans">Entity Type</label>
                           <select
                             value={supportForm.type || 'Dosage'}
                             onChange={e => setSupportForm({ ...supportForm, type: e.target.value as any })}
@@ -2310,7 +2222,7 @@ export default function ClinicalNotesView({
                         </div>
                       </div>
                       <div>
-                        <label className="text-[10px] font-bold text-slate-400 uppercase font-mono">Description / Notes</label>
+                        <label className="text-2xs font-semibold text-slate-500 uppercase font-sans">Description / Notes</label>
                         <input
                           type="text"
                           value={supportForm.description || ''}
@@ -2322,7 +2234,7 @@ export default function ClinicalNotesView({
                       <div className="flex justify-end gap-1.5 pt-1">
                         <button
                           onClick={cancelEdit}
-                          className="p-1 text-slate-400 hover:text-slate-600 border border-slate-200 rounded hover:bg-slate-50 cursor-pointer"
+                          className="p-1 text-slate-500 hover:text-slate-600 border border-slate-200 rounded hover:bg-slate-50 cursor-pointer"
                         >
                           <X className="w-3.5 h-3.5" />
                         </button>
@@ -2340,7 +2252,7 @@ export default function ClinicalNotesView({
                         <div>
                           <h4 className="text-xs font-semibold text-slate-800">{ent.name}</h4>
                           <div className="flex gap-1.5 mt-1">
-                            <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">
+                            <span className="text-2xs font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">
                               {ent.type}
                             </span>
                           </div>
@@ -2348,20 +2260,20 @@ export default function ClinicalNotesView({
                         <div className="flex gap-1 opacity-0 group-hover:opacity-100 hover:opacity-100 transition-opacity">
                           <button
                             onClick={(e) => { e.stopPropagation(); startEdit('support', idx, ent); }}
-                            className="p-1 text-slate-400 hover:text-amber-500 cursor-pointer"
+                            className="p-1 text-slate-500 hover:text-amber-500 cursor-pointer"
                           >
                             <Edit2 className="w-3 h-3" />
                           </button>
                           <button
                             onClick={(e) => { e.stopPropagation(); handleDeleteSupport(ent.id); }}
-                            className="p-1 text-slate-400 hover:text-rose-500 cursor-pointer"
+                            className="p-1 text-slate-500 hover:text-rose-500 cursor-pointer"
                           >
                             <Trash2 className="w-3 h-3" />
                           </button>
                         </div>
                       </div>
                       {ent.description && (
-                        <p className="text-[10px] text-slate-500 mt-1.5 border-t border-dashed border-slate-100/80 pt-1">
+                        <p className="text-2xs text-slate-500 mt-1.5 border-t border-dashed border-slate-100/80 pt-1">
                           {ent.description}
                         </p>
                       )}
@@ -2385,16 +2297,16 @@ export default function ClinicalNotesView({
       <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-4">
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
-            <div className="p-1.5 bg-indigo-50 text-indigo-600 rounded-lg">
+            <div className="p-1.5 bg-brand-50 text-brand-600 rounded-lg">
               <Link2 className="w-4 h-4" />
             </div>
             <div>
               <h3 className="text-sm font-semibold text-slate-800">Graph Relations Manager</h3>
-              <p className="text-[10px] text-slate-400 mt-0.5">Link manual additions to create structured concepts</p>
+              <p className="text-2xs text-slate-500 mt-0.5">Link manual additions to create structured concepts</p>
             </div>
           </div>
           {selectedEntityId && (
-            <div className="bg-amber-50 border border-amber-100 px-2 py-0.5 rounded text-[10px] font-medium text-amber-700 flex items-center gap-1">
+            <div className="bg-amber-50 border border-amber-100 px-2 py-0.5 rounded text-2xs font-medium text-amber-700 flex items-center gap-1">
               <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse"></span>
               Focusing: {entities.find(e => e.id === selectedEntityId)?.name || 'Focus Entity'}
             </div>
@@ -2403,18 +2315,18 @@ export default function ClinicalNotesView({
 
         {/* Add Relation Form */}
         <form onSubmit={handleAddRelation} className="space-y-3 bg-slate-50/50 p-3 rounded-lg border border-slate-100">
-          <div className="text-[10px] font-bold text-slate-500 uppercase font-mono tracking-wider">
+          <div className="text-2xs font-semibold text-slate-500 uppercase font-sans tracking-wider">
             Establish New Relationship
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             {/* Source Entity Select */}
             <div>
-              <label className="block text-[9px] font-bold text-slate-400 uppercase font-mono mb-1">Source Entity</label>
+              <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">Source Entity</label>
               <select
                 value={newRelSource}
                 onChange={e => setNewRelSource(e.target.value)}
                 required
-                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 bg-white"
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-brand-400 bg-white"
               >
                 <option value="">-- Choose Source --</option>
                 {entities.map(ent => (
@@ -2427,12 +2339,12 @@ export default function ClinicalNotesView({
 
             {/* Relationship Type Select */}
             <div>
-              <label className="block text-[9px] font-bold text-slate-400 uppercase font-mono mb-1">Relationship Type</label>
+              <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">Relationship Type</label>
               <select
                 value={newRelType}
                 onChange={e => setNewRelType(e.target.value)}
                 required
-                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 bg-white"
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-brand-400 bg-white"
               >
                 <optgroup label="Person Status & Experience">
                   <option value="EXPERIENCING">EXPERIENCING (Person &rarr; Symptom)</option>
@@ -2441,7 +2353,7 @@ export default function ClinicalNotesView({
                   <option value="HAS_MEASUREMENT">HAS_MEASUREMENT (Person &rarr; Measurement)</option>
                   <option value="DIAGNOSED_WITH">DIAGNOSED_WITH (Person &rarr; Condition)</option>
                 </optgroup>
-                
+
                 <optgroup label="Clinical Associations">
                   <option value="TREATS">TREATS (Medication &rarr; Symptom/Condition)</option>
                   <option value="PRESCRIBED_FOR">PRESCRIBED_FOR (Medication &rarr; Condition)</option>
@@ -2487,12 +2399,12 @@ export default function ClinicalNotesView({
 
             {/* Target Entity Select */}
             <div>
-              <label className="block text-[9px] font-bold text-slate-400 uppercase font-mono mb-1">Target Entity</label>
+              <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">Target Entity</label>
               <select
                 value={newRelTarget}
                 onChange={e => setNewRelTarget(e.target.value)}
                 required
-                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 bg-white"
+                className="w-full text-xs border border-slate-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-brand-400 bg-white"
               >
                 <option value="">-- Choose Target --</option>
                 {entities.map(ent => (
@@ -2508,10 +2420,10 @@ export default function ClinicalNotesView({
             <button
               type="submit"
               disabled={!newRelSource || !newRelTarget}
-              className={`flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
+              className={`flex items-center gap-1 text-2xs font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
                 !newRelSource || !newRelTarget
-                  ? 'bg-slate-50 text-slate-400 border-slate-100 cursor-not-allowed'
-                  : 'bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-500 hover:shadow-md'
+                  ? 'bg-slate-50 text-slate-500 border-slate-100 cursor-not-allowed'
+                  : 'bg-brand-600 hover:bg-brand-700 text-white border-brand-500 hover:shadow-md'
               }`}
             >
               <Plus className="w-3.5 h-3.5" />
@@ -2523,13 +2435,13 @@ export default function ClinicalNotesView({
         {/* Existing Relations List */}
         <div className="space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-bold text-slate-500 uppercase font-mono tracking-wider">
+            <span className="text-2xs font-semibold text-slate-500 uppercase font-sans tracking-wider">
               Active Map Connections ({relations.length})
             </span>
           </div>
 
           {relations.length === 0 ? (
-            <p className="text-xs text-slate-400 italic text-center py-4 bg-slate-50/20 border border-dashed border-slate-100 rounded-lg">
+            <p className="text-xs text-slate-500 italic text-center py-4 bg-slate-50/20 border border-dashed border-slate-100 rounded-lg">
               No custom graph connections established.
             </p>
           ) : (
@@ -2544,26 +2456,26 @@ export default function ClinicalNotesView({
                     key={rel.id}
                     className={`flex items-center justify-between p-2 rounded-md border text-xs transition-all ${
                       isFocused
-                        ? 'bg-indigo-50/40 border-indigo-200 shadow-sm'
+                        ? 'bg-brand-50/40 border-brand-200 shadow-sm'
                         : 'bg-white border-slate-100 hover:border-slate-200'
                     }`}
                   >
                     <div className="flex items-center gap-1 flex-wrap font-medium">
                       <span
                         onClick={() => onSelectEntity(rel.source)}
-                        className={`cursor-pointer px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-700 hover:bg-slate-200 ${
-                          rel.source === selectedEntityId ? 'ring-1 ring-amber-500 font-bold' : ''
+                        className={`cursor-pointer px-1.5 py-0.5 rounded text-2xs bg-slate-100 text-slate-700 hover:bg-slate-200 ${
+                          rel.source === selectedEntityId ? 'ring-1 ring-amber-500 font-semibold' : ''
                         }`}
                       >
                         {sourceEnt ? sourceEnt.name : 'Unknown'}
                       </span>
-                      <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.2 rounded uppercase font-mono">
+                      <span className="text-2xs font-semibold text-brand-600 bg-brand-50 border border-brand-100 px-1.5 py-0.2 rounded uppercase font-sans">
                         {rel.type}
                       </span>
                       <span
                         onClick={() => onSelectEntity(rel.target)}
-                        className={`cursor-pointer px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-700 hover:bg-slate-200 ${
-                          rel.target === selectedEntityId ? 'ring-1 ring-amber-500 font-bold' : ''
+                        className={`cursor-pointer px-1.5 py-0.5 rounded text-2xs bg-slate-100 text-slate-700 hover:bg-slate-200 ${
+                          rel.target === selectedEntityId ? 'ring-1 ring-amber-500 font-semibold' : ''
                         }`}
                       >
                         {targetEnt ? targetEnt.name : 'Unknown'}
@@ -2573,7 +2485,7 @@ export default function ClinicalNotesView({
                     <button
                       type="button"
                       onClick={() => handleDeleteRelation(rel.id)}
-                      className="p-1 text-slate-400 hover:text-rose-500 rounded transition-colors cursor-pointer ml-2"
+                      className="p-1 text-slate-500 hover:text-rose-500 rounded transition-colors cursor-pointer ml-2"
                       title="Delete connection"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -2588,10 +2500,10 @@ export default function ClinicalNotesView({
 
       {/* Raw Object Preview */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm mt-6">
-        <div className="text-[10px] font-bold text-slate-400 uppercase mb-2 tracking-wider font-mono">
+        <div className="text-2xs font-semibold text-slate-500 uppercase mb-2 tracking-wider font-sans">
           Clinical Instance Registry (JSON Node binding)
         </div>
-        <div className="bg-slate-900 rounded-lg p-3 text-[10.5px] font-mono text-emerald-400 overflow-x-auto max-h-[160px] scrollbar-thin select-all">
+        <div className="bg-slate-900 rounded-lg p-3 text-2xs font-mono text-emerald-400 overflow-x-auto max-h-[160px] scrollbar-thin select-all">
           <pre>{JSON.stringify({
             selectedNodeId: selectedEntityId || 'None (Click a node or entity to bind)',
             selectedEntity: selectedEntityId ? entities.find(e => e.id === selectedEntityId) : null,
@@ -2614,12 +2526,12 @@ export default function ClinicalNotesView({
 
       {/* UMLS Manual Search and Override Modal */}
       {activeUmlsEditEntityId && (
-        <div 
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs"
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs"
           onClick={() => setActiveUmlsEditEntityId(null)}
         >
-          <div 
-            className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-2xl w-full flex flex-col overflow-hidden max-h-[90vh]"
+          <div
+            className="dialog-surface bg-white rounded-xl shadow-xl border border-slate-200 max-w-2xl w-full flex flex-col overflow-hidden max-h-[90vh]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header */}
@@ -2628,14 +2540,14 @@ export default function ClinicalNotesView({
                 <Beaker className="w-5 h-5 text-blue-400" />
                 <div>
                   <h3 className="font-semibold text-sm">Manual UMLS Concept Mapping</h3>
-                  <p className="text-[10px] text-slate-300 font-mono mt-0.5">
+                  <p className="text-2xs text-slate-300 font-mono mt-0.5">
                     Entity: "{entities.find(e => e.id === activeUmlsEditEntityId)?.name}" ({entities.find(e => e.id === activeUmlsEditEntityId)?.type})
                   </p>
                 </div>
               </div>
-              <button 
+              <button
                 onClick={() => setActiveUmlsEditEntityId(null)}
-                className="text-slate-400 hover:text-white transition-colors cursor-pointer p-1 rounded-md hover:bg-slate-800"
+                className="text-slate-500 hover:text-white transition-colors cursor-pointer p-1 rounded-md hover:bg-slate-800"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2643,15 +2555,15 @@ export default function ClinicalNotesView({
 
             {/* Modal Body */}
             <div className="p-5 overflow-y-auto space-y-5 divide-y divide-slate-100 max-h-[calc(90vh-120px)] scrollbar-thin">
-              
+
               {/* Part 1: UTS Search Engine */}
               <div className="space-y-3">
                 <div>
-                  <h4 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                  <h4 className="text-2xs font-semibold text-slate-500 uppercase tracking-wider font-sans flex items-center gap-1.5">
                     <Search className="w-3.5 h-3.5 text-blue-500" />
                     <span>Search UMLS Metathesaurus</span>
                   </h4>
-                  <p className="text-[11px] text-slate-400 mt-1">
+                  <p className="text-2xs text-slate-500 mt-1">
                     Query NLM's UTS to search over 100 vocabularies. Selected concepts will automatically auto-fill code registries.
                   </p>
                 </div>
@@ -2662,7 +2574,7 @@ export default function ClinicalNotesView({
                     value={umlsSearchQuery}
                     onChange={(e) => setUmlsSearchQuery(e.target.value)}
                     placeholder="Search query (e.g. edema, heart failure, paracetamol)..."
-                    className="flex-1 text-xs border border-slate-200 rounded-lg px-3 py-2 bg-slate-50/50 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
+                    className="flex-1 text-xs border border-slate-200 rounded-lg px-3 py-2 bg-slate-50/50 focus:outline-none focus:ring-1 focus:ring-brand-500 focus:bg-white"
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault();
@@ -2673,7 +2585,7 @@ export default function ClinicalNotesView({
                   <button
                     onClick={handleUmlsSearch}
                     disabled={isUmlsSearching || !umlsSearchQuery.trim()}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-100 disabled:text-slate-400 text-white font-semibold text-xs rounded-lg transition-all cursor-pointer shadow-xs flex items-center gap-1.5"
+                    className="px-4 py-2 bg-brand-600 hover:bg-brand-500 disabled:bg-slate-100 disabled:text-slate-500 text-white font-semibold text-xs rounded-lg transition-all cursor-pointer shadow-xs flex items-center gap-1.5"
                   >
                     {isUmlsSearching ? (
                       <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
@@ -2685,7 +2597,7 @@ export default function ClinicalNotesView({
                 </div>
 
                 {umlsEditError && (
-                  <p className="text-[11px] text-rose-500 font-medium bg-rose-50 border border-rose-100 rounded-md p-2 flex items-center gap-1.5">
+                  <p className="text-2xs text-rose-500 font-medium bg-rose-50 border border-rose-100 rounded-md p-2 flex items-center gap-1.5">
                     <ShieldAlert className="w-4 h-4 text-rose-500 shrink-0" />
                     <span>{umlsEditError}</span>
                   </p>
@@ -2693,7 +2605,7 @@ export default function ClinicalNotesView({
 
                 {umlsSearchResults.length > 0 && (
                   <div className="border border-slate-100 rounded-lg overflow-hidden bg-slate-50/50 max-h-[160px] overflow-y-auto scrollbar-thin">
-                    <div className="bg-slate-100 px-3 py-1.5 text-[9px] font-bold text-slate-500 uppercase tracking-wider font-mono">
+                    <div className="bg-slate-100 px-3 py-1.5 text-2xs font-semibold text-slate-500 uppercase tracking-wider font-sans">
                       Query matches ({umlsSearchResults.length})
                     </div>
                     <div className="divide-y divide-slate-100">
@@ -2705,7 +2617,7 @@ export default function ClinicalNotesView({
                           className="w-full text-left px-3 py-2 text-xs hover:bg-white flex items-center justify-between gap-4 transition-colors disabled:opacity-50"
                         >
                           <span className="font-medium text-slate-700 truncate">{res.name}</span>
-                          <span className="font-mono text-[10px] text-blue-600 font-bold bg-blue-50 px-1.5 py-0.5 rounded shrink-0">
+                          <span className="font-mono text-2xs text-blue-600 font-semibold bg-blue-50 px-1.5 py-0.5 rounded shrink-0">
                             CUI: {res.cui}
                           </span>
                         </button>
@@ -2718,12 +2630,12 @@ export default function ClinicalNotesView({
               {/* Part 2: Custom / Direct Mapping Overrides */}
               <div className="pt-4 space-y-3">
                 <div className="flex items-center justify-between">
-                  <h4 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                  <h4 className="text-2xs font-semibold text-slate-500 uppercase tracking-wider font-sans flex items-center gap-1.5">
                     <Settings className="w-3.5 h-3.5 text-purple-500" />
                     <span>Direct Registry Overrides</span>
                   </h4>
                   {fetchCodesLoading && (
-                    <div className="flex items-center gap-1.5 text-[10px] text-purple-600 font-semibold font-mono animate-pulse">
+                    <div className="flex items-center gap-1.5 text-2xs text-purple-600 font-semibold font-mono animate-pulse">
                       <span className="w-2.5 h-2.5 border-2 border-purple-300 border-t-purple-600 rounded-full animate-spin"></span>
                       <span>Resolving vocabulary mappings...</span>
                     </div>
@@ -2733,7 +2645,7 @@ export default function ClinicalNotesView({
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {/* Concept Name */}
                   <div className="md:col-span-2">
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       Preferred Concept Name
                     </label>
                     <input
@@ -2741,13 +2653,13 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.preferredName}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, preferredName: e.target.value }))}
                       placeholder="Preferred standardized term name..."
-                      className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
 
                   {/* CUI */}
                   <div>
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       UMLS CUI (Concept Unique Identifier)
                     </label>
                     <input
@@ -2755,13 +2667,13 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.cui}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, cui: e.target.value }))}
                       placeholder="CXXXXXXX"
-                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
 
                   {/* SNOMED */}
                   <div>
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       SNOMED-CT Code
                     </label>
                     <input
@@ -2769,13 +2681,13 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.snomed}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, snomed: e.target.value }))}
                       placeholder="e.g. 29857009"
-                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
 
                   {/* RxNorm */}
                   <div>
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       RxNorm Code
                     </label>
                     <input
@@ -2783,13 +2695,13 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.rxnorm}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, rxnorm: e.target.value }))}
                       placeholder="e.g. 1191"
-                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
 
                   {/* ICD-10 */}
                   <div>
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       ICD-10 Code
                     </label>
                     <input
@@ -2797,13 +2709,13 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.icd10}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, icd10: e.target.value }))}
                       placeholder="e.g. I10, R60.9"
-                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
 
                   {/* LOINC */}
                   <div>
-                    <label className="block text-[10px] font-bold text-slate-400 uppercase font-mono mb-1">
+                    <label className="block text-2xs font-semibold text-slate-500 uppercase font-sans mb-1">
                       LOINC Code
                     </label>
                     <input
@@ -2811,7 +2723,7 @@ export default function ClinicalNotesView({
                       value={customUmlsMapping.loinc}
                       onChange={(e) => setCustomUmlsMapping(prev => ({ ...prev, loinc: e.target.value }))}
                       placeholder="e.g. 1751-7"
-                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                      className="w-full text-xs font-mono border border-slate-200 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-brand-400"
                     />
                   </div>
                 </div>
@@ -2841,7 +2753,7 @@ export default function ClinicalNotesView({
                   type="button"
                   onClick={handleSaveCustomUmlsMapping}
                   disabled={!customUmlsMapping.cui}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-transparent text-white font-semibold text-xs rounded-lg transition-all cursor-pointer shadow-xs border border-indigo-500 hover:shadow-md"
+                  className="px-4 py-2 bg-brand-600 hover:bg-brand-500 disabled:bg-slate-100 disabled:text-slate-500 disabled:border-transparent text-white font-semibold text-xs rounded-lg transition-all cursor-pointer shadow-xs border border-brand-500 hover:shadow-md"
                 >
                   Save Mapping
                 </button>
@@ -2862,3 +2774,4 @@ export default function ClinicalNotesView({
     </div>
   );
 }
+import { apiFetch } from '../firebase';

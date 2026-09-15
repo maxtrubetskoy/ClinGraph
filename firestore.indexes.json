@@ -1,0 +1,9 @@
+{
+  "indexes": [],
+  "fieldOverrides": [
+    { "collectionGroup": "clinical_conversations", "fieldPath": "payload", "indexes": [] },
+    { "collectionGroup": "session_groups", "fieldPath": "payload", "indexes": [] },
+    { "collectionGroup": "user_settings", "fieldPath": "payload", "indexes": [] },
+    { "collectionGroup": "checkpoints", "fieldPath": "payload", "indexes": [] }
+  ]
+}
