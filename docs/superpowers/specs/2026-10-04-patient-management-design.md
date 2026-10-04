@@ -33,12 +33,6 @@ Reuse ClinGraph's recording, transcription provider adapters, transcript editing
 
 Keep authorization, patient persistence, source intake, AI jobs, registration, and portal projection in separate modules. Mount the annotation editor inside a patient's source workspace rather than expanding the existing large `App.tsx` into the entire clinic application.
 
-## Frontend design workflow
-
-The user requested design skills for frontend development. Install and use [Anthropic's frontend-design](https://github.com/anthropics/skills/tree/main/skills/frontend-design) for the visual direction and implementation, and [Vercel's web-design-guidelines](https://github.com/vercel-labs/agent-skills/tree/main/skills/web-design-guidelines) for accessibility and interaction review. The repository's [frontend instructions](../../../AGENTS.md) make both part of development and must be copied into the fork.
-
-Before implementing screens, establish shared design tokens and distinct layouts for the clinician's evidence/review workspace and the patient's readable record. Check each completed frontend change against the current interface guidelines and inspect desktop/mobile screenshots and keyboard behavior. Clinical registration, source provenance, and patient access remain the governing product requirements.
-
 ## Account access and care teams
 
 Firebase verifies account identity. Clinic membership, care-team assignment, and patient-account binding determine access on every API request. A successful sign-in to the shared Firebase project alone grants no access to the fork.
