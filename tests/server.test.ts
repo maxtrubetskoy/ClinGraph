@@ -474,7 +474,8 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
     } else if (prompt.includes('Extracted Mentions from Step 1:')) {
       result = { entities: [{ id: 'e1', name: 'Headache', type: 'symptoms',
         mentionIds: input.model === 'bad-cluster-model' ? ['m1', 'm2'] : ['m1'],
-        attributeMentionIds: { onset: ['m2'] }, attributes: { severity: 'Mild', onset: 'Tuesday' } }] };
+        attributeMentionIds: input.model === 'unmapped-attribute-model' ? {} : { onset: ['m2'] },
+        attributes: { severity: 'Mild', onset: 'Tuesday' } }] };
     } else if (prompt.includes('Strict Rules:')) {
       result = { relations: [{ source: 'e1', target: 'e2', type: 'associated_with' }] };
     } else {
@@ -604,6 +605,15 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
     aiConfig: { annotation: { ...aiConfig.annotation, model: 'bad-cluster-model' } } });
   assert.equal(badCluster.status, 502);
   assert.equal((await badCluster.json()).data, undefined);
+  const unmappedCluster = await send('/annotate', { transcript: 'Patient: No headache since Tuesday.',
+    aiConfig: { annotation: { ...aiConfig.annotation, model: 'unmapped-attribute-model' } } });
+  assert.equal(unmappedCluster.status, 200);
+  const unmappedData = (await unmappedCluster.json()).data;
+  assert.equal(unmappedData.entities.length, 1);
+  assert.equal(unmappedData.mentions.length, 2);
+  assert.equal(unmappedData.mentions[0].target.kind, 'entity');
+  assert.equal(unmappedData.mentions[1].target.kind, 'attribute');
+  assert.equal(unmappedData.mentions[1].target.entityId, unmappedData.entities[0].id);
   const failed = await send('/relations', { aiConfig: { annotation: { ...aiConfig.annotation, model: 'failing-model' } }, entities: [{ id: 'e1' }] });
   assert.equal(failed.status, 502);
   assert.equal((await failed.json()).data, undefined);

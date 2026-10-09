@@ -35,7 +35,7 @@ export function logAi(context: AiRequestContext, event: string, details: Diagnos
   const record = JSON.stringify({ timestamp: new Date().toISOString(), event, requestId: context.requestId,
     stage: context.stage, utteranceIndex: context.utteranceIndex, attempt: context.attempt,
     ...details });
-  if (process.env.CLINGRAPH_STORAGE === 'firebase' || process.env.K_SERVICE) {
+  if ((process.env.CLINGRAPH_STORAGE === 'firebase' || process.env.K_SERVICE) && !process.env.CLINGRAPH_AI_LOG_PATH) {
     console.log(record);
     return;
   }

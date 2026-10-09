@@ -26,6 +26,7 @@ export default function AuthenticationGate() {
 
   if (ready && runtime && (runtime.storage === 'sqlite' || user)) return <App key={user?.uid || 'local'}
     storageMode={runtime.storage} accountName={user?.displayName || user?.email || 'Signed in'}
+    hasServerGeminiKey={Boolean(runtime.hasServerGeminiKey)}
     onSignOut={user ? () => { void signOut(initializeFirebaseAuth(runtime.firebase)); } : undefined} />;
 
   const signIn = async () => {

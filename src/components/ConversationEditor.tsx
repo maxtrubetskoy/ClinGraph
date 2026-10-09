@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit, Key } from 'lucide-react';
+import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit, Key, Square } from 'lucide-react';
 import { isJsonOrJsonlFormat } from '../utils/transcriptParser';
 import AnnotationProgress from './AnnotationProgress';
 import type { AnnotationProgress as Progress } from '../types';
@@ -10,6 +10,7 @@ interface ConversationEditorProps {
   onFocusEditor?: () => void;
   onAnnotate: (text: string) => void;
   onDiarize: () => void;
+  onStopDiarize?: () => void;
   onManualAnnotate: () => void;
   isDiarizing: boolean;
   hasAudio: boolean;
@@ -121,6 +122,7 @@ export default function ConversationEditor({
   onFocusEditor,
   onAnnotate,
   onDiarize,
+  onStopDiarize,
   onManualAnnotate,
   isDiarizing,
   hasAudio,
@@ -402,35 +404,50 @@ export default function ConversationEditor({
           ) : (
             <>
               {hasAudio && (
-                <button
-                  onClick={onDiarize}
-                  disabled={isDiarizing || status === 'processing' || !isServerReady}
-                  className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2.5 rounded-lg shadow-sm border transition-all cursor-pointer ${
-                    isDiarizing || !isServerReady
-                      ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed shadow-none'
-                      : 'bg-brand-50 hover:bg-brand-100 text-brand-700 border-brand-200 hover:shadow-md'
-                  }`}
-                >
-                  {isDiarizing ? (
-                    <>
+                isDiarizing ? (
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 text-xs font-semibold px-3 py-2.5 rounded-lg bg-brand-50 text-brand-700 border border-brand-200 shadow-sm">
                       <svg className="animate-spin h-4 w-4 text-brand-600" fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                       </svg>
-                      <span>Diarizing Audio...</span>
-                    </>
-                  ) : !isServerReady ? (
-                    <>
-                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                      <span>Server Starting...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4 text-brand-500" />
-                      <span>Diarize Audio (JSONL)</span>
-                    </>
-                  )}
-                </button>
+                      <span>Transcribing Audio...</span>
+                    </div>
+                    {onStopDiarize && (
+                      <button
+                        type="button"
+                        onClick={onStopDiarize}
+                        className="flex items-center gap-1.5 text-xs font-semibold px-3.5 py-2.5 rounded-lg shadow-sm border border-rose-300 bg-rose-50 hover:bg-rose-100 text-rose-700 hover:shadow-md transition-all cursor-pointer"
+                        title="Stop AI transcription in progress"
+                      >
+                        <Square className="w-3.5 h-3.5 fill-rose-600 text-rose-600" />
+                        <span>Stop</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <button
+                    onClick={onDiarize}
+                    disabled={status === 'processing' || !isServerReady}
+                    className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-2.5 rounded-lg shadow-sm border transition-all cursor-pointer ${
+                      !isServerReady
+                        ? 'bg-slate-100 text-slate-500 border-slate-200 cursor-not-allowed shadow-none'
+                        : 'bg-brand-50 hover:bg-brand-100 text-brand-700 border-brand-200 hover:shadow-md'
+                    }`}
+                  >
+                    {!isServerReady ? (
+                      <>
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        <span>Server Starting...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4 text-brand-500" />
+                        <span>Diarize Audio (JSONL)</span>
+                      </>
+                    )}
+                  </button>
+                )
               )}
 
               <button
