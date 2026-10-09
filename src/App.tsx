@@ -1,3 +1,4 @@
+import { retainMentionEntities } from './utils/evidenceTargets';
 import EncounterTimeEditor from './components/EncounterTimeEditor';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useWorkspace } from './lib/useWorkspace';
@@ -808,8 +809,8 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
       );
 
       const baseMentions = updatedMentions ?? activeConversation.annotation.mentions ?? [];
-      // Delete evidence with its owner, but preserve deliberately unlinked legacy mentions.
-      const filteredMentions = baseMentions.filter(m => !m.target || validEntityIds.has(m.target.entityId));
+      // Remove only deleted-owner links; shared source mentions and their other links survive.
+      const filteredMentions = baseMentions.map(m => retainMentionEntities(m, validEntityIds));
 
       const deletedIds = new Set(activeConversation.annotation.entities.filter(entity => !validEntityIds.has(entity.id)).map(entity => entity.id));
       const cleanAnnotation = reconcileEvidenceWithNotes(unlinkDeletedProcedures({

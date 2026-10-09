@@ -12,8 +12,9 @@ import type { TemporalValue } from '../utils/temporal';
 import React, { useState, useEffect, useRef } from 'react';
 import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
 import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers, Syringe, Users, ClipboardCheck, FileCode, HeartHandshake } from 'lucide-react';
-import { getMentionAttributeName, retargetMention, sameEvidenceTarget } from '../utils/evidence';
+import { getMentionAttributeName, sameEvidenceTarget, mentionLinksToEntity, isAttributeEvidence, retainMentionEntities } from '../utils/evidence';
 import ExportJsonlModal from './ExportJsonlModal';
+import MentionTargetsEditor from './MentionTargetsEditor';
 
 const mentionFieldLabelClass = 'text-2xs font-semibold text-slate-500 uppercase font-sans';
 const mentionFieldSelectClass = 'w-full text-2xs font-semibold bg-white border rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-brand-400 cursor-pointer';
@@ -231,7 +232,7 @@ export default function ClinicalNotesView({
     const entity = entities.find(e => e.id === entityId);
     const linkedAttributes = (entity?.attributes || []).map(attribute => ({
       ...attribute,
-      evidence: mentions.filter(m => m.target?.kind === 'attribute' && m.target.attributeId === attribute.id)
+      evidence: mentions.filter(m => isAttributeEvidence(m, attribute.id, entityId))
     })).filter(attribute => attribute.evidence.length > 0);
     if (!linkedAttributes.length) return null;
     return <div className="mt-2 border-t border-violet-100 pt-2 space-y-2" data-testid={`attribute-evidence-${entityId}`}>
@@ -271,7 +272,7 @@ export default function ClinicalNotesView({
   };
 
   const renderMentionsSubWindow = (entityId: string) => {
-    const entityMentions = (mentions || []).filter(m => m.entityId === entityId);
+    const entityMentions = (mentions || []).filter(m => mentionLinksToEntity(m, entityId));
 
     if (entityMentions.length === 0) {
       return (
@@ -598,29 +599,9 @@ export default function ClinicalNotesView({
                         </select>
                       </div>
 
-                      <div className="flex flex-col gap-0.5 flex-1 min-w-[160px]">
-                        <span className={mentionFieldLabelClass}>Evidence target</span>
-                        <select
-                          aria-label={`Evidence target for ${mention.textSpan.text}`}
-                          value={mention.target?.kind === 'attribute' ? mention.target.attributeId : '__entity__'}
-                          disabled={isReadOnly}
-                          onChange={event => {
-                            const target = event.target.value === '__entity__'
-                              ? { kind: 'entity' as const, entityId }
-                              : { kind: 'attribute' as const, entityId, attributeId: event.target.value };
-                            onUpdateNotes(clinicalNotes, entities, relations,
-                              mentions.map(m => m.id === mention.id ? retargetMention(m, target) : m));
-                          }}
-                          className={`${mentionFieldSelectClass} border-slate-200 text-slate-700`}
-                        >
-                          <option value="__entity__">Entity itself</option>
-                          {(parentEntity?.attributes || []).map(attribute => (
-                            <option key={attribute.id} value={attribute.id}>
-                              {attribute.name}: {formatAttributeValue(attribute.value, entities)}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
+                      <MentionTargetsEditor mention={mention} entities={entities} readOnly={isReadOnly}
+                        onChange={updated => onUpdateNotes(clinicalNotes, entities, relations,
+                          mentions.map(m => m.id === updated.id ? updated : m))} />
                     </div>
 
                     {/* Apply to All Mentions Action */}
@@ -725,9 +706,9 @@ export default function ClinicalNotesView({
                           {mention.experiencer === 'other' ? 'Other Experiencer' : mention.experiencer}
                         </span>
                       )}
-                      {getMentionAttributeName(mention, entities) && (
-                        <span className="text-2xs font-semibold px-1.5 py-0.2 rounded font-mono bg-violet-50 text-violet-700 border border-violet-200" title={`Supported Entity Attribute: ${getMentionAttributeName(mention, entities)}`}>
-                          attr: {getMentionAttributeName(mention, entities)}
+                      {getMentionAttributeName(mention, entities, entityId) && (
+                        <span className="text-2xs font-semibold px-1.5 py-0.2 rounded font-mono bg-violet-50 text-violet-700 border border-violet-200" title={`Supported Entity Attribute: ${getMentionAttributeName(mention, entities, entityId)}`}>
+                          attr: {getMentionAttributeName(mention, entities, entityId)}
                         </span>
                       )}
                     </div>
@@ -1436,7 +1417,7 @@ export default function ClinicalNotesView({
 
     // Also remove from general entities array
     const updatedEntities = entities.filter(e => e.id !== entityId);
-    const updatedMentions = mentions.filter(m => m.entityId !== entityId);
+    const updatedMentions = mentions.map(m => retainMentionEntities(m, new Set(updatedEntities.map(e => e.id))));
     const updatedRelations = relations.filter(r => r.source !== entityId && r.target !== entityId);
 
     onUpdateNotes(updatedNotes, updatedEntities, updatedRelations, updatedMentions);
@@ -1586,7 +1567,7 @@ export default function ClinicalNotesView({
       }
     });
 
-    const updatedMentions = mentions.filter(m => m.entityId !== entityId);
+    const updatedMentions = mentions.map(m => retainMentionEntities(m, new Set(updatedEntities.map(e => e.id))));
     const updatedRelations = relations.filter(r => r.source !== entityId && r.target !== entityId);
 
     onUpdateNotes(updatedNotes, updatedEntities, updatedRelations, updatedMentions);
@@ -1958,7 +1939,7 @@ export default function ClinicalNotesView({
                       {(entities.find(entity => entity.id === item.entityId)?.attributes || []).filter(attribute => observationStatusReview(attribute)).map(attribute => {
                         const assessment = entities.find(entity => entity.id === item.entityId)?.attributes?.find(a => a.name.toLowerCase() === 'diagnosticassessment');
                         return <LegacyStatusReview key={attribute.id} attribute={attribute} assessment={assessment}
-                          evidenceCount={mentions.filter(m => m.target?.kind === 'attribute' && m.target.entityId === item.entityId && m.target.attributeId === attribute.id).length}
+                          evidenceCount={mentions.filter(m => isAttributeEvidence(m, attribute.id, item.entityId)).length}
                           readOnly={isReadOnly} editing={isEditing}
                           onResolve={async resolution => {
                             const reviewed = resolveLegacyStatus({ evidenceVersion: 2, observationStatusVersion: 1,

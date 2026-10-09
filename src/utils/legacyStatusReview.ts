@@ -1,5 +1,5 @@
 import type { AnnotationData, AnnotationCategory } from '../types';
-import { normalizeEvidence, retargetMention } from './evidence';
+import { normalizeEvidence, getMentionTargets, setMentionTargets, isAttributeEvidence } from './evidence';
 import { DIAGNOSTIC_ASSESSMENTS, observationStatusReview } from './observationStatus';
 
 export type LegacyStatusResolution = { kind: 'keep-context' } | { kind: 'assessment'; value: string };
@@ -23,9 +23,10 @@ export function resolveLegacyStatus(annotation: AnnotationData, entityId: string
     const previousAssessmentValue = assessment.value;
     const movedMentionIds: string[] = [];
     if (source !== assessment) result.mentions = result.mentions.map(mention => {
-      if (mention.target?.kind !== 'attribute' || mention.target.entityId !== entityId || mention.target.attributeId !== source.id) return mention;
+      if (!isAttributeEvidence(mention, source.id, entityId)) return mention;
       movedMentionIds.push(mention.id);
-      return retargetMention(mention, { kind: 'attribute', entityId, attributeId: assessment.id });
+      return setMentionTargets(mention, getMentionTargets(mention).map(target => target.entityId === entityId
+        ? { kind: 'attribute', entityId, attributeId: assessment.id } : target));
     });
     assessment.value = resolution.value;
     source.migration = { ...source.migration, review: { decision: 'mapped-to-assessment',

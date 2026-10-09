@@ -1,3 +1,4 @@
+import { getMentionTargets } from './evidenceTargets';
 import { TranscriptSegment, Mention, Entity, TextSpan } from '../types';
 import {
   calculateGlobalWordSpan,
@@ -409,8 +410,8 @@ export function realignMentionsWithSegments(
   // Also realign entity.textSpan for all entities
   const mentionByEntityId = new Map<string, Mention>();
   realignedMentions.forEach(m => {
-    if (m.entityId) {
-      mentionByEntityId.set(m.entityId, m);
+    for (const target of getMentionTargets(m)) {
+      if (target.kind === 'entity') mentionByEntityId.set(target.entityId, m);
     }
   });
 

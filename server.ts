@@ -2,7 +2,7 @@ import express from "express";
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { aiTimeoutMs, aiLogPath, callOpenAiChat, logAi, runAiRequest, wrapAiError, type AiRunContext, type AiRequestContext } from './server/aiRequests';
-import { normalizeEvidence, isEntityEvidence } from "./src/utils/evidence";
+import { normalizeEvidence, isEntityEvidence, isAttributeEvidence } from "./src/utils/evidence";
 import { normalizeMentionContext } from "./src/utils/mentionContext";
 import { validateEncounterTime } from "./src/utils/temporal";
 import type { TemporalValue } from "./src/utils/temporal";
@@ -263,6 +263,7 @@ async function extractMentionsForUtterance(
   const docType = encounterType === 'note' ? 'clinical document' : 'clinical dialogue';
   const prompt = `You are an expert clinical annotator specializing in Clinical Mention Extraction.
 Your task is to analyze exactly one TARGET utterance (utterance ${targetIndex}) from a ${docType}.
+A plural reference or shared phrase (for example Dutch 'die' referring to both Cellcept and Prednison in the previous turn) is ONE mention span, even when it has multiple referents. Preserve the verbatim span once; entity mapping can link it to all supported referents later. Describe the referents in its description without inventing new spans.
 Extract every distinct clinical mention and attribute-evidence span in this utterance; do not summarize it into a single mention. An utterance may contain several findings, values, times, or claims. Before returning, check the entire target for any omitted clinical facts or evidence spans.
 
 CRITICAL BOUNDARY MANDATE:
@@ -515,7 +516,7 @@ CRITICAL INSTRUCTIONS:
      * If the category schema defines: status (select: [Unassigned, Active, Resolved, Refuted, Unspecified]) -> then use Title Case "Active", "Resolved", "Refuted".
      * For text attributes (e.g. details, dosage, value), provide concise clinically accurate values.
 7. Schema Type: The Entity 'type' must match the category ID from the active schema (e.g. "symptoms", "conditions", "fhir_symptoms", "fhir_conditions").
-8. Evidence targets: mentionIds contains ONLY mentions that directly support the entity. Put attribute-only evidence in attributeMentionIds, a map from exact schema field names to arrays of mention IDs. For example, 'headache' is direct evidence; 'Tuesday' supports onset; 'moderate' supports severity. Populate each field's value in attributes. A mention must occur exactly once, in either mentionIds or one attributeMentionIds entry, never both. Assign all mentions, including attribute-only spans, to the appropriate owning entity. Context on an attribute span is not a denial/assertion of the entire entity.
+8. Evidence targets: mentionIds contains ONLY mentions that directly support the entity. Put attribute-only evidence in attributeMentionIds, a map from exact schema field names to arrays of mention IDs. For example, 'headache' is direct evidence; 'Tuesday' supports onset; 'moderate' supports severity. Populate each field's value in attributes. Within EACH entity, a mention must occur once, in either mentionIds or one attributeMentionIds entry, never both. The SAME mention ID may appear under MULTIPLE distinct entities when its source span refers to or supports all of them. For example, after 'Cellcept en Prednison?', the patient's 'die' can refer to both medications: link that single mention ID to both entities. Shared attribute evidence can likewise support one attribute on each relevant entity. Do not duplicate the source span into multiple mentions, invent additional IDs, or copy a clinical claim to another entity unless the wording actually supports it. Assign all mentions, including attribute-only spans, to the appropriate owning entity. Context on an attribute span is not a denial/assertion of the entire entity.
 9. Encounter Title: Provide a concise, informative title of the medical encounter (e.g. 'Hypertension Follow-up & Medication Adjustment').
 
 Temporal attributes (type "temporal") use the ClinGraph structure, NOT a guessed date string:
@@ -936,7 +937,7 @@ async function startServer() {
         attributes: (e.attributes || []).map(attribute => ({
           ...attribute,
           mentions: relationAnnotation.mentions!.filter(m =>
-            m.target?.kind === 'attribute' && m.target.attributeId === attribute.id)
+            isAttributeEvidence(m, attribute.id, e.id))
         }))
       }));
 

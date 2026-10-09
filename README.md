@@ -57,7 +57,7 @@ Save open annotation forms before checkpointing: unsaved form drafts are not cap
 
 Select text, choose a category and an existing entity, then choose **Evidence supports → Entity itself** or **A specific attribute**. Select the attribute and click **Link Evidence**. To create an entity first, select its name in the text and use **Create Entity**, or add an item in the clinical notes. Edit attribute values in the notes; linking evidence does not automatically overwrite a curated value.
 
-The mention editor's **Evidence target** dropdown can move an existing mention between the entity and its attributes without changing the source span, role, or context. Bulk context changes affect only mentions of that exact target **and the same assigned evidence role**. Attribute evidence is displayed separately from direct entity summaries.
+The mention editor's **Evidence target** dropdown can move an existing mention between the entity and its attributes without changing the source span, role, or context. Bulk context changes affect only mentions with the same complete set of targets **and the same assigned evidence role**. Attribute evidence is displayed separately from direct entity summaries.
 
 The **Evidence Graph** tab shows the actual containment and evidence edges:
 
@@ -72,18 +72,18 @@ Patient (this case)
 
 Patient context is case-local: ClinGraph does not yet have shared patient IDs or automatically group different sessions as the same patient. The separate **Entity Relations** view remains for semantic relations between clinical entities.
 
-Annotation format **evidenceVersion: 2** stores attributes on each entity as `{ id, name, value }`. Attribute IDs are stable across value edits. Every mention has one explicit `target`:
+Annotation format **evidenceVersion: 2** stores attributes on each entity as `{ id, name, value }`. Attribute IDs are stable across value edits. A single-target mention has an explicit `target`:
 
 ```json
 {"kind": "entity", "entityId": "e1"}
 {"kind": "attribute", "entityId": "e1", "attributeId": "attribute:e1:onset"}
 ```
 
-The mention's top-level `entityId` is retained as an ownership/navigation alias, not an additional evidence edge. A null target denotes an unlinked legacy mention. Invalid or cross-owner attribute references are rejected before saving.
+For a single link, `entityId` remains an ownership/navigation alias. Shared mentions use `targets: [ ... ]`, containing one entity or attribute target per linked entity; `target` and `entityId` are then null. An absent/empty `targets` list together with a null `target` denotes an unlinked mention. Invalid or cross-owner attribute references and multiple targets within the same entity are rejected before saving.
 
 Existing entity-linked mentions and legacy `supportedAttribute` name hints migrate on load. Migration preserves spans and context, creates real attribute references, and leaves unknown attribute values unassigned. It is saved to SQLite on the next edit. In v2, entity attributes are authoritative; `clinicalNotes` is a compatibility projection for the schema forms.
 
-JSONL exports preserve this distinction: **Entities & Mentions** nests attribute evidence under its attribute, **Mention Spans** includes the explicit target, and **Full Session Record** includes the node/edge evidence graph. Downstream consumers must use `target`, not group all evidence by the ownership alias.
+JSONL exports preserve this distinction: **Entities & Mentions** nests attribute evidence under its attribute, **Mention Spans** includes the explicit target, and **Full Session Record** includes the node/edge evidence graph. Downstream consumers must use every entry in `targets` when present, otherwise `target`; grouping by the singular ownership alias loses shared and attribute evidence.
 
 ## Mention references versus claims
 
@@ -218,7 +218,11 @@ Use **Set API Keys** to configure Gemini or an OpenAI-compatible endpoint separa
 
 AI processing sends the submitted text/audio to the configured provider. Settings and keys are stored in your private Firebase account settings, or in SQLite when using offline mode. A local model URL must be reachable from the server; localhost in a hosted deployment refers to the cloud container. Missing keys and failed AI requests produce errors, never demo clinical results. Speaker inference from a text transcription is not audio-based diarization; Gemini audio timestamps are model estimates.
 
-AI annotation has two independent actions. **Extract mentions** calls `POST /api/extract-mentions` and saves the extracted spans and attribute hints to the session. **Map entities** calls `POST /api/map-entities` with those saved mentions and the source transcript segments; it never runs extraction. A failed mapping leaves the extraction and any existing annotation intact, so mapping can be retried after a page reload. Mapping replaces the annotation only after success. Individual model errors do not abort mapping: valid entities and fields are saved, invalid structured values keep source wording where available, and unmapped or conflicting mentions remain unlinked. A persistent **AI mapping review** report lists warnings and original model values, including after reload or checkpoint restore. Provider failures and unusable top-level responses still fail the request and preserve the previous annotation. Editing the source transcript clears saved extraction because its span coordinates may no longer be valid. Checkpoints include the saved extraction.
+One source mention can link to several entities. For example, “die” after “Cellcept en Prednison?” can refer to both medications. Click the highlighted mention and use **Linked entities → Link another entity** to add the second link. Each linked entity has its own choice of **Entity itself** or a specific attribute, plus **Remove link**. The source span, mention ID, role, and context remain shared. Deleting an entity removes only its link; the mention remains available, including when no links remain. AI mapping, both graph views, checkpoints, and JSONL exports retain every link.
+
+For API clients, single-target mentions keep `target` and `entityId`. Shared mentions use an authoritative `targets` array; their singular `target` and `entityId` are null. There is one target per linked entity. Mention exports add `linkedTargets` with the names and attributes for each link. A shared mention still has one record and one evidence-graph node, with multiple evidence edges.
+
+AI annotation has two independent actions. **Extract mentions** calls `POST /api/extract-mentions` and saves the extracted spans and attribute hints to the session. **Map entities** calls `POST /api/map-entities` with those saved mentions and the source transcript segments; it never runs extraction. A failed mapping leaves the extraction and any existing annotation intact, so mapping can be retried after a page reload. Mapping replaces the annotation only after success. Individual model errors do not abort mapping: valid entities and fields are saved, invalid structured values keep source wording where available, and unmapped mentions remain unlinked; conflicting fields within one entity leave only that entity’s link unassigned. A persistent **AI mapping review** report lists warnings and original model values, including after reload or checkpoint restore. Provider failures and unusable top-level responses still fail the request and preserve the previous annotation. Editing the source transcript clears saved extraction because its span coordinates may no longer be valid. Checkpoints include the saved extraction.
 
 If the tab closes during a request, use **Resume saved mentions** after reopening the session. This keeps the saved extraction and ignores unfinished results from the earlier request. Opening another tab alone does not interrupt an active run.
 

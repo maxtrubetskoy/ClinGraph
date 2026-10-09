@@ -10,6 +10,7 @@ import { normalizeTemporal } from '../src/utils/temporal';
 import { FHIR_ANNOTATION_SCHEMA } from '../src/types';
 import type { AnnotationProgress } from '../src/types';
 import { readAnnotationResponse } from '../src/lib/annotationStream';
+import { getMentionTargets } from '../src/utils/evidenceTargets';
 
 let child: ChildProcess;
 let provider: Server;
@@ -108,9 +109,9 @@ test('mapping keeps 120 mentions and valid entities when individual model fields
     const data = result.data;
     assert.equal(data.entities.length, 2);
     assert.equal(data.mentions.length, 120);
-    assert.equal(data.mentions.filter((m: any) => m.target).length, 118);
+    assert.equal(data.mentions.filter((m: any) => getMentionTargets(m).length).length, 119);
     assert.equal(data.mentions.find((m: any) => m.id === 'm120').target, null);
-    assert.equal(data.mentions.find((m: any) => m.id === 'm117').target, null);
+    assert.equal(getMentionTargets(data.mentions.find((m: any) => m.id === 'm117')).length, 2);
     const headache = data.entities.find((e: any) => e.name === 'Headache');
     assert.equal(headache.attributes.find((a: any) => a.name === 'severity').value, 'Mild');
     const onset = headache.attributes.find((a: any) => a.name === 'onset');

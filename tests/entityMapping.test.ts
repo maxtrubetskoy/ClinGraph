@@ -4,6 +4,7 @@ import { processEntityMapping } from '../server/entityMapping';
 import { DEFAULT_ANNOTATION_SCHEMA, FHIR_ANNOTATION_SCHEMA, type Mention } from '../src/types';
 import { normalizeEvidence, attributeIdFor } from '../src/utils/evidence';
 import { normalizeTemporal } from '../src/utils/temporal';
+import { getMentionTargets } from '../src/utils/evidenceTargets';
 
 const mentions: Mention[] = [{ id: 'm1', entityId: null, entityType: 'symptoms',
   textSpan: { lineIndex: 0, startChar: 0, endChar: 8, text: 'Headache' } }];
@@ -76,6 +77,20 @@ test('ambiguous assignments stay unlinked; identical assignments are deduplicate
   assert.equal(invalid.mentions![0].target, null);
   assert(invalid.mappingIssues!.some(issue => issue.code === 'invalid_assignment'));
   assert(invalid.mappingIssues!.some(issue => issue.attributeName === 'mysteriousField'));
+});
+
+test('a shared pronoun maps once to both medications; a conflict within one owner preserves the other link', () => {
+  const mentions: Mention[] = [{ id: 'die', entityId: null, entityType: 'medications', evidenceRole: 'reference',
+    textSpan: { lineIndex: 1, startChar: 6, endChar: 9, text: 'die' } }];
+  const entities = ['Cellcept', 'Prednison'].map(name => ({ name, type: 'medications', mentionIds: ['die'] }));
+  const mapped = processEntityMapping({ entities }, mentions, DEFAULT_ANNOTATION_SCHEMA);
+  assert.equal(mapped.mentions!.length, 1);
+  assert.deepEqual(getMentionTargets(mapped.mentions![0]), [{ kind: 'entity', entityId: 'e1' }, { kind: 'entity', entityId: 'e2' }]);
+  assert.deepEqual(mapped.mappingIssues, []);
+  assert.equal(mapped.mentions![0].evidenceRole, 'reference');
+  const partial = processEntityMapping({ entities: [{ ...entities[0], attributeMentionIds: { action: ['die'] } }, entities[1]] }, mentions, DEFAULT_ANNOTATION_SCHEMA);
+  assert.deepEqual(getMentionTargets(partial.mentions![0]), [{ kind: 'entity', entityId: 'e2' }]);
+  assert(partial.mappingIssues!.some(issue => issue.code === 'conflicting_assignment' && issue.entityId === 'e1'));
 });
 
 test('invalid workflow statuses remain unassigned and never become inferred clinical assessments', () => {

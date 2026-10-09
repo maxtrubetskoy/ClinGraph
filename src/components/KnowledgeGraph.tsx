@@ -1,3 +1,4 @@
+import { mentionLinksToEntity } from '../utils/evidenceTargets';
 import { getProcedureRelations } from '../utils/procedureReferences';
 import { getMentionAttributeName } from '../utils/evidence';
 import { useState, useEffect, useRef, useMemo, MouseEvent } from 'react';
@@ -810,8 +811,8 @@ export default function KnowledgeGraph({
             )}
 
             {(() => {
-              const entityMentions = (mentions || []).filter(m => m.entityId === activeSelectedEntity?.id);
-              const supportedAttrMentions = entityMentions.filter(m => Boolean(getMentionAttributeName(m, entities) && m.textSpan?.text));
+              const entityMentions = (mentions || []).filter(m => mentionLinksToEntity(m, activeSelectedEntity?.id || null));
+              const supportedAttrMentions = entityMentions.filter(m => Boolean(getMentionAttributeName(m, entities, activeSelectedEntity.id) && m.textSpan?.text));
               if (supportedAttrMentions.length === 0) return null;
               return (
                 <div className="mt-2 pt-2 border-t border-slate-100 flex flex-wrap gap-1.5 items-center">
@@ -820,9 +821,9 @@ export default function KnowledgeGraph({
                     <span
                       key={idx}
                       className="inline-flex items-center text-2xs font-mono font-semibold px-2 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200"
-                      title={`Mention "${m.textSpan?.text}" grounds attribute "${getMentionAttributeName(m, entities)}"`}
+                      title={`Mention "${m.textSpan?.text}" grounds attribute "${getMentionAttributeName(m, entities, activeSelectedEntity.id)}"`}
                     >
-                      <span className="text-violet-500 uppercase mr-1">{getMentionAttributeName(m, entities)}:</span>
+                      <span className="text-violet-500 uppercase mr-1">{getMentionAttributeName(m, entities, activeSelectedEntity.id)}:</span>
                       "{m.textSpan?.text}"
                     </span>
                   ))}

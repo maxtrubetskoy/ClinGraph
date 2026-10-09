@@ -8,6 +8,7 @@ export function validateExtractedMentions(mentions: unknown, segments: Transcrip
     if (!mention || typeof mention.id !== 'string' || !mention.id.trim() || ids.has(mention.id) ||
         typeof mention.entityType !== 'string' || !mention.entityType.trim() ||
         mention.entityId != null || mention.target != null ||
+        (mention.targets !== undefined && (!Array.isArray(mention.targets) || mention.targets.length > 0)) ||
         (mention.supportedAttribute !== undefined && typeof mention.supportedAttribute !== 'string')) {
       throw new Error('Invalid extracted mention or duplicate mention ID.');
     }

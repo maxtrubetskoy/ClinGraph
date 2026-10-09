@@ -1,6 +1,6 @@
 import type { AnnotationAttribute, AnnotationCategory, AnnotationData, Entity, EntityAttribute, EvidenceTarget, MappingIssue, Mention } from '../src/types';
 import { getPrimaryAttribute } from '../src/types';
-import { attributeIdFor, normalizeEvidence, retargetMention } from '../src/utils/evidence';
+import { attributeIdFor, normalizeEvidence, setMentionTargets } from '../src/utils/evidence';
 import { isTemporalValue, normalizeTemporal } from '../src/utils/temporal';
 import { isTrajectoryValue, normalizeTrajectory, TRAJECTORY_DIRECTIONS } from '../src/utils/trajectory';
 
@@ -60,7 +60,7 @@ export function processEntityMapping(raw: unknown, extractedMentions: Mention[],
   const mappingIssues: MappingIssue[] = [];
   const entities: Entity[] = [];
   const mentionMap = new Map(extractedMentions.map(m => [m.id, m]));
-  const assignments = new Map<string, EvidenceTarget>();
+  const assignments = new Map<string, Map<string, EvidenceTarget>>();
   const conflicts = new Set<string>();
   const originalValues = new Map<string, unknown>();
 
@@ -124,9 +124,18 @@ export function processEntityMapping(raw: unknown, extractedMentions: Mention[],
         }
         const target: EvidenceTarget = attribute ? { kind: 'attribute', entityId: entity.id, attributeId: attribute.id }
           : { kind: 'entity', entityId: entity.id };
-        const previous = assignments.get(mention.id);
-        if (previous && JSON.stringify(previous) !== JSON.stringify(target)) conflicts.add(mention.id);
-        else assignments.set(mention.id, target);
+        const links = assignments.get(mention.id) || new Map<string, EvidenceTarget>();
+        assignments.set(mention.id, links);
+        const key = JSON.stringify([mention.id, entity.id]);
+        if (conflicts.has(key)) continue;
+        const previous = links.get(entity.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(target)) {
+          conflicts.add(key);
+          links.delete(entity.id);
+          mappingIssues.push({ code: 'conflicting_assignment', mentionId: mention.id, entityId: entity.id, entityName: entity.name,
+            message: 'Conflicting evidence fields for this entity; its link was left unassigned. Other entity links were kept.',
+            originalValue: [previous, target] });
+        } else links.set(entity.id, target);
       }
     };
     attach(entry.mentionIds);
@@ -163,10 +172,12 @@ export function processEntityMapping(raw: unknown, extractedMentions: Mention[],
   }
 
   const mentions = extractedMentions.map(mention => {
-    const target = conflicts.has(mention.id) ? null : assignments.get(mention.id) ?? null;
-    if (!target) mappingIssues.push({ code: conflicts.has(mention.id) ? 'conflicting_assignment' : 'unmapped_mention', mentionId: mention.id,
-      message: conflicts.has(mention.id) ? 'Conflicting assignments; mention kept unlinked for review.' : 'No entity was mapped; mention kept unlinked for review.' });
-    return retargetMention(mention, target);
+    const targets = [...(assignments.get(mention.id)?.values() || [])];
+    if (!targets.length && !mappingIssues.some(issue => issue.mentionId === mention.id && issue.code === 'conflicting_assignment')) {
+      mappingIssues.push({ code: 'unmapped_mention', mentionId: mention.id,
+        message: 'No entity was mapped; mention kept unlinked for review.' });
+    }
+    return setMentionTargets(mention, targets);
   });
   return { title: typeof raw.title === 'string' && raw.title.trim() ? raw.title : 'Annotated Clinical Consultation',
     ...normalizeEvidence({ evidenceVersion: 2, mentionContextVersion: 1, observationStatusVersion: 1,

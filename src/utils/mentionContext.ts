@@ -1,4 +1,5 @@
 import type { Mention } from '../types';
+import { isEntityEvidence } from './evidenceTargets';
 
 export const MENTION_EVIDENCE_ROLES = ['unassigned', 'reference', 'claim'] as const;
 export type MentionEvidenceRole = typeof MENTION_EVIDENCE_ROLES[number];
@@ -56,7 +57,7 @@ export function setMentionEvidenceRole(mention: Mention, evidenceRole: MentionEv
  * a patient-assertion summary. Missing labels never imply current/positive/certain.
  */
 export function summarizeEntityClaims(mentions: Mention[], entityId: string) {
-  const direct = mentions.filter(m => m.target?.kind === 'entity' && m.target.entityId === entityId);
+  const direct = mentions.filter(m => isEntityEvidence(m, entityId));
   const claims = direct.filter(m => m.evidenceRole === 'claim' && m.function === 'asserted' && m.experiencer === 'patient');
   const summarize = (field: 'polarity' | 'certainty' | 'temporality') => {
     const counts = new Map<string, number>();

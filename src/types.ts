@@ -436,9 +436,11 @@ export interface Mention {
   segmentId?: string;
   textSpan: TextSpan;
   entityType: EntityType;
-  /** Owning entity for navigation; target alone determines what this mention supports. */
+  /** Single-target navigation compatibility; null for shared or unlinked mentions. */
   entityId: string | null;
   target?: EvidenceTarget | null;
+  /** Authoritative links for a shared span. Singular target/entityId are null when present. */
+  targets?: EvidenceTarget[];
   /** Independent of target: a name/reference is not itself a clinical claim. */
   evidenceRole?: import('./utils/mentionContext').MentionEvidenceRole;
   speaker?: string;

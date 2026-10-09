@@ -7,30 +7,31 @@ import { normalizeObservationStatus } from './observationStatus';
 import { attributeIdFor } from './attributeIds';
 import { normalizeMentionContext } from './mentionContext';
 import { getProcedureRelations, isProcedureReferenceValue, normalizeProcedureReferences, validateProcedureReferences } from './procedureReferences';
+import { getMentionTargets, setMentionTargets, evidenceTargetKey, isEntityEvidence } from './evidenceTargets';
+export { getMentionTargets, setMentionTargets, isEntityEvidence, isAttributeEvidence, mentionLinksToEntity, retainMentionEntities } from './evidenceTargets';
 export { attributeIdFor } from './attributeIds';
 
-export function getMentionAttribute(mention: Mention, entities: Entity[]): EntityAttribute | undefined {
-  if (mention.target?.kind !== 'attribute') return undefined;
-  const target = mention.target;
+export function getMentionAttribute(mention: Mention, entities: Entity[], entityId?: string): EntityAttribute | undefined {
+  const targets = getMentionTargets(mention).filter(t => !entityId || t.entityId === entityId);
+  if (targets.length !== 1 || targets[0].kind !== 'attribute') return undefined;
+  const target = targets[0];
   return entities.find(e => e.id === target.entityId)?.attributes?.find(a => a.id === target.attributeId);
 }
 
-export function getMentionAttributeName(mention: Mention, entities: Entity[]): string {
-  return getMentionAttribute(mention, entities)?.name || (!mention.target ? mention.supportedAttribute || '' : '');
-}
-
-export function isEntityEvidence(mention: Mention, entityId: string): boolean {
-  return mention.target?.kind === 'entity' && mention.target.entityId === entityId;
+export function getMentionAttributeName(mention: Mention, entities: Entity[], entityId?: string): string {
+  return getMentionTargets(mention).filter(t => t.kind === 'attribute' && (!entityId || t.entityId === entityId))
+    .map(t => getMentionAttribute(setMentionTargets(mention, [t]), entities)?.name).filter(Boolean).join(', ') ||
+    (!getMentionTargets(mention).length ? mention.supportedAttribute || '' : '');
 }
 
 export function sameEvidenceTarget(a: Mention, b: Mention): boolean {
-  if (!a.target || !b.target || a.target.kind !== b.target.kind || a.target.entityId !== b.target.entityId) return false;
-  return a.target.kind === 'entity' || (b.target.kind === 'attribute' && a.target.attributeId === b.target.attributeId);
+  const left = getMentionTargets(a).map(evidenceTargetKey).sort();
+  const right = getMentionTargets(b).map(evidenceTargetKey).sort();
+  return left.length > 0 && JSON.stringify(left) === JSON.stringify(right);
 }
 
 export function retargetMention(mention: Mention, target: EvidenceTarget | null): Mention {
-  const { supportedAttribute, ...rest } = mention;
-  return { ...rest, target, entityId: target?.entityId ?? null };
+  return setMentionTargets(mention, target ? [target] : []);
 }
 
 const noteEntries = (notes: ClinicalCategory) => Object.entries(notes || {}).flatMap(([categoryId, items]) =>
@@ -66,7 +67,7 @@ export function normalizeEvidence(annotation: AnnotationData, schema?: Annotatio
   });
   const entityMap = new Map(entities.map(e => [e.id, e]));
   const mentions = (migrated.mentions || []).map(mention => {
-    if (mention.target !== undefined) return retargetMention(mention, mention.target);
+    if (mention.targets !== undefined || mention.target !== undefined) return setMentionTargets(mention, getMentionTargets(mention));
     if (!legacy) throw new Error(`Mention ${mention.id} has no evidence target`);
     const owner = mention.entityId ? entityMap.get(mention.entityId) : undefined;
     if (!owner) return retargetMention(mention, null);
@@ -192,13 +193,17 @@ export function validateEvidence(annotation: AnnotationData) {
   for (const mention of annotation.mentions || []) {
     if (typeof mention.id !== 'string' || !mention.id || mentionIds.has(mention.id)) throw new Error('Mention IDs must be unique');
     mentionIds.add(mention.id);
-    const target = mention.target;
-    if (target === null) continue;
-    if (!target || !['entity', 'attribute'].includes(target.kind) || !entityIds.has(target.entityId)) {
-      throw new Error(`Mention ${mention.id} references a missing entity`);
-    }
-    if (target.kind === 'attribute' && attributeOwners.get(target.attributeId) !== target.entityId) {
-      throw new Error(`Mention ${mention.id} references a missing attribute or an attribute owned by another entity`);
+    if (mention.targets === undefined && mention.target === undefined) throw new Error(`Mention ${mention.id} has no evidence target`);
+    const owners = new Set<string>();
+    for (const target of getMentionTargets(mention)) {
+      if (!target || !['entity', 'attribute'].includes(target.kind) || !entityIds.has(target.entityId)) {
+        throw new Error(`Mention ${mention.id} references a missing entity`);
+      }
+      if (owners.has(target.entityId)) throw new Error('A mention can have only one evidence target per entity');
+      owners.add(target.entityId);
+      if (target.kind === 'attribute' && attributeOwners.get(target.attributeId) !== target.entityId) {
+        throw new Error(`Mention ${mention.id} references a missing attribute or an attribute owned by another entity`);
+      }
     }
   }
 }
@@ -250,10 +255,10 @@ export function buildEvidenceGraph(sessionId: string, title: string, annotation:
     nodes.push({ id, kind: 'mention', label: mention.textSpan.text, mentionId: mention.id, entityId: mention.target?.entityId,
       evidenceRole: context.evidenceRole, polarity: context.polarity, temporality: context.temporality,
       certainty: context.certainty, function: context.function });
-    if (!mention.target) continue;
-    const source = mention.target.kind === 'entity'
-      ? nodeId('entity', mention.target.entityId) : nodeId('attribute', mention.target.attributeId);
-    edges.push({ source, target: id, type: 'EVIDENCED_BY' });
+    for (const target of getMentionTargets(mention)) {
+      const source = target.kind === 'entity' ? nodeId('entity', target.entityId) : nodeId('attribute', target.attributeId);
+      edges.push({ source, target: id, type: 'EVIDENCED_BY' });
+    }
   }
   return { nodes, edges };
 }

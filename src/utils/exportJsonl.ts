@@ -1,5 +1,5 @@
 import type { Entity, Mention, Relation, Conversation, ClinicalCategory } from '../types';
-import { normalizeEvidence, getMentionAttribute, buildEvidenceGraph } from './evidence';
+import { normalizeEvidence, getMentionAttribute, buildEvidenceGraph, getMentionTargets } from './evidence';
 import { isTemporalValue, resolveTemporal } from './temporal';
 import { isTrajectoryValue } from './trajectory';
 import { getProcedureRelations } from './procedureReferences';
@@ -40,10 +40,11 @@ export function generateJsonlContent(
   const entityMap = new Map(annotation.entities.map(entity => [entity.id, entity]));
   const byTarget = new Map<string, Mention[]>();
   for (const mention of normalizedMentions) {
-    if (!mention.target) continue;
-    const key = mention.target.kind === 'attribute' ? 'attribute:' + mention.target.attributeId : 'entity:' + mention.target.entityId;
-    if (!byTarget.has(key)) byTarget.set(key, []);
-    byTarget.get(key)!.push(mention);
+    for (const target of getMentionTargets(mention)) {
+      const key = target.kind === 'attribute' ? 'attribute:' + target.attributeId : 'entity:' + target.entityId;
+      if (!byTarget.has(key)) byTarget.set(key, []);
+      byTarget.get(key)!.push(mention);
+    }
   }
   const directMentions = (id: string) => (byTarget.get('entity:' + id) || []).map(exportMention);
 
@@ -68,6 +69,12 @@ export function generateJsonlContent(
         ...timeContext,
         ...exportMention(mention),
         entityName: owner?.name || '',
+        linkedTargets: getMentionTargets(mention).map(target => ({ ...target,
+          entityName: entityMap.get(target.entityId)?.name || '',
+          entityType: entityMap.get(target.entityId)?.type || 'Unknown',
+          attribute: target.kind === 'attribute' ? exportAttribute(entityMap.get(target.entityId)!.attributes!.find(a => a.id === target.attributeId)!) : null,
+          umlsMapping: entityMap.get(target.entityId)?.umlsMapping || null
+        })),
         entityType: mention.entityType || owner?.type || 'Unknown',
         attribute: getMentionAttribute(mention, annotation.entities) ? exportAttribute(getMentionAttribute(mention, annotation.entities)!) : null,
         umlsMapping: owner?.umlsMapping || null

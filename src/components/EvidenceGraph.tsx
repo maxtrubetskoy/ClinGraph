@@ -7,7 +7,7 @@ import { formatResolvedTime, resolveTemporal } from '../utils/temporal';
 import type { TemporalValue } from '../utils/temporal';
 import { useMemo } from 'react';
 import type { AnnotationData } from '../types';
-import { buildEvidenceGraph, type EvidenceGraphNode } from '../utils/evidence';
+import { buildEvidenceGraph, getMentionTargets, type EvidenceGraphNode } from '../utils/evidence';
 
 interface Props {
   sessionId: string;
@@ -30,7 +30,7 @@ export default function EvidenceGraph({ sessionId, title, annotation, encounterT
     return { graph, nodes, children };
   }, [sessionId, title, annotation, encounterTime]);
 
-  const renderNode = (node: EvidenceGraphNode) => {
+  const renderNode = (node: EvidenceGraphNode, ownerId?: string) => {
     const resolved = node.kind === 'attribute' ? resolveTemporal(node.value, { encounterTime, entities: annotation.entities }) : null;
     const comparisonTime = node.kind === 'attribute' && isTrajectoryValue(node.value)
       ? resolveTemporal(node.value.comparedTo, { encounterTime, entities: annotation.entities }) : null;
@@ -46,7 +46,7 @@ export default function EvidenceGraph({ sessionId, title, annotation, encounterT
           <span className="text-2xs uppercase tracking-wide text-slate-500 mr-2">{node.kind}</span>
           {node.kind === 'mention' ? (
             <button className="text-sm text-emerald-800 text-left hover:underline cursor-pointer"
-              onClick={() => onSelectEvidence(node.entityId || null, node.mentionId || null)}>
+              onClick={() => onSelectEvidence(ownerId || node.entityId || null, node.mentionId || null)}>
               “{node.label}”
             </button>
           ) : (
@@ -73,7 +73,7 @@ export default function EvidenceGraph({ sessionId, title, annotation, encounterT
           {comparisonTime && isTrajectoryValue(node.value) && node.value.comparedTo?.kind === 'relative' &&
             <p className="text-xs text-violet-600 mt-1">Comparison time (derived): {formatResolvedTime(comparisonTime)}</p>}
         </div>
-        {childNodes.length > 0 && <ul className="ml-4 pl-4 border-l border-slate-300">{childNodes.map(renderNode)}</ul>}
+        {childNodes.length > 0 && <ul className="ml-4 pl-4 border-l border-slate-300">{childNodes.map(child => renderNode(child, node.entityId || ownerId))}</ul>}
       </li>
     );
   };
@@ -82,11 +82,11 @@ export default function EvidenceGraph({ sessionId, title, annotation, encounterT
     <section aria-label="Evidence graph" className="evidence-tree h-full overflow-auto p-4 bg-slate-50/70">
       <h3 className="text-sm font-semibold text-slate-800">Evidence Graph</h3>
       <p className="text-xs text-slate-500 mt-1 mb-4">
-        Each mention supports its immediate parent. Click a mention to inspect its source text.
+        Each mention supports its immediate parent. A shared mention appears under every linked entity or attribute. Click a mention to inspect its source text.
         Patient context is local to this case; sessions are not automatically linked across patients.
       </p>
       <ul>{renderNode(graph.nodes[0])}</ul>
-      {(annotation.mentions || []).some(mention => !mention.target) && (
+      {(annotation.mentions || []).some(mention => !getMentionTargets(mention).length) && (
         <p className="text-xs text-amber-700 mt-4">Unlinked mentions are retained in the full export but have no evidence edge.</p>
       )}
     </section>

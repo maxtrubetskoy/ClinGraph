@@ -1,9 +1,10 @@
+import { getMentionTargets } from '../utils/evidenceTargets';
 import type { AnnotationData } from '../types';
 
 export default function MappingReview({ annotation }: { annotation: AnnotationData }) {
   const issues = annotation.mappingIssues || [];
   if (!issues.length) return null;
-  const unlinked = (annotation.mentions || []).filter(mention => !mention.target).length;
+  const unlinked = (annotation.mentions || []).filter(mention => !getMentionTargets(mention).length).length;
   return (
     <section aria-label="AI mapping review" className="xl:col-span-12 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
       <p className="font-semibold">AI mapping saved with {issues.length} {issues.length === 1 ? 'warning' : 'warnings'}</p>

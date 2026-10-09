@@ -2,7 +2,8 @@ import { formatAttributeValue } from '../utils/attributeValues';
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { TranscriptSegment, Entity, ClinicalCategory, EntityType, Mention, Relation, AnnotationCategory, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
 import { MessageSquare, Plus, X, Sparkles, Brain, Info, FileText, Trash2, Scissors, ChevronDown, UserCheck } from 'lucide-react';
-import { getMentionAttributeName } from '../utils/evidence';
+import { getMentionAttributeName, getMentionTargets, mentionLinksToEntity } from '../utils/evidence';
+import MentionTargetsEditor from './MentionTargetsEditor';
 import { mentionRoleLabel, mentionContextLabel, mentionContextDefaults, normalizeMentionContext, type MentionEvidenceRole } from '../utils/mentionContext';
 import { calculateGlobalWordSpan } from '../utils/wordAnchoring';
 
@@ -385,7 +386,7 @@ export default function RawTranscriptView({
       }
     } else if (selectedEntityId) {
       // If any mention for this entity is already in view, do NOT jump/scroll
-      const entityMentions = derivedMentions.filter(m => m.entityId === selectedEntityId);
+      const entityMentions = derivedMentions.filter(m => mentionLinksToEntity(m, selectedEntityId));
       const isAnyMentionVisible = entityMentions.some(m => {
         const el = containerRef.current?.querySelector(`#mention-${m.id}`) as HTMLElement | null;
         if (!el || !containerRef.current) return false;
@@ -556,14 +557,14 @@ export default function RawTranscriptView({
       }
 
       // Add highlighted span
-      const isSelected = selectedEntityId === mention.entityId;
+      const isSelected = mentionLinksToEntity(mention, selectedEntityId);
       const isMentionSelected = selectedMentionId === mention.id;
       const typeColorClass = getEntityTypeColor(mention.entityType);
 
       // Find canonical entity name if mapped
-      const mappedEntity = entities.find(e => e.id === mention.entityId);
-      const tooltipText = mappedEntity
-        ? `${mention.entityType}: ${mappedEntity.name} ${mappedEntity.umlsMapping ? '🧬 UMLS Mapped' : ''}`
+      const mappedEntities = entities.filter(e => mentionLinksToEntity(mention, e.id));
+      const tooltipText = mappedEntities.length
+        ? `${mention.entityType}: ${mappedEntities.map(e => e.name).join(', ')}`
         : `${mention.entityType}: "${span.text}" (Unmapped)`;
 
       elements.push(
@@ -572,8 +573,9 @@ export default function RawTranscriptView({
           id={`mention-${mention.id}`}
           onClick={(e) => {
             e.stopPropagation();
-            if (onSelectEntity && mention.entityId) {
-              onSelectEntity(mention.entityId === selectedEntityId ? null : mention.entityId);
+            const linkedEntityId = getMentionTargets(mention).find(t => t.entityId === selectedEntityId)?.entityId || getMentionTargets(mention)[0]?.entityId;
+            if (onSelectEntity && linkedEntityId) {
+              onSelectEntity(linkedEntityId === selectedEntityId ? null : linkedEntityId);
             }
             if (onSelectMention) {
               onSelectMention(mention.id === selectedMentionId ? null : mention.id);
@@ -606,9 +608,9 @@ export default function RawTranscriptView({
   const activeSelectedMention = selectedMentionId
     ? derivedMentions.find(m => m.id === selectedMentionId)
     : null;
-  const activeSelectedMentionEntity = activeSelectedMention
-    ? entities.find(e => e.id === activeSelectedMention.entityId)
-    : null;
+  const activeSelectedMentionEntities = activeSelectedMention
+    ? entities.filter(e => mentionLinksToEntity(activeSelectedMention, e.id))
+    : [];
 
   return (
     <div className="flex flex-col h-[calc(100dvh-200px)] min-h-[440px]">
@@ -689,9 +691,9 @@ export default function RawTranscriptView({
                 Function: {mentionContextLabel(activeSelectedMention.function)}
               </span>
             )}
-            {activeSelectedMentionEntity && (
+            {activeSelectedMentionEntities.length > 0 && (
               <span className="text-2xs text-slate-600 font-medium truncate max-w-[200px]">
-                Mapped to: <strong className="text-slate-900">{activeSelectedMentionEntity.name}</strong> ({activeSelectedMention.entityType || activeSelectedMentionEntity.type})
+                Mapped to: <strong className="text-slate-900">{activeSelectedMentionEntities.map(e => e.name).join(', ')}</strong>
               </span>
             )}
           </div>
@@ -723,6 +725,14 @@ export default function RawTranscriptView({
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+        </div>
+      )}
+
+      {activeSelectedMention && !pendingAnnotation && onUpdateNotes && (
+        <div className="mb-4 shrink-0">
+          <MentionTargetsEditor mention={activeSelectedMention} entities={entities} labelPrefix="Transcript "
+            onChange={updated => onUpdateNotes(clinicalNotes || { symptoms: [], medications: [], followUps: [] }, entities, undefined,
+              mentions.map(m => m.id === updated.id ? updated : m))} />
         </div>
       )}
 
@@ -971,7 +981,7 @@ export default function RawTranscriptView({
       <div ref={containerRef} className="flex-1 overflow-y-auto space-y-4 pr-1.5 scroll-smooth">
         {enrichedSegments.map((seg, idx) => {
           const isSelectedSegment = selectedEntityId && derivedMentions.some(m =>
-            m.entityId === selectedEntityId &&
+            mentionLinksToEntity(m, selectedEntityId) &&
             m.textSpan &&
             m.textSpan.lineIndex === idx
           );
