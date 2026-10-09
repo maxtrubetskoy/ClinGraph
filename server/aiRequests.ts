@@ -13,7 +13,7 @@ interface Diagnostics {
   provider?: string; model?: string; endpoint?: string; promptChars?: number;
   timeoutMs?: number; elapsedMs?: number; httpStatus?: number; upstreamRequestId?: string;
   promptTokens?: number; completionTokens?: number; responseChars?: number;
-  reason?: string; retryDelayMs?: number; mentionCount?: number;
+  reason?: string; retryDelayMs?: number; mentionCount?: number; warningCount?: number;
 }
 
 export function aiTimeoutMs(): number {

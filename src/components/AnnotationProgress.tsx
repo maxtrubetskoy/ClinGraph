@@ -26,7 +26,7 @@ export default function AnnotationProgress({ progress, encounterType = 'dialogue
     : progress.stage === 'extracting' ? `Extracting mentions from ${unit.toLowerCase()}s…`
     : progress.stage === 'clustering' ? 'Organizing clinical entities…'
     : progress.stage === 'failed' ? (progress.operation === 'mapping' ? 'Entity mapping failed' : 'Mention extraction failed')
-    : progress.operation === 'mapping' ? 'Entity mapping complete'
+    : progress.operation === 'mapping' ? (progress.warningCount ? 'Entity mapping complete with warnings' : 'Entity mapping complete')
     : progress.operation === 'extraction' ? (skipped ? `Mentions extracted with skipped ${unit.toLowerCase()}s` : 'Mentions extracted')
     : skipped ? `AI annotation finished with skipped ${unit.toLowerCase()}s` : 'AI annotation complete';
   const summary = `${complete} complete, ${inProgress} in progress, ${skipped} skipped due to an error, ${pending} ${progress.stage === 'failed' ? 'not processed' : 'pending'}`;

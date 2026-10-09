@@ -3,6 +3,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { useWorkspace } from './lib/useWorkspace';
 import { Conversation, ClinicalCategory, Entity, Mention, SessionGroup, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from './types';
 import type { AnnotationProgress } from './types';
+import MappingReview from './components/MappingReview';
 import { readAnnotationResponse } from './lib/annotationStream';
 import { apiFetch } from './firebase';
 import { ANNOTATION_CONCURRENCY_ERROR, DEFAULT_ANNOTATION_CONCURRENCY, MAX_ANNOTATION_CONCURRENCY, isValidAnnotationConcurrency } from './utils/annotationConcurrency';
@@ -812,6 +813,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
 
       const deletedIds = new Set(activeConversation.annotation.entities.filter(entity => !validEntityIds.has(entity.id)).map(entity => entity.id));
       const cleanAnnotation = reconcileEvidenceWithNotes(unlinkDeletedProcedures({
+        ...activeConversation.annotation,
         evidenceVersion: 2,
         entities: updatedEntities,
         relations: filteredRelations,
@@ -1220,6 +1222,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
               {/* Annotation & Knowledge Graph Dashboard */}
               {activeConversation.annotation && !annotationRuns[activeConversation.id] && (
                 <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+                  <MappingReview annotation={activeConversation.annotation} />
                   {/* Left Column (Interactive Visualization - 7 Cols) */}
                   <div className="xl:col-span-7 min-w-0 relative">
                     <div className="space-y-6">

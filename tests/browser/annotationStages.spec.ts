@@ -15,7 +15,9 @@ test('mentions persist across reload and mapping failure; retry never repeats ex
       mappings++;
       if (mappings === 1) { res.writeHead(503).end('Unavailable'); return; }
       result = { entities: [{ name: 'Headache', type: 'symptoms', mentionIds: ['m1'],
-        attributeMentionIds: { onset: ['m2'] }, attributes: { onset: 'Tuesday' } }] };
+        attributeMentionIds: mappings === 3 ? {} : { onset: ['m2'] }, attributes: { onset: mappings === 3
+          ? { type: 'temporal', kind: 'absolute', date: '2026-99-40', precision: 'invalid', qualifier: 'maybe', text: 'Tuesday' }
+          : 'Tuesday' } }] };
     } else {
       extractions++;
       result = { mentions: [
@@ -73,6 +75,33 @@ test('mentions persist across reload and mapping failure; retry never repeats ex
     expect(saved.mentionExtraction).toEqual(extracted);
     expect(extractions).toBe(1);
     expect(mappings).toBe(2);
+    // A later mapping with an invalid date and an omitted assignment still saves all mentions.
+    await map.click();
+    await expect(page.getByText('Entity mapping complete with warnings', { exact: true })).toBeVisible();
+    const review = page.getByRole('region', { name: 'AI mapping review' });
+    await expect(review).toContainText('2 warnings');
+    await expect(review).toContainText('1 mention is currently unlinked');
+    expect((await read()).annotation.mentions).toHaveLength(2);
+    expect((await read()).annotation.mentions[1].target).toBeNull();
+    await page.reload();
+    await expect(review).toBeVisible();
+    await review.getByText('Review mapping warnings', { exact: true }).click();
+    await expect(review).toContainText('No entity was mapped; mention kept unlinked for review.');
+    await review.getByText('Original model value', { exact: true }).click();
+    await expect(review.locator('pre')).toContainText('2026-99-40');
+    const warnings = (await read()).annotation.mappingIssues;
+    await page.getByRole('button', { name: 'Edit Headache', exact: true }).click();
+    await page.getByLabel('Onset source text', { exact: true }).fill('Tuesday (reviewed)');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect.poll(async () => (await read()).annotation.entities[0].attributes.find((a: any) => a.name === 'onset').value.text).toBe('Tuesday (reviewed)');
+    expect((await read()).annotation.mappingIssues).toEqual(warnings);
+    await page.reload();
+    await expect(review).toBeVisible();
+    await review.getByText('Review mapping warnings', { exact: true }).click();
+    await review.getByText('Original model value', { exact: true }).click();
+    await expect(review.locator('pre')).toContainText('2026-99-40');
+    expect(extractions).toBe(1);
+    expect(mappings).toBe(3);
     const source = page.getByRole('textbox', { name: 'Conversation transcript', exact: true });
     await source.fill('Patient: Nausea.');
     await expect(map).toBeDisabled();

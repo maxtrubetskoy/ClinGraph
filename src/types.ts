@@ -460,6 +460,17 @@ export interface Mention {
   description?: string;
 }
 
+/** Diagnostics from the last AI mapping run, retained even after manual corrections. */
+export interface MappingIssue {
+  code: 'invalid_entity' | 'invalid_attribute' | 'invalid_assignment' | 'conflicting_assignment' | 'unmapped_mention';
+  message: string;
+  entityId?: string;
+  entityName?: string;
+  attributeName?: string;
+  mentionId?: string;
+  originalValue?: unknown;
+}
+
 export interface AnnotationData {
   mentionContextVersion?: 1;
   evidenceVersion?: 2;
@@ -468,6 +479,7 @@ export interface AnnotationData {
   relations: Relation[];
   clinicalNotes: ClinicalCategory;
   mentions?: Mention[];
+  mappingIssues?: MappingIssue[];
 }
 
 export function normalizeAnnotationSchema(schema: AnnotationCategory[]): AnnotationCategory[] {
@@ -790,6 +802,7 @@ export interface AnnotationUtteranceProgress {
 export interface AnnotationProgress {
   requestId?: string;
   operation?: 'extraction' | 'mapping';
+  warningCount?: number;
   stage: 'preparing' | 'extracting' | 'clustering' | 'complete' | 'failed';
   /** Nonblank utterances only; blank text never triggers an extraction request. */
   utterances: AnnotationUtteranceProgress[];

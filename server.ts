@@ -24,6 +24,7 @@ import { aiExtractionConcurrency, mapConcurrent } from "./server/concurrency";
 import { parseTranscriptToSegments } from "./src/utils/transcriptParser";
 import { DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from "./src/types";
 import { annotationResponse } from './server/annotationResponse';
+import { processEntityMapping } from './server/entityMapping';
 import { validateExtractedMentions } from './src/utils/mentionExtraction';
 
 dotenv.config();
@@ -447,80 +448,6 @@ Return JSON ONLY:
   }
 }
 
-function normalizeItemAttributesToSchema(itemAttributes: Record<string, any>, cat: any): Record<string, any> {
-  if (!cat || !Array.isArray(cat.attributes)) return { ...itemAttributes };
-
-  const normalized: Record<string, any> = { ...itemAttributes };
-
-  const aliasMap: Record<string, string[]> = {
-    clinicalstatus: ['clinical_status', 'conditionstatus'],
-    status: [],
-    verificationstatus: ['verification_status'],
-    severity: ['intensity', 'grade'],
-    details: ['description', 'notes', 'comment', 'note'],
-    description: ['details', 'notes', 'comment', 'note'],
-    name: ['title', 'task', 'medication', 'vaccine', 'condition', 'reportName'],
-    task: ['name', 'title'],
-    title: ['name', 'task'],
-    onset: ['duration', 'time', 'date'],
-    value: ['result', 'measurement', 'val'],
-    dosage: ['dose', 'amount'],
-    action: ['plan', 'instruction']
-  };
-
-  for (const attr of cat.attributes) {
-    const attrNameLower = attr.name.toLowerCase();
-
-    // 1. Check direct name or case-insensitive name
-    let val = normalized[attr.name];
-    if (val === undefined || val === null || val === '') {
-      const keyMatch = Object.keys(normalized).find(k => k.toLowerCase() === attrNameLower);
-      if (keyMatch && normalized[keyMatch] !== undefined && normalized[keyMatch] !== null && normalized[keyMatch] !== '') {
-        val = normalized[keyMatch];
-      }
-    }
-
-    // Entity IDs are assigned after clustering. Never persist model-invented procedure references.
-    if (attr.type === 'procedure-reference') {
-      normalized[attr.name] = null;
-      continue;
-    }
-    // Temporal roles are not aliases. A duration must never become an onset/effective date.
-    if (attr.type === 'temporal' || attr.type === 'trajectory') {
-      normalized[attr.name] = val ?? null;
-      continue;
-    }
-
-    // 2. Check aliases
-    if (val === undefined || val === null || val === '') {
-      const aliases = aliasMap[attrNameLower] || [];
-      for (const alias of aliases) {
-        if (normalized[alias] !== undefined && normalized[alias] !== null && normalized[alias] !== '') {
-          val = normalized[alias];
-          break;
-        }
-        const aliasKeyMatch = Object.keys(normalized).find(k => k.toLowerCase() === alias.toLowerCase());
-        if (aliasKeyMatch && normalized[aliasKeyMatch] !== undefined && normalized[aliasKeyMatch] !== null && normalized[aliasKeyMatch] !== '') {
-          val = normalized[aliasKeyMatch];
-          break;
-        }
-      }
-    }
-
-    if (val !== undefined && val !== null && val !== '') {
-      if (attr.type === 'select' && Array.isArray(attr.choices) && attr.choices.length > 0) {
-        const matchedChoice = attr.choices.find((c: string) => c.toLowerCase() === String(val).toLowerCase());
-        normalized[attr.name] = matchedChoice || String(val);
-      } else {
-        normalized[attr.name] = val;
-      }
-    }
-  }
-
-  return normalized;
-}
-
-// Fallback deterministic mention clustering
 async function clusterMentionsIntoEntities(
   client: GoogleGenAI | null,
   modelName: string,
@@ -530,23 +457,8 @@ async function clusterMentionsIntoEntities(
   annotationConfig?: any,
   encounterTime?: TemporalValue | null,
   runContext: AiRunContext = { requestId: randomUUID() }
-): Promise<{
-  title: string;
-  entities: any[];
-  clinicalNotes: any;
-}> {
-  const defaultNotes: any = {};
-  activeSchema.forEach(cat => {
-    defaultNotes[cat.id] = [];
-  });
-
-  if (!mentions || mentions.length === 0) {
-    return {
-      title: "Clinical Consultation",
-      entities: [],
-      clinicalNotes: defaultNotes
-    };
-  }
+): Promise<ReturnType<typeof processEntityMapping>> {
+  if (!mentions.length) return processEntityMapping({ entities: [] }, mentions, activeSchema);
 
   const mentionsSummary = mentions.map(m => ({
     id: m.id,
@@ -683,171 +595,7 @@ The JSON schema you must output is:
       throw new Error("The AI provider returned invalid entity clusters");
     }
 
-    const data = cleanAndParseJson(text);
-    const rawEntities = data.entities || [];
-    const extractedTitle = data.title || "Annotated Clinical Consultation";
-
-    if (!Array.isArray(rawEntities) || rawEntities.length === 0) {
-      throw new Error("The AI provider returned invalid entity clusters");
-    }
-
-    const canonicalEntities: any[] = [];
-    const clinicalNotes: any = { ...defaultNotes };
-    activeSchema.forEach(cat => {
-      clinicalNotes[cat.id] = [];
-    });
-
-    const mentionMap = new Map<string, any>();
-    mentions.forEach(m => mentionMap.set(m.id, m));
-
-    const mappedMentionIds = new Set<string>();
-    let entityCount = 1;
-
-    for (const rawEnt of rawEntities) {
-      const entId = `e${entityCount++}`;
-      const entName = rawEnt.name || "Clinical Entity";
-      const entType = rawEnt.type || "symptoms";
-      const entDesc = rawEnt.description || `${entName} discussed in encounter`;
-
-      const clusterMentionIds: string[] = Array.isArray(rawEnt.mentionIds)
-        ? rawEnt.mentionIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
-        : typeof rawEnt.mentionIds === 'string' && rawEnt.mentionIds.trim()
-        ? [rawEnt.mentionIds.trim()]
-        : [];
-      let representativeSpan: any = null;
-      const attach = (mId: string, attributeName?: string) => {
-        const m = mentionMap.get(mId);
-        if (!m) return;
-        if (mappedMentionIds.has(mId)) throw new Error('Each evidence mention must be assigned once to a valid target');
-        m.entityId = entId;
-        // Preserve hints from older compatible providers, but never promote them to direct evidence.
-        m.supportedAttribute = attributeName || m.supportedAttribute;
-        mappedMentionIds.add(mId);
-        if (!m.supportedAttribute && !representativeSpan && m.textSpan) representativeSpan = m.textSpan;
-      };
-      clusterMentionIds.forEach(mId => attach(mId));
-      for (const [rawAttrName, rawIds] of Object.entries(rawEnt.attributeMentionIds || {})) {
-        const attributeName = rawAttrName.trim();
-        if (!attributeName) continue;
-        const ids: string[] = Array.isArray(rawIds)
-          ? rawIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
-          : typeof rawIds === 'string' && rawIds.trim()
-          ? [rawIds.trim()]
-          : [];
-        ids.forEach(mId => attach(mId, attributeName));
-      }
-
-      canonicalEntities.push({
-        id: entId,
-        name: entName,
-        type: entType,
-        description: entDesc,
-        ...(representativeSpan ? { textSpan: representativeSpan } : {})
-      });
-
-      // Structure category item for clinicalNotes directly
-      const itemAttributes = rawEnt.attributes || {};
-      let noteItem: any = {
-        entityId: entId,
-        name: entName,
-        ...itemAttributes
-      };
-
-      // Ensure item is placed in correct category
-      let targetCatId = entType;
-      const matchingCat = activeSchema.find(c =>
-        c.id.toLowerCase() === entType.toLowerCase() ||
-        (c.entityType || '').toLowerCase() === entType.toLowerCase()
-      );
-      if (!clinicalNotes[targetCatId] && matchingCat) {
-        targetCatId = matchingCat.id;
-      }
-
-      // Clinical conclusions come from explicitly scoped attributes and their evidence.
-      // Do not overwrite workflow/verification status based on negation or description keywords.
-
-      if (matchingCat) {
-        noteItem = normalizeItemAttributesToSchema(noteItem, matchingCat);
-      }
-
-      if (!clinicalNotes[targetCatId]) {
-        clinicalNotes[targetCatId] = [];
-      }
-      clinicalNotes[targetCatId].push(noteItem);
-    }
-
-    // Safety: ensure any unmapped mentions get linked to an entity
-    mentions.forEach(m => {
-      if (!m.entityId || !mappedMentionIds.has(m.id)) {
-        // Try to link to an existing entity of matching name and type, matching name, or matching category
-        const match = canonicalEntities.find(e =>
-          (e.name || '').toLowerCase() === (m.canonicalName || '').toLowerCase() &&
-          e.type === m.entityType
-        ) || canonicalEntities.find(e =>
-          (e.name || '').toLowerCase() === (m.canonicalName || '').toLowerCase()
-        ) || (m.supportedAttribute ? canonicalEntities.find(e => e.type === m.entityType) : null);
-
-        if (match) {
-          m.entityId = match.id;
-          mappedMentionIds.add(m.id);
-          // If this was an attribute evidence mention, ensure attribute value is tracked in clinicalNotes if missing
-          if (m.supportedAttribute) {
-            let noteItem: any = null;
-            for (const catItems of Object.values(clinicalNotes)) {
-              if (Array.isArray(catItems)) {
-                const found = catItems.find((item: any) => item && item.entityId === match.id);
-                if (found) {
-                  noteItem = found;
-                  break;
-                }
-              }
-            }
-            if (noteItem && !noteItem[m.supportedAttribute]) {
-              noteItem[m.supportedAttribute] = m.literalText || null;
-            }
-          }
-        } else {
-          const fallbackId = `e${entityCount++}`;
-          m.entityId = fallbackId;
-          mappedMentionIds.add(m.id);
-          const fallbackEnt = {
-            id: fallbackId,
-            name: m.canonicalName || m.literalText || "Clinical Mention",
-            type: m.entityType,
-            description: m.description || `${m.canonicalName || m.literalText} mentioned in dialogue`,
-            ...(!m.supportedAttribute && m.textSpan ? { textSpan: m.textSpan } : {})
-          };
-          canonicalEntities.push(fallbackEnt);
-          let noteItem: any = {
-            entityId: fallbackId,
-            name: fallbackEnt.name,
-            details: fallbackEnt.description,
-            ...(m.supportedAttribute ? { [m.supportedAttribute]: m.literalText } : {})
-          };
-          const fallbackCat = activeSchema.find(c => c.id.toLowerCase() === m.entityType.toLowerCase() || (c.entityType || '').toLowerCase() === m.entityType.toLowerCase());
-          if (fallbackCat) {
-            noteItem = normalizeItemAttributesToSchema(noteItem, fallbackCat);
-          }
-          if (clinicalNotes[m.entityType]) {
-            clinicalNotes[m.entityType].push(noteItem);
-          } else if (fallbackCat && clinicalNotes[fallbackCat.id]) {
-            clinicalNotes[fallbackCat.id].push(noteItem);
-          } else {
-            const targetCat = fallbackCat ? fallbackCat.id : m.entityType;
-            if (!clinicalNotes[targetCat]) {
-              clinicalNotes[targetCat] = [];
-            }
-            clinicalNotes[targetCat].push(noteItem);
-          }
-        }
-      }
-    });
-
-    return {
-      title: extractedTitle,
-      entities: canonicalEntities,
-      clinicalNotes
-    };
+    return processEntityMapping(cleanAndParseJson(text), mentions, activeSchema);
   } catch (err) {
     throw wrapAiError(err, 'Entity clustering failed');
   }
@@ -1130,13 +878,12 @@ async function startServer() {
       const transcript = segments.map((seg, idx) => `[Segment ${idx}] [${seg.speaker}]: ${seg.text}`).join('\n');
       const clustered = await clusterMentionsIntoEntities(client, config?.model || 'gemini-3.1-flash-lite',
         mentions, activeSchema, transcript, config, encounterTime, runContext);
-      const data = {
-        title: clustered.title,
-        ...normalizeEvidence({ mentionContextVersion: 1, observationStatusVersion: 1,
-          entities: clustered.entities, relations: [], clinicalNotes: clustered.clinicalNotes, mentions }, activeSchema)
-      };
+      const data = clustered;
       progress.stage = 'complete';
-      logAi({ ...runContext, stage: 'entity-clustering' }, 'mapping_completed', { mentionCount: mentions.length });
+      progress.warningCount = data.mappingIssues?.length || 0;
+      logAi({ ...runContext, stage: 'entity-clustering' }, 'mapping_completed', {
+        mentionCount: mentions.length, warningCount: progress.warningCount
+      });
       finish(200, { success: true, data });
     } catch (error: any) {
       runController.abort();

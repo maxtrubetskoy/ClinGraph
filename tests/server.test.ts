@@ -80,6 +80,58 @@ test('mapping validates its saved input before requesting a model and handles ze
   assert.deepEqual(result.data.mentions, []);
 });
 
+test('mapping keeps 120 mentions and valid entities when individual model fields and assignments are invalid', async () => {
+  const segments = [{ id: 's0', speaker: 'Patient', text: 'Headache since Tuesday.' }];
+  const mentions = Array.from({ length: 120 }, (_, i) => ({ id: `m${i + 1}`, entityId: null, entityType: 'symptoms',
+    canonicalName: 'Headache', textSpan: { lineIndex: 0, startChar: 0, endChar: 8, text: 'Headache' } }));
+  const invalidTime = { type: 'temporal', kind: 'absolute', date: '2026-99-40', precision: 'invalid', qualifier: 'maybe', text: 'Tuesday' };
+  const fixture = createServer(async (req, res) => {
+    for await (const _chunk of req) { /* consume request */ }
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ entities: [
+      { name: 'Headache', type: 'symptoms', mentionIds: mentions.slice(0, 117).map(m => m.id),
+        attributeMentionIds: { onset: ['m118'] }, attributes: { severity: 'Mild', onset: invalidTime } },
+      null,
+      { name: 'Nausea', type: 'symptoms', mentionIds: ['m117', 'm119', 'invented-mention'], attributes: { severity: 'Severe' } }
+    ] }) } }] }));
+  });
+  const id = 'partial-mapping';
+  try {
+    const port = await listen(fixture);
+    const response = await send('/map-entities', { mentions, transcriptSegments: segments,
+      aiConfig: { annotation: { provider: 'openai', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'partial', apiKey: '' } } });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.success, true);
+    assert.equal(result.progress.stage, 'complete');
+    assert(result.progress.warningCount > 0);
+    const data = result.data;
+    assert.equal(data.entities.length, 2);
+    assert.equal(data.mentions.length, 120);
+    assert.equal(data.mentions.filter((m: any) => m.target).length, 118);
+    assert.equal(data.mentions.find((m: any) => m.id === 'm120').target, null);
+    assert.equal(data.mentions.find((m: any) => m.id === 'm117').target, null);
+    const headache = data.entities.find((e: any) => e.name === 'Headache');
+    assert.equal(headache.attributes.find((a: any) => a.name === 'severity').value, 'Mild');
+    const onset = headache.attributes.find((a: any) => a.name === 'onset');
+    assert.deepEqual(onset.value, normalizeTemporal('Tuesday'));
+    assert.equal(data.mentions.find((m: any) => m.id === 'm118').target.attributeId, onset.id);
+    assert(data.mappingIssues.some((issue: any) => issue.attributeName === 'onset' && JSON.stringify(issue.originalValue) === JSON.stringify(invalidTime)));
+    assert(data.mappingIssues.some((issue: any) => issue.mentionId === 'm120'));
+    assert.equal((await send('/conversations/' + id, { title: 'Partial result', rawTranscript: 'Patient: Headache since Tuesday.',
+      transcriptSegments: segments, createdAt: new Date().toISOString(), status: 'annotated', annotation: data }, 'PUT')).status, 201);
+    const saved = await (await fetch(base + '/api/conversations/' + id)).json();
+    assert.deepEqual(saved.annotation.mappingIssues, data.mappingIssues);
+    assert.equal(saved.annotation.mentions.length, 120);
+    const checkpoint = await (await send('/conversations/' + id + '/checkpoints', {})).json();
+    assert.deepEqual(checkpoint.snapshot.annotation.mappingIssues, data.mappingIssues);
+  } finally {
+    await fetch(base + '/api/conversations/' + id, { method: 'DELETE' });
+    fixture.closeAllConnections();
+    await new Promise<void>(resolve => fixture.close(() => resolve()));
+  }
+});
+
 test('saved mention extraction survives mapping failure and maps on retry without re-extraction', async () => {
   let extractions = 0;
   let mappings = 0;
@@ -629,7 +681,12 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
     const response = await annotate({ transcript: 'Clinician: Headache. ' + phrase + '. Final report.', annotationSchema: FHIR_ANNOTATION_SCHEMA,
       aiConfig: { annotation: { ...aiConfig.annotation, model } } });
     const result = await response.json();
-    if (model === 'status-invalid') { assert.equal(response.status, 502); assert.equal(result.data, undefined); continue; }
+    if (model === 'status-invalid') {
+      assert.equal(response.status, 200);
+      assert.equal(result.data.entities[0].attributes.find((a: any) => a.name === 'status').value, 'unassigned');
+      assert(result.data.mappingIssues.some((issue: any) => issue.attributeName === 'status' && issue.originalValue === 'refuted'));
+      continue;
+    }
     assert.equal(response.status, 200, JSON.stringify(result));
     assert.equal(result.data.observationStatusVersion, 1);
     const attributes = result.data.entities[0].attributes;
@@ -652,7 +709,14 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
       ...(model === 'trajectory-fhir' ? { annotationSchema: FHIR_ANNOTATION_SCHEMA } : {}),
       aiConfig: { annotation: { ...aiConfig.annotation, model } } });
     const result = await response.json();
-    if (model === 'trajectory-invalid') { assert.equal(response.status, 502); assert.equal(result.data, undefined); continue; }
+    if (model === 'trajectory-invalid') {
+      assert.equal(response.status, 200);
+      const trajectory = result.data.entities[0].attributes.find((a: any) => a.name === 'trajectory').value;
+      assert.equal(trajectory.direction, 'worsened');
+      assert.equal(trajectory.comparedTo, null);
+      assert(result.data.mappingIssues.some((issue: any) => issue.attributeName === 'trajectory'));
+      continue;
+    }
     assert.equal(response.status, 200, JSON.stringify(result));
     const entity = result.data.entities[0];
     const trajectory = entity.attributes.find((a: any) => a.name === 'trajectory');
@@ -696,8 +760,10 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
   assert.equal(durationEntity.attributes.find((a: any) => a.name === 'onset').value, null);
   const badCluster = await annotate({ transcript: 'Patient: No headache since Tuesday.',
     aiConfig: { annotation: { ...aiConfig.annotation, model: 'bad-cluster-model' } } });
-  assert.equal(badCluster.status, 502);
-  assert.equal((await badCluster.json()).data, undefined);
+  assert.equal(badCluster.status, 200);
+  const deduplicated = (await badCluster.json()).data;
+  assert.equal(deduplicated.mentions.length, 2);
+  assert.equal(deduplicated.mentions[1].target.kind, 'attribute');
   const unmappedCluster = await annotate({ transcript: 'Patient: No headache since Tuesday.',
     aiConfig: { annotation: { ...aiConfig.annotation, model: 'unmapped-attribute-model' } } });
   assert.equal(unmappedCluster.status, 200);
@@ -705,8 +771,8 @@ test('OpenAI-compatible annotation and relations work with no Gemini key or loca
   assert.equal(unmappedData.entities.length, 1);
   assert.equal(unmappedData.mentions.length, 2);
   assert.equal(unmappedData.mentions[0].target.kind, 'entity');
-  assert.equal(unmappedData.mentions[1].target.kind, 'attribute');
-  assert.equal(unmappedData.mentions[1].target.entityId, unmappedData.entities[0].id);
+  assert.equal(unmappedData.mentions[1].target, null);
+  assert(unmappedData.mappingIssues.some((issue: any) => issue.mentionId === unmappedData.mentions[1].id));
   const failed = await send('/relations', { aiConfig: { annotation: { ...aiConfig.annotation, model: 'failing-model' } }, entities: [{ id: 'e1' }] });
   assert.equal(failed.status, 502);
   assert.equal((await failed.json()).data, undefined);
