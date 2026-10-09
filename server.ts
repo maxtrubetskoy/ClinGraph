@@ -27,6 +27,16 @@ import type { AnnotationProgress } from './src/types';
 
 dotenv.config();
 
+// Normalize CLINGRAPH_AI_TIMEOUT_MS if configured in seconds (e.g. 180 for 3 minutes, <= 900).
+// Container environments commonly set timeouts in seconds; values <= 900ms would abort
+// real AI extraction requests prematurely within sub-second intervals.
+if (process.env.CLINGRAPH_AI_TIMEOUT_MS) {
+  const parsedTimeout = Number(process.env.CLINGRAPH_AI_TIMEOUT_MS);
+  if (Number.isInteger(parsedTimeout) && parsedTimeout > 0 && parsedTimeout <= 900) {
+    process.env.CLINGRAPH_AI_TIMEOUT_MS = String(parsedTimeout * 1000);
+  }
+}
+
 // Configure undici fetch timeout globally to handle slow/complex AI requests
 const globalAgent = new Agent({
   headersTimeout: 600000, // 10 minutes
@@ -578,7 +588,10 @@ CRITICAL INSTRUCTIONS:
    - Missing workflow/assessment/verification information stays unassigned. Do not infer final because a result was mentioned. Never generate legacy_refuted: that code is reserved for lossless migration of old annotations.
    - For other/custom schemas, follow the defined attributes without inventing assessment/status fields.
 
-3. Every Mention Mapped: Every input mention ID must occur exactly once, either as direct entity evidence in mentionIds or as evidence of one field in attributeMentionIds.
+3. Every Mention Mapped: Every input mention ID (e.g. m1, m2, ...) MUST appear in your output:
+   - If a mention has evidenceTarget kind 'attribute', place its ID in that entity's attributeMentionIds[attributeName] array (e.g. "attributeMentionIds": { "severity": ["m2"], "onset": ["m3"] }).
+   - If a mention has evidenceTarget kind 'entity', place its ID in that entity's mentionIds array.
+   - Do NOT omit any mention from the output entities.
 4. Canonical English Name: The 'name' of each Entity MUST be a standardized English clinical concept name (e.g. 'Headache', 'Essential Hypertension', 'Skin Rash', 'Orthopnea', 'Joint Pain', 'Lisinopril', 'Blood Pressure', 'Dyspepsia').
 5. Synthesized Description: Provide a concise clinical synthesis of the entity combining its mentions (e.g. 'Patient reports moderate dyspepsia and stomach discomfort, denies nausea' or 'Screened for orthopnea; patient explicitly denies nighttime dyspnea').
 6. Direct Category Attributes & Strict Schema Choice Matching (CRITICAL):
@@ -695,11 +708,16 @@ The JSON schema you must output is:
       const entType = rawEnt.type || "symptoms";
       const entDesc = rawEnt.description || `${entName} discussed in encounter`;
 
-      const clusterMentionIds: string[] = Array.isArray(rawEnt.mentionIds) ? rawEnt.mentionIds : [];
+      const clusterMentionIds: string[] = Array.isArray(rawEnt.mentionIds)
+        ? rawEnt.mentionIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
+        : typeof rawEnt.mentionIds === 'string' && rawEnt.mentionIds.trim()
+        ? [rawEnt.mentionIds.trim()]
+        : [];
       let representativeSpan: any = null;
       const attach = (mId: string, attributeName?: string) => {
         const m = mentionMap.get(mId);
-        if (!m || mappedMentionIds.has(mId)) throw new Error('Each evidence mention must be assigned once to a valid target');
+        if (!m) return;
+        if (mappedMentionIds.has(mId)) throw new Error('Each evidence mention must be assigned once to a valid target');
         m.entityId = entId;
         // Preserve hints from older compatible providers, but never promote them to direct evidence.
         m.supportedAttribute = attributeName || m.supportedAttribute;
@@ -707,8 +725,14 @@ The JSON schema you must output is:
         if (!m.supportedAttribute && !representativeSpan && m.textSpan) representativeSpan = m.textSpan;
       };
       clusterMentionIds.forEach(mId => attach(mId));
-      for (const [attributeName, ids] of Object.entries(rawEnt.attributeMentionIds || {})) {
-        if (!attributeName.trim() || !Array.isArray(ids)) throw new Error('Invalid attribute evidence mapping');
+      for (const [rawAttrName, rawIds] of Object.entries(rawEnt.attributeMentionIds || {})) {
+        const attributeName = rawAttrName.trim();
+        if (!attributeName) continue;
+        const ids: string[] = Array.isArray(rawIds)
+          ? rawIds.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
+          : typeof rawIds === 'string' && rawIds.trim()
+          ? [rawIds.trim()]
+          : [];
         ids.forEach(mId => attach(mId, attributeName));
       }
 
@@ -754,29 +778,50 @@ The JSON schema you must output is:
     // Safety: ensure any unmapped mentions get linked to an entity
     mentions.forEach(m => {
       if (!m.entityId || !mappedMentionIds.has(m.id)) {
-        if (m.supportedAttribute) throw new Error('The AI provider left attribute evidence without an owning entity');
-        // Try to link to an existing entity of matching name or type
+        // Try to link to an existing entity of matching name and type, matching name, or matching category
         const match = canonicalEntities.find(e =>
           (e.name || '').toLowerCase() === (m.canonicalName || '').toLowerCase() &&
           e.type === m.entityType
-        );
+        ) || canonicalEntities.find(e =>
+          (e.name || '').toLowerCase() === (m.canonicalName || '').toLowerCase()
+        ) || (m.supportedAttribute ? canonicalEntities.find(e => e.type === m.entityType) : null);
+
         if (match) {
           m.entityId = match.id;
+          mappedMentionIds.add(m.id);
+          // If this was an attribute evidence mention, ensure attribute value is tracked in clinicalNotes if missing
+          if (m.supportedAttribute) {
+            let noteItem: any = null;
+            for (const catItems of Object.values(clinicalNotes)) {
+              if (Array.isArray(catItems)) {
+                const found = catItems.find((item: any) => item && item.entityId === match.id);
+                if (found) {
+                  noteItem = found;
+                  break;
+                }
+              }
+            }
+            if (noteItem && !noteItem[m.supportedAttribute]) {
+              noteItem[m.supportedAttribute] = m.literalText || null;
+            }
+          }
         } else {
           const fallbackId = `e${entityCount++}`;
           m.entityId = fallbackId;
+          mappedMentionIds.add(m.id);
           const fallbackEnt = {
             id: fallbackId,
             name: m.canonicalName || m.literalText || "Clinical Mention",
             type: m.entityType,
-            description: m.description || `${m.canonicalName} mentioned in dialogue`,
-            textSpan: m.textSpan
+            description: m.description || `${m.canonicalName || m.literalText} mentioned in dialogue`,
+            ...(!m.supportedAttribute && m.textSpan ? { textSpan: m.textSpan } : {})
           };
           canonicalEntities.push(fallbackEnt);
           let noteItem: any = {
             entityId: fallbackId,
             name: fallbackEnt.name,
-            details: fallbackEnt.description
+            details: fallbackEnt.description,
+            ...(m.supportedAttribute ? { [m.supportedAttribute]: m.literalText } : {})
           };
           const fallbackCat = activeSchema.find(c => c.id.toLowerCase() === m.entityType.toLowerCase() || (c.entityType || '').toLowerCase() === m.entityType.toLowerCase());
           if (fallbackCat) {
@@ -786,6 +831,12 @@ The JSON schema you must output is:
             clinicalNotes[m.entityType].push(noteItem);
           } else if (fallbackCat && clinicalNotes[fallbackCat.id]) {
             clinicalNotes[fallbackCat.id].push(noteItem);
+          } else {
+            const targetCat = fallbackCat ? fallbackCat.id : m.entityType;
+            if (!clinicalNotes[targetCat]) {
+              clinicalNotes[targetCat] = [];
+            }
+            clinicalNotes[targetCat].push(noteItem);
           }
         }
       }
@@ -815,10 +866,20 @@ async function startServer() {
 
   app.get('/api/runtime', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ storage: storageMode, ...(firebase ? { firebase: firebaseConfig(),
-      ...(process.env.FIREBASE_AUTH_EMULATOR_HOST ? { authEmulatorUrl: `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}` } : {}) } : {}) });
+    res.json({
+      storage: storageMode,
+      hasServerGeminiKey: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+      ...(firebase ? { firebase: firebaseConfig(),
+        ...(process.env.FIREBASE_AUTH_EMULATOR_HOST ? { authEmulatorUrl: `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}` } : {}) } : {})
+    });
   });
-  app.get('/api/health', (_req, res) => res.json({ success: true, status: 'ready', storage: database ? 'sqlite' : 'firestore', authentication: Boolean(firebase) }));
+  app.get('/api/health', (_req, res) => res.json({
+    success: true,
+    status: 'ready',
+    storage: database ? 'sqlite' : 'firestore',
+    authentication: Boolean(firebase),
+    hasServerGeminiKey: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY')
+  }));
   if (firebase) app.use('/api', requireFirebaseUser);
   if (firebase) app.use('/api/archive', legacyArchiveApi(firebase.legacyFirestore));
 
@@ -1217,6 +1278,8 @@ Strict Rules:
 
   // API endpoint for diarized transcription
   app.post("/api/diarize", audioUpload, async (req, res) => {
+    const diarizeController = new AbortController();
+    res.once('close', () => { if (!res.writableEnded) diarizeController.abort(); });
     const { audioBase64, audioMimeType, aiConfig } = req.body;
 
     let userAiConfig: any = null;
@@ -1334,6 +1397,7 @@ Keep the transcription highly professional and accurate. Do not add any extra te
       console.log(`Running diarization using Gemini model "${useGeminiModel}"...`);
       let response;
       try {
+        const diarizeDeadlineMs = Math.max(aiTimeoutMs(), 180000);
         response = await withTimeout(
           client.models.generateContent({
             model: useGeminiModel,
@@ -1342,6 +1406,8 @@ Keep the transcription highly professional and accurate. Do not add any extra te
               { text: prompt }
             ],
             config: {
+              abortSignal: diarizeController.signal,
+              httpOptions: { timeout: diarizeDeadlineMs },
               responseMimeType: "application/json",
               responseSchema: {
                 type: "ARRAY",
@@ -1366,7 +1432,7 @@ Keep the transcription highly professional and accurate. Do not add any extra te
               }
             }
           }),
-          25000,
+          diarizeDeadlineMs,
           "Gemini diarization call timed out"
         );
       } catch (geminiError: any) {
@@ -1397,6 +1463,10 @@ Keep the transcription highly professional and accurate. Do not add any extra te
       });
 
     } catch (error: any) {
+      if (diarizeController.signal.aborted || res.writableEnded) {
+        console.log("Audio transcription and diarization cancelled by client");
+        return;
+      }
       console.error("Error in /api/diarize:", error);
       res.status(error.status || 502).json({
         success: false,
@@ -1650,6 +1720,21 @@ Keep the transcription highly professional and accurate. Do not add any extra te
   // Custom error handler to guarantee JSON response instead of default HTML pages
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error("Unhandled server error:", err);
+    if (err.code === 7 || (typeof err.message === 'string' && (err.message.includes('PERMISSION_DENIED') || err.message.includes('Missing or insufficient permissions')))) {
+      const sa = process.env.AUTHORIZED_SERVICE_ACCOUNT_EMAIL || 'ais-sandbox@ais-europe-west2-d082e3eb33c94.iam.gserviceaccount.com';
+      const conf = firebaseConfig();
+      const message = `PERMISSION_DENIED: Service account '${sa}' lacks permission on project '${conf.projectId}' (database '${conf.firestoreDatabaseId}' or bucket '${conf.storageBucket}'). Run 'bash scripts/prepare-firebase.sh' to grant required IAM roles.`;
+      res.status(403).json({
+        success: false,
+        error: message,
+        code: 'PERMISSION_DENIED',
+        serviceAccount: sa,
+        projectId: conf.projectId,
+        databaseId: conf.firestoreDatabaseId,
+        bucket: conf.storageBucket
+      });
+      return;
+    }
     res.status(err.status || err.statusCode || 500).json({
       success: false,
       error: err.message || "An internal server error occurred"

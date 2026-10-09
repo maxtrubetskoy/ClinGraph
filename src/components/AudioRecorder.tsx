@@ -7,13 +7,17 @@ interface AudioRecorderProps {
   onClearAudio: () => void;
   hasAudio: boolean;
   audioUrl?: string;
+  isTranscribing?: boolean;
+  onStopTranscribing?: () => void;
 }
 
 export default function AudioRecorder({
   onAudioRecorded,
   onClearAudio,
   hasAudio,
-  audioUrl
+  audioUrl,
+  isTranscribing = false,
+  onStopTranscribing
 }: AudioRecorderProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
@@ -270,6 +274,26 @@ export default function AudioRecorder({
                       -{Math.round((1 - audioStats.compressedSize / audioStats.originalSize) * 100)}% Size
                     </span>
                   </div>
+                </div>
+              )}
+
+              {isTranscribing && (
+                <div className="flex items-center justify-between gap-3 bg-sky-50 border border-sky-200 text-sky-900 rounded-lg px-3 py-2 text-xs">
+                  <div className="flex items-center gap-2">
+                    <RefreshCw className="w-3.5 h-3.5 text-sky-600 animate-spin shrink-0" />
+                    <span className="font-medium">AI transcription and speaker diarization in progress...</span>
+                  </div>
+                  {onStopTranscribing && (
+                    <button
+                      type="button"
+                      onClick={onStopTranscribing}
+                      className="flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 shadow-xs cursor-pointer transition-colors"
+                      title="Stop transcription"
+                    >
+                      <Square className="w-3 h-3 fill-rose-600 text-rose-600" />
+                      <span>Stop</span>
+                    </button>
+                  )}
                 </div>
               )}
             </div>

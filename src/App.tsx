@@ -28,14 +28,15 @@ import RawTranscriptView from './components/RawTranscriptView';
 import { Sparkles, Brain, MessageSquare, Shield, HelpCircle, PanelLeftClose, PanelLeftOpen, X, FileText, Check, Edit2, Share2, Copy, ExternalLink, ShieldAlert, Key, Folder, FolderPlus, FileCode, Info, History, Network, ArrowRight, Plus, Settings2 } from 'lucide-react';
 import ExportJsonlModal from './components/ExportJsonlModal';
 
-export default function App({ storageMode = 'sqlite', accountName, onSignOut }: {
-  storageMode?: 'sqlite' | 'firebase'; accountName?: string; onSignOut?: () => void;
+export default function App({ storageMode = 'sqlite', accountName, onSignOut, hasServerGeminiKey = false }: {
+  storageMode?: 'sqlite' | 'firebase'; accountName?: string; onSignOut?: () => void; hasServerGeminiKey?: boolean;
 }) {
   const { conversations, sessionGroups, settings, loading, error: storageError, reload,
     saveConversation, deleteConversation, saveGroup, deleteGroup, saveSettings, saveAudio,
     listCheckpoints, getCheckpoint, createCheckpoint, restoreCheckpoint } = useWorkspace();
   const [activeId, setActiveId] = useState<string | null>(() => new URLSearchParams(window.location.search).get('session'));
   const [audioRevision, setAudioRevision] = useState(0);
+  const [serverGeminiKeyAvailable, setServerGeminiKeyAvailable] = useState(hasServerGeminiKey);
   useEffect(() => {
     if (loading) return;
     setActiveId(previous => previous && conversations.some(c => c.id === previous) ? previous : conversations[0]?.id || null);
@@ -63,8 +64,17 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
   const [audioUrl, setAudioUrl] = useState<string | undefined>(undefined);
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
   const [isDiarizing, setIsDiarizing] = useState(false);
+  const diarizeAbortControllerRef = useRef<AbortController | null>(null);
   const [annotationRuns, setAnnotationRuns] = useState<Record<string, AnnotationProgress>>({});
   const annotatingIds = useRef(new Set<string>());
+
+  useEffect(() => {
+    return () => {
+      if (diarizeAbortControllerRef.current) {
+        diarizeAbortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Session Creation Dialog State
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -94,6 +104,9 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
             if (data && data.status === 'ready') {
               if (active) {
                 setServerStatus('ready');
+                if (data.hasServerGeminiKey !== undefined) {
+                  setServerGeminiKeyAvailable(Boolean(data.hasServerGeminiKey));
+                }
                 // Poll less frequently once ready (15 seconds)
                 timeoutId = setTimeout(checkHealth, 15000);
                 return;
@@ -145,10 +158,15 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
   const annotationConcurrencyValid = isValidAnnotationConcurrency(localConfig.annotation.concurrency);
 
-  // Check if visitor has configured any API keys
-  const hasUserConfiguredKeys = Boolean(
+  // Check if visitor has configured custom API keys or has server-provided Gemini key active
+  const hasCustomApiKey = Boolean(
     userAiConfig?.annotation?.apiKey?.trim() || userAiConfig?.transcription?.apiKey?.trim()
   );
+  const isUsingServerGeminiKey = !hasCustomApiKey && serverGeminiKeyAvailable && (
+    (!userAiConfig?.annotation?.provider || userAiConfig?.annotation?.provider === 'gemini') ||
+    (!userAiConfig?.transcription?.provider || userAiConfig?.transcription?.provider === 'gemini')
+  );
+  const hasUserConfiguredKeys = hasCustomApiKey || isUsingServerGeminiKey;
 
   useEffect(() => {
     if (settings) setUserAiConfig({ ...settings, annotation: {
@@ -646,6 +664,12 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
   const handleDiarize = async () => {
     if (!activeId || !activeConversation) return;
 
+    if (diarizeAbortControllerRef.current) {
+      diarizeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    diarizeAbortControllerRef.current = controller;
+
     setIsDiarizing(true);
     setWarningMessage(null);
 
@@ -668,7 +692,8 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
 
       const response = await apiFetch('/api/diarize', {
         method: 'POST',
-        body: formData
+        body: formData,
+        signal: controller.signal
       });
 
       const result = await safelyParseResponse(response);
@@ -676,7 +701,6 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
       if (!result.success) {
         throw new Error(result.error || 'Diarization processing failed');
       }
-
 
       const { jsonlText, segments } = result.data;
 
@@ -687,11 +711,26 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
       }, { merge: true });
 
     } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        console.log('Audio Diarization was stopped by user');
+        return;
+      }
       console.error('Audio Diarization Failure:', err);
       setWarningMessage(err.message || 'Diarization failed. Please check your connection or try again.');
     } finally {
+      if (diarizeAbortControllerRef.current === controller) {
+        diarizeAbortControllerRef.current = null;
+      }
       setIsDiarizing(false);
     }
+  };
+
+  const handleStopDiarize = () => {
+    if (diarizeAbortControllerRef.current) {
+      diarizeAbortControllerRef.current.abort();
+      diarizeAbortControllerRef.current = null;
+    }
+    setIsDiarizing(false);
   };
 
   // Instantly initializes manual clinical curation and switches view to the workspace
@@ -823,8 +862,19 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
 
       {storageError && (
         <div role="alert" className="bg-rose-50 border-b border-rose-200 px-6 py-3 text-sm text-rose-800">
-          Workspace error: {storageError}. Your last action may not have been saved.
-          <button className="ml-3 underline cursor-pointer" onClick={() => { void reload().catch(() => {}); }}>Reload saved data</button>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <span className="font-semibold">Workspace error:</span> {storageError}. Your last action may not have been saved.
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <button type="button" className="underline font-medium hover:text-rose-950 cursor-pointer" onClick={() => { void reload().catch(() => {}); }}>Reload saved data</button>
+            </div>
+          </div>
+          {storageError.includes('PERMISSION_DENIED') && (
+            <div className="mt-2 text-xs bg-rose-100/70 border border-rose-200 rounded p-2 font-mono text-rose-900 select-all">
+              To authorize preview: <code className="font-bold">bash scripts/prepare-firebase.sh</code>
+            </div>
+          )}
         </div>
       )}
 
@@ -1092,6 +1142,8 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                       onClearAudio={handleClearAudio}
                       hasAudio={activeConversation.hasAudio}
                       audioUrl={audioUrl}
+                      isTranscribing={isDiarizing}
+                      onStopTranscribing={handleStopDiarize}
                     />
                   )}
 
@@ -1106,6 +1158,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                     }}
                     onAnnotate={handleAnnotate}
                     onDiarize={handleDiarize}
+                    onStopDiarize={handleStopDiarize}
                     onManualAnnotate={handleManualAnnotate}
                     isDiarizing={isDiarizing}
                     hasAudio={activeConversation.hasAudio}
@@ -1674,12 +1727,16 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                   )}
 
                   <div>
-                    <label className="block text-2xs font-semibold text-slate-700 mb-1">
-                      {localConfig.transcription.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
-                      <span className="font-normal text-slate-500 ml-1.5 text-2xs">
-                        {localConfig.transcription.provider === 'gemini' ? '(Or set GEMINI_API_KEY in .env)' : '(Optional for local endpoints)'}
-                      </span>
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-2xs font-semibold text-slate-700">
+                        {localConfig.transcription.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
+                      </label>
+                      {localConfig.transcription.provider === 'gemini' && serverGeminiKeyAvailable && !localConfig.transcription.apiKey && (
+                        <span className="text-emerald-700 font-medium bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded text-2xs flex items-center gap-1">
+                          <Check className="w-3 h-3" /> AI Studio default key active
+                        </span>
+                      )}
+                    </div>
                     <input
                       type="password"
                       value={localConfig.transcription.apiKey || ''}
@@ -1687,7 +1744,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                         ...localConfig,
                         transcription: { ...localConfig.transcription, apiKey: e.target.value }
                       })}
-                      placeholder={localConfig.transcription.provider === 'gemini' ? 'AIzaSy...' : 'sk-...'}
+                      placeholder={localConfig.transcription.provider === 'gemini' && serverGeminiKeyAvailable ? 'Using AI Studio default key (or enter custom key)' : (localConfig.transcription.provider === 'gemini' ? 'AIzaSy...' : 'sk-...')}
                       className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-brand-500 transition-all"
                     />
                   </div>
@@ -1784,12 +1841,16 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                   )}
 
                   <div>
-                    <label className="block text-2xs font-semibold text-slate-700 mb-1">
-                      {localConfig.annotation.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
-                      <span className="font-normal text-slate-500 ml-1.5 text-2xs">
-                        {localConfig.annotation.provider === 'gemini' ? '(Or set GEMINI_API_KEY in .env)' : '(Optional for local endpoints)'}
-                      </span>
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-2xs font-semibold text-slate-700">
+                        {localConfig.annotation.provider === 'gemini' ? 'Gemini API Key' : 'OpenAI / Custom API Key'}
+                      </label>
+                      {localConfig.annotation.provider === 'gemini' && serverGeminiKeyAvailable && !localConfig.annotation.apiKey && (
+                        <span className="text-emerald-700 font-medium bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded text-2xs flex items-center gap-1">
+                          <Check className="w-3 h-3" /> AI Studio default key active
+                        </span>
+                      )}
+                    </div>
                     <input
                       type="password"
                       value={localConfig.annotation.apiKey || ''}
@@ -1797,7 +1858,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                         ...localConfig,
                         annotation: { ...localConfig.annotation, apiKey: e.target.value }
                       })}
-                      placeholder={localConfig.annotation.provider === 'gemini' ? 'AIzaSy...' : 'sk-...'}
+                      placeholder={localConfig.annotation.provider === 'gemini' && serverGeminiKeyAvailable ? 'Using AI Studio default key (or enter custom key)' : (localConfig.annotation.provider === 'gemini' ? 'AIzaSy...' : 'sk-...')}
                       className="w-full h-9 bg-white border border-slate-200 rounded-lg px-2.5 text-xs text-slate-700 font-mono outline-none focus:border-brand-500 transition-all"
                     />
                   </div>
@@ -1811,6 +1872,11 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut }: 
                     <span className="text-emerald-700 font-semibold flex items-center gap-1">
                       <Check className="w-3.5 h-3.5" />
                       <span>Custom API key configured</span>
+                    </span>
+                  ) : serverGeminiKeyAvailable ? (
+                    <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>AI Studio default Gemini key active</span>
                     </span>
                   ) : (
                     <span className="text-slate-500 font-medium">
