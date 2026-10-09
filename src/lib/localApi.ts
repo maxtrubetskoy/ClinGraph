@@ -2,7 +2,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(`/api${path}`, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw new Error(body?.error || `Server returned HTTP ${response.status}`);
+    throw Object.assign(new Error(body?.error || `Server returned HTTP ${response.status}`), { status: response.status });
   }
   return response.status === 204 ? undefined as T : response.json();
 }

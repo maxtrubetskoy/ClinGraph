@@ -8,6 +8,7 @@ import { schemaSnapshot, validateSchemaSnapshot } from './checkpoints';
 import { normalizeEvidence } from '../src/utils/evidence';
 import { normalizeTemporal, validateEncounterTime } from '../src/utils/temporal';
 import { ANNOTATION_CONCURRENCY_ERROR, isValidAnnotationConcurrency } from '../src/utils/annotationConcurrency';
+import { validateExtractedMentions } from '../src/utils/mentionExtraction';
 
 export class StorageError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -17,6 +18,28 @@ export const isObject = (value: unknown): value is Record<string, any> =>
 export function validateId(id: string) {
   if (!/^[\w-]{1,128}$/.test(id)) throw new StorageError(400, 'Invalid record ID');
 }
+
+/** Optimistic ownership check, executed within each storage backend's write boundary. */
+export function conversationPatch(previous: Conversation | undefined, input: Record<string, any>) {
+  const { expectedAnnotationRunId, ...patch } = input;
+  if (expectedAnnotationRunId !== undefined && expectedAnnotationRunId !== (previous?.annotationRunId ?? null)) {
+    throw new StorageError(409, 'This annotation run was superseded. Reload the session to use its current saved state.');
+  }
+  if (patch.annotationRunId != null) {
+    if (typeof patch.annotationRunId !== 'string') throw new StorageError(400, 'Invalid annotation run ID');
+    validateId(patch.annotationRunId);
+  }
+  if (previous && expectedAnnotationRunId === undefined && (
+    (patch.rawTranscript !== undefined && patch.rawTranscript !== previous.rawTranscript) ||
+    (patch.transcriptSegments !== undefined && JSON.stringify(patch.transcriptSegments) !== JSON.stringify(previous.transcriptSegments)) ||
+    patch.annotation !== undefined || patch.encounterTime !== undefined || patch.schemaSnapshot !== undefined
+  )) {
+    patch.annotationRunId = null;
+    if (previous.status === 'processing' && patch.status === undefined) patch.status = previous.annotation ? 'annotated' : 'draft';
+  }
+  return patch;
+}
+
 export function validateConversation(data: any) {
   if (!isObject(data) || typeof data.title !== 'string' || !data.title.trim() ||
       typeof data.rawTranscript !== 'string' || !Array.isArray(data.transcriptSegments) ||
@@ -33,6 +56,16 @@ export function validateConversation(data: any) {
       !isObject(data.annotation.clinicalNotes) ||
       (data.annotation.mentions != null && !Array.isArray(data.annotation.mentions)))) {
     throw new StorageError(400, 'Invalid annotation');
+  }
+  if (data.mentionExtraction != null) {
+    try {
+      const extraction = data.mentionExtraction;
+      if (!isObject(extraction) || extraction.progress?.stage !== 'complete' ||
+          !Array.isArray(extraction.progress.utterances) || extraction.progress.utterances.some((item: any) =>
+            !item || !Number.isInteger(item.lineIndex) || item.lineIndex < 0 ||
+            !['complete', 'skipped'].includes(item.status))) throw new Error('Invalid mention extraction progress.');
+      validateExtractedMentions(extraction.mentions, data.transcriptSegments);
+    } catch (error) { throw new StorageError(400, (error as Error).message); }
   }
 }
 
@@ -103,7 +136,11 @@ export class LocalDatabase {
       throw new StorageError(409, 'Conversation already exists');
     }
     const previous = create ? undefined : this.getConversation(id);
-    const data = { ...previous, ...input, id } as Conversation;
+    const data = { ...previous, ...conversationPatch(previous, input), id } as Conversation;
+    if (previous && input.mentionExtraction === undefined && (
+      data.rawTranscript !== previous.rawTranscript ||
+      JSON.stringify(data.transcriptSegments) !== JSON.stringify(previous.transcriptSegments)
+    )) data.mentionExtraction = null;
     validateConversation(data);
     // A previous run's utterance indices no longer describe an edited transcript.
     if (previous && input.annotationProgress === undefined && (
@@ -188,10 +225,10 @@ export class LocalDatabase {
         mentionCount: conversation.annotation?.mentions?.length || 0,
       };
       // Explicit allowlist: no audio, provider settings, credentials, or transient UI state.
-      const { title, rawTranscript, transcriptSegments, annotation, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } = conversation;
+      const { title, rawTranscript, transcriptSegments, annotation, mentionExtraction, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } = conversation;
       const checkpoint: AnnotationCheckpoint = {
         ...summary, snapshotFormatVersion: 1, schema,
-        snapshot: { title, rawTranscript, transcriptSegments, annotation, encounterTime, encounterType, status, createdAt, groupId, restoredFrom },
+        snapshot: { title, rawTranscript, transcriptSegments, annotation, mentionExtraction, encounterTime, encounterType, status, createdAt, groupId, restoredFrom },
       };
       this.db.prepare('INSERT INTO annotation_checkpoints (id, conversation_id, version, summary, data) VALUES (?, ?, ?, ?, ?)')
         .run(checkpoint.id, id, checkpoint.version, JSON.stringify(summary), JSON.stringify(checkpoint));

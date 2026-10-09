@@ -469,24 +469,62 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
     return result;
   };
 
-  const handleAnnotate = async (text?: string) => {
+  const handleAnnotationStage = async (operation: 'extraction' | 'mapping', text?: string) => {
     if (!activeId || !activeConversation || annotatingIds.current.has(activeId)) return;
 
+    if (activeConversation.status === 'processing' || (operation === 'mapping' && !activeConversation.mentionExtraction)) return;
+    const runId = crypto.randomUUID();
+    let started = false;
     annotatingIds.current.add(activeId);
-    let latestProgress: AnnotationProgress = { stage: 'preparing', utterances: [] };
+    let extractionUtterances = activeConversation.mentionExtraction?.progress.utterances || [];
+    let latestProgress: AnnotationProgress = { operation, stage: 'preparing',
+      utterances: operation === 'mapping' ? extractionUtterances : [] };
     const updateProgress = (progress: AnnotationProgress) => {
-      latestProgress = progress;
-      setAnnotationRuns(previous => ({ ...previous, [activeId]: progress }));
+      latestProgress = { ...progress, operation,
+        ...(operation === 'mapping' ? { utterances: extractionUtterances } : {}) };
+      setAnnotationRuns(previous => ({ ...previous, [activeId]: latestProgress }));
     };
     updateProgress(latestProgress);
     setWarningMessage(null);
     try {
-      const sourceConversation = text !== undefined && text !== activeConversation.rawTranscript
+      let sourceConversation = text !== undefined && text !== activeConversation.rawTranscript
         ? await handleTranscriptChange(text)
         : activeConversation;
       if (!sourceConversation) return;
-      if (sourceConversation.annotation) await createCheckpoint(activeId, 'Before AI regeneration', 'before-ai');
-      await saveConversation(activeId, { status: 'processing', annotationProgress: null }, { merge: true });
+      if (sourceConversation.annotation || sourceConversation.mentionExtraction) {
+        await createCheckpoint(activeId, operation === 'mapping' ? 'Before entity mapping' : 'Before mention extraction', 'before-ai');
+      }
+      // Use the fresh saved source returned when acquiring ownership: another
+      // tab may have edited or replaced extraction while the checkpoint saved.
+      sourceConversation = await saveConversation(activeId, { status: 'processing', annotationProgress: null, annotationRunId: runId },
+        { merge: true, expectedAnnotationRunId: sourceConversation.annotationRunId ?? null });
+      started = true;
+      if (operation === 'mapping') {
+        extractionUtterances = sourceConversation.mentionExtraction?.progress.utterances || [];
+        if (!sourceConversation.mentionExtraction) throw new Error('The source changed before mapping started. Extract mentions again.');
+        const response = await apiFetch('/api/map-entities', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+          body: JSON.stringify({
+            mentions: sourceConversation.mentionExtraction!.mentions,
+            transcriptSegments: sourceConversation.transcriptSegments,
+            annotationSchema: activeSchema,
+            encounterTime: sourceConversation.encounterTime || null,
+            aiConfig: userAiConfig
+          })
+        });
+        const result = await readAnnotationResponse(response, updateProgress);
+        const { title, ...annotation } = result.data;
+        await saveConversation(activeId, {
+          title: sourceConversation.title?.trim() || title || 'Annotated Clinical Session',
+          annotation,
+          status: 'annotated',
+          annotationProgress: latestProgress,
+          annotationRunId: null
+        }, { merge: true, expectedAnnotationRunId: runId });
+        return;
+      }
+
       let response;
       const schemaToPass = activeSchema;
       if (sourceConversation.audioLocalId && !sourceConversation.rawTranscript.trim()) {
@@ -504,7 +542,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
             formData.append('aiConfig', JSON.stringify(userAiConfig));
           }
 
-          response = await apiFetch('/api/annotate', {
+          response = await apiFetch('/api/extract-mentions', {
             method: 'POST',
             headers: { Accept: 'application/x-ndjson' },
             body: formData
@@ -513,7 +551,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
       }
 
       if (!response) {
-        response = await apiFetch('/api/annotate', {
+        response = await apiFetch('/api/extract-mentions', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -539,7 +577,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
       }
 
 
-      const { title, rawTranscript, transcriptSegments, entities, relations, clinicalNotes, mentions } = result.data;
+      const { rawTranscript, transcriptSegments, mentions } = result.data;
 
       // Check if original transcript was in JSON / JSONL format to avoid scrambling it
       const isOriginalJson = sourceConversation.rawTranscript && isJsonOrJsonlFormat(sourceConversation.rawTranscript);
@@ -562,27 +600,16 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
         finalSegments = parseTranscriptToSegments(finalRawTranscript, sourceConversation.encounterType || 'dialogue');
       }
 
-      // Preserve existing session title if already set rather than replacing with AI generated title
-      const existingTitle = sourceConversation.title?.trim();
-      const finalTitle = existingTitle || title || 'Annotated Clinical Session';
-
-      const updatePayload: Partial<Conversation> = {
-        title: finalTitle,
+      // Persist the raw extraction before any mapping request can be started. Keep
+      // attribute-name hints here; final annotation normalization removes them.
+      await saveConversation(activeId, {
         rawTranscript: finalRawTranscript,
         transcriptSegments: finalSegments,
-        annotation: {
-          evidenceVersion: 2,
-          entities: entities || [],
-          relations: [], // Separated altogether from Generate AI Annotations
-          clinicalNotes: clinicalNotes || { symptoms: [], conditions: [], medications: [], followUps: [], measurements: [] },
-          mentions: mentions || []
-        },
-        status: 'annotated',
-        annotationProgress: result.progress || null
-      };
-
-      // Update local database with the structured annotations returned by Gemini
-      await saveConversation(activeId, updatePayload, { merge: true });
+        mentionExtraction: { mentions: mentions || [], progress: latestProgress },
+        status: sourceConversation.annotation ? 'annotated' : 'draft',
+        annotationProgress: latestProgress,
+        annotationRunId: null
+      }, { merge: true, expectedAnnotationRunId: runId });
 
     } catch (err: any) {
       console.error('Medical Annotation Failure:', err);
@@ -592,7 +619,13 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
         utterances: latestProgress.utterances.map(item => item.status === 'in_progress' ? { ...item, status: 'pending' } : item)
       };
       updateProgress(failedProgress);
-      await saveConversation(activeId, { status: 'failed', annotationProgress: failedProgress }, { merge: true }).catch(() => {});
+      if (err.status === 409) {
+        setWarningMessage(err.message);
+        await reload().catch(() => {});
+      } else if (started) {
+        await saveConversation(activeId, { status: 'failed', annotationProgress: failedProgress, annotationRunId: null },
+          { merge: true, expectedAnnotationRunId: runId }).catch(() => reload().catch(() => {}));
+      } else setWarningMessage(failedProgress.error!);
     } finally {
       annotatingIds.current.delete(activeId);
       setAnnotationRuns(previous => {
@@ -611,7 +644,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
 
     const entities = activeConversation.annotation?.entities;
     if (!entities || entities.length === 0) {
-      setWarningMessage('No clinical entities available. Please run "Generate AI Annotations" first to extract entities before generating relationships.');
+      setWarningMessage('No clinical entities available. Extract mentions and then map entities before generating relationships.');
       return;
     }
 
@@ -1156,7 +1189,17 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
                       if (selectedEntityId) setSelectedEntityId(null);
                       if (selectedMentionId) setSelectedMentionId(null);
                     }}
-                    onAnnotate={handleAnnotate}
+                    onAnnotate={text => handleAnnotationStage('extraction', text)}
+                    onMapEntities={() => handleAnnotationStage('mapping')}
+                    onResumeAnnotation={activeConversation.status === 'processing' && !annotationRuns[activeConversation.id] ? async () => {
+                      try {
+                        await saveConversation(activeConversation.id, {
+                          status: activeConversation.annotation ? 'annotated' : 'draft', annotationRunId: null,
+                          annotationProgress: activeConversation.mentionExtraction?.progress || null
+                        }, { merge: true, expectedAnnotationRunId: activeConversation.annotationRunId ?? null });
+                      } catch (error) { setWarningMessage((error as Error).message); }
+                    } : undefined}
+                    mentionExtraction={activeConversation.mentionExtraction}
                     onDiarize={handleDiarize}
                     onStopDiarize={handleStopDiarize}
                     onManualAnnotate={handleManualAnnotate}
@@ -1175,7 +1218,7 @@ export default function App({ storageMode = 'sqlite', accountName, onSignOut, ha
               </div>
 
               {/* Annotation & Knowledge Graph Dashboard */}
-              {activeConversation.status === 'annotated' && activeConversation.annotation && (
+              {activeConversation.annotation && !annotationRuns[activeConversation.id] && (
                 <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
                   {/* Left Column (Interactive Visualization - 7 Cols) */}
                   <div className="xl:col-span-7 min-w-0 relative">

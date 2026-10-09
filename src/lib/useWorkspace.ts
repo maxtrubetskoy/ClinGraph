@@ -35,8 +35,9 @@ export function useWorkspace() {
     window.addEventListener('focus', refresh);
     return () => { mounted.current = false; requests.current.abort(); window.removeEventListener('focus', refresh); };
   }, [reload]);
-  const saveConversation = useCallback((id: string, data: Partial<Conversation>, options?: { merge: boolean }) => run(async () => {
-    const saved = await request<Conversation>(`/conversations/${encodeURIComponent(id)}`, jsonRequest(options?.merge ? 'PATCH' : 'PUT', data));
+  const saveConversation = useCallback((id: string, data: Partial<Conversation>, options?: { merge: boolean; expectedAnnotationRunId?: string | null }) => run(async () => {
+    const saved = await request<Conversation>(`/conversations/${encodeURIComponent(id)}`, jsonRequest(options?.merge ? 'PATCH' : 'PUT',
+      { ...data, ...(options?.expectedAnnotationRunId !== undefined ? { expectedAnnotationRunId: options.expectedAnnotationRunId } : {}) }));
     setWorkspace(prev => ({ ...prev, conversations: replace(prev.conversations, saved) }));
     return saved;
   }), [run]);

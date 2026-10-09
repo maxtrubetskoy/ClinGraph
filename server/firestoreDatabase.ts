@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Firestore, DocumentReference, DocumentSnapshot, Transaction } from 'firebase-admin/firestore';
 import type { Bucket } from '@google-cloud/storage';
-import { StorageError, isObject, validateConversation, validateId } from './database';
+import { StorageError, isObject, validateConversation, validateId, conversationPatch } from './database';
 import { schemaSnapshot, validateSchemaSnapshot } from './checkpoints';
 import { normalizeEvidence } from '../src/utils/evidence';
 import { normalizeTemporal, validateEncounterTime } from '../src/utils/temporal';
@@ -88,7 +88,11 @@ export class FirestoreDatabase implements WorkspaceDatabase {
       if (create && snapshot.exists) throw new StorageError(409, 'Conversation already exists');
       if (!create && (!snapshot.exists || snapshot.data()!.userId !== this.userId)) throw new StorageError(404, 'Conversation not found');
       const previous = snapshot.exists ? await this.conversation(snapshot, tx, true) : undefined;
-      const value = { ...previous, ...input, id, userId: this.userId, isShared: false } as Conversation;
+      const value = { ...previous, ...conversationPatch(previous, input), id, userId: this.userId, isShared: false } as Conversation;
+      if (previous && input.mentionExtraction === undefined && (
+        value.rawTranscript !== previous.rawTranscript ||
+        JSON.stringify(value.transcriptSegments) !== JSON.stringify(previous.transcriptSegments)
+      )) value.mentionExtraction = null;
       validateConversation(value);
       const group = await this.groupIfPresent(value.groupId, tx);
       if (value.groupId != null && !group) throw new StorageError(404, 'Session group not found');
@@ -245,9 +249,9 @@ export class FirestoreDatabase implements WorkspaceDatabase {
         createdAt: new Date().toISOString(), label: input.label?.trim() || '', reason: input.reason || 'manual',
         schemaVersion: schema.version, entityCount: conversation.annotation?.entities.length || 0,
         mentionCount: conversation.annotation?.mentions?.length || 0 };
-      const { title, rawTranscript, transcriptSegments, annotation, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } = conversation;
+      const { title, rawTranscript, transcriptSegments, annotation, mentionExtraction, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } = conversation;
       const checkpoint: AnnotationCheckpoint = { ...summary, snapshotFormatVersion: 1, schema,
-        snapshot: { title, rawTranscript, transcriptSegments, annotation, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } };
+        snapshot: { title, rawTranscript, transcriptSegments, annotation, mentionExtraction, encounterTime, encounterType, status, createdAt, groupId, restoredFrom } };
       const stored = await this.encode(checkpoint, `conversations/${id}/checkpoints/${checkpointId}`);
       tx.create(document.ref.collection('checkpoints').doc(checkpointId), { ...stored, summary, userId: this.userId });
       tx.update(document.ref, { checkpointVersion: version });

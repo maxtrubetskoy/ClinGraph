@@ -12,8 +12,8 @@ const states = {
 const errorDetail = (error?: string) => error?.replace(/^Mention extraction failed for utterance \d+: /, '')
   .replace(/for utterance (\d+)/g, (_, index) => `for utterance ${Number(index) + 1}`);
 
-export default function AnnotationProgress({ progress, encounterType = 'dialogue' }: {
-  progress: Progress; encounterType?: 'dialogue' | 'note';
+export default function AnnotationProgress({ progress, encounterType = 'dialogue', hasSavedMentions = false }: {
+  progress: Progress; encounterType?: 'dialogue' | 'note'; hasSavedMentions?: boolean;
 }) {
   const total = progress.utterances.length;
   const complete = progress.utterances.filter(item => item.status === 'complete').length;
@@ -22,10 +22,12 @@ export default function AnnotationProgress({ progress, encounterType = 'dialogue
   const pending = total - complete - skipped - inProgress;
   const running = !['complete', 'failed'].includes(progress.stage);
   const unit = encounterType === 'note' ? 'Segment' : 'Utterance';
-  const stage = progress.stage === 'preparing' ? 'Preparing transcript…'
-    : progress.stage === 'extracting' ? `Annotating ${unit.toLowerCase()}s…`
+  const stage = progress.stage === 'preparing' ? (progress.operation === 'mapping' ? 'Preparing entity mapping…' : 'Preparing transcript…')
+    : progress.stage === 'extracting' ? `Extracting mentions from ${unit.toLowerCase()}s…`
     : progress.stage === 'clustering' ? 'Organizing clinical entities…'
-    : progress.stage === 'failed' ? 'AI annotation failed'
+    : progress.stage === 'failed' ? (progress.operation === 'mapping' ? 'Entity mapping failed' : 'Mention extraction failed')
+    : progress.operation === 'mapping' ? 'Entity mapping complete'
+    : progress.operation === 'extraction' ? (skipped ? `Mentions extracted with skipped ${unit.toLowerCase()}s` : 'Mentions extracted')
     : skipped ? `AI annotation finished with skipped ${unit.toLowerCase()}s` : 'AI annotation complete';
   const summary = `${complete} complete, ${inProgress} in progress, ${skipped} skipped due to an error, ${pending} ${progress.stage === 'failed' ? 'not processed' : 'pending'}`;
 
@@ -38,6 +40,9 @@ export default function AnnotationProgress({ progress, encounterType = 'dialogue
         </div>
         <span className="text-xs text-slate-500">{complete + skipped} / {total} {unit.toLowerCase()}s processed</span>
       </div>
+      {progress.stage === 'failed' && progress.operation === 'mapping' && hasSavedMentions && (
+        <p className="text-xs text-slate-600">Extracted mentions are saved. Use Map entities to retry.</p>
+      )}
       <div role="status" aria-live="polite" aria-atomic="true" className="flex items-center gap-2 text-xs text-slate-600">
         {running && <LoaderCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 motion-safe:animate-spin text-sky-600" />}
         <span>{stage}</span><span className="sr-only">. {summary}</span>

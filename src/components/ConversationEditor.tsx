@@ -2,13 +2,16 @@ import { useState, useEffect, useRef } from 'react';
 import { Play, ClipboardCopy, FileText, Sparkles, AlertCircle, Info, Download, Edit, Key, Square } from 'lucide-react';
 import { isJsonOrJsonlFormat } from '../utils/transcriptParser';
 import AnnotationProgress from './AnnotationProgress';
-import type { AnnotationProgress as Progress } from '../types';
+import type { AnnotationProgress as Progress, MentionExtraction } from '../types';
 
 interface ConversationEditorProps {
   rawTranscript: string;
   onTranscriptChange: (text: string) => void;
   onFocusEditor?: () => void;
   onAnnotate: (text: string) => void;
+  onMapEntities: () => void;
+  onResumeAnnotation?: () => void;
+  mentionExtraction?: MentionExtraction | null;
   onDiarize: () => void;
   onStopDiarize?: () => void;
   onManualAnnotate: () => void;
@@ -121,6 +124,9 @@ export default function ConversationEditor({
   onTranscriptChange,
   onFocusEditor,
   onAnnotate,
+  onMapEntities,
+  onResumeAnnotation,
+  mentionExtraction,
   onDiarize,
   onStopDiarize,
   onManualAnnotate,
@@ -366,7 +372,33 @@ export default function ConversationEditor({
         </div>
       </div>
 
-      {annotationProgress && <AnnotationProgress progress={annotationProgress} encounterType={encounterType} />}
+      {annotationProgress && <AnnotationProgress progress={annotationProgress} encounterType={encounterType} hasSavedMentions={Boolean(mentionExtraction)} />}
+
+      {onResumeAnnotation && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-xs text-amber-900 space-y-2">
+          <p>Another tab may still be processing this session. If that request was interrupted, resume here. Saved mentions stay available; unfinished results from the previous run will be ignored.</p>
+          <button onClick={onResumeAnnotation} className="btn btn-secondary">
+            {mentionExtraction ? 'Resume saved mentions' : 'Reset interrupted run'}
+          </button>
+        </div>
+      )}
+
+      {mentionExtraction && localText === rawTranscript && (
+        <section aria-label="Saved mention extraction" className="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-600 space-y-2">
+          <p className="font-semibold text-slate-800">{mentionExtraction.mentions.length} extracted mentions saved</p>
+          <p>Map these mentions to clinical entities when ready. You can retry mapping without extracting again.</p>
+          <details>
+            <summary className="cursor-pointer font-medium">View extracted mentions</summary>
+            <ol className="mt-2 max-h-48 overflow-y-auto space-y-1">
+              {mentionExtraction.mentions.map(mention => <li key={mention.id}>
+                <span className="font-medium">{mention.textSpan.text}</span>
+                {' — '}{encounterType === 'note' ? 'Segment' : 'Utterance'} {mention.textSpan.lineIndex + 1}
+                {mention.supportedAttribute && ` · ${mention.supportedAttribute}`}
+              </li>)}
+            </ol>
+          </details>
+        </section>
+      )}
 
       {/* API Key hint if unset */}
       {!hasApiKey && !isReadOnly && (
@@ -464,13 +496,13 @@ export default function ConversationEditor({
                 disabled={status === 'processing' || isDiarizing || !localText.trim() || !isServerReady}
                 className={`btn ${hasApiKey ? 'btn-primary' : 'btn-secondary'}`}
               >
-                {status === 'processing' ? (
+                {status === 'processing' && annotationProgress?.operation !== 'mapping' ? (
                   <>
                     <svg className="animate-spin h-4 w-4 text-slate-500" fill="none" viewBox="0 0 24 24">
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                     </svg>
-                    <span>Analyzing Medical Encounters...</span>
+                    <span>Extracting mentions…</span>
                   </>
                 ) : !isServerReady ? (
                   <>
@@ -480,9 +512,17 @@ export default function ConversationEditor({
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4 fill-white/20" />
-                    <span>Generate AI Annotations</span>
+                    <span>Extract mentions</span>
                   </>
                 )}
+              </button>
+              <button
+                onClick={onMapEntities}
+                disabled={!mentionExtraction || localText !== rawTranscript || status === 'processing' || isDiarizing || !isServerReady}
+                className={`btn ${mentionExtraction ? 'btn-primary' : 'btn-secondary'}`}
+              >
+                <Sparkles className="w-4 h-4" />
+                <span>{status === 'processing' && annotationProgress?.operation === 'mapping' ? 'Mapping entities…' : 'Map entities'}</span>
               </button>
             </>
           )}

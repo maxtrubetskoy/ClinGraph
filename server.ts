@@ -23,7 +23,8 @@ import { FirestoreDatabase } from './server/firestoreDatabase';
 import { aiExtractionConcurrency, mapConcurrent } from "./server/concurrency";
 import { parseTranscriptToSegments } from "./src/utils/transcriptParser";
 import { DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema } from "./src/types";
-import type { AnnotationProgress } from './src/types';
+import { annotationResponse } from './server/annotationResponse';
+import { validateExtractedMentions } from './src/utils/mentionExtraction';
 
 dotenv.config();
 
@@ -889,8 +890,8 @@ async function startServer() {
 
   app.use('/api', localApi(database || (req => new FirestoreDatabase(firebase!.firestore, firebase!.bucket, req.res!.locals.userId))));
 
-  // API endpoint for annotation and transcription
-  app.post("/api/annotate", audioUpload, async (req, res) => {
+  // Extract mentions only; mapping is a separate request using the saved output.
+  app.post("/api/extract-mentions", audioUpload, async (req, res) => {
     const runController = new AbortController();
     const runContext: AiRunContext = { requestId: randomUUID(), signal: runController.signal };
     res.setHeader('X-Request-ID', runContext.requestId);
@@ -929,30 +930,7 @@ async function startServer() {
       return res.status(error.status || 500).json({ success: false, error: error.message });
     }
 
-    const streaming = req.get('Accept')?.includes('application/x-ndjson');
-    const progress: AnnotationProgress = { requestId: runContext.requestId, stage: 'preparing', utterances: [] };
-    const publishProgress = () => {
-      if (streaming && !res.destroyed && !res.writableEnded) {
-        res.write(JSON.stringify({ type: 'progress', progress }) + '\n');
-      }
-    };
-    const finish = (status: number, result: Record<string, unknown>) => {
-      if (res.destroyed) return;
-      const payload = { ...result, requestId: runContext.requestId, progress };
-      if (streaming) res.end(JSON.stringify({ type: 'result', ...payload }) + '\n');
-      else res.status(status).json(payload);
-    };
-    if (streaming) {
-      res.setHeader('Content-Type', 'application/x-ndjson');
-      res.setHeader('Cache-Control', 'no-cache, no-store, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.flushHeaders();
-      publishProgress();
-      const heartbeat = setInterval(() => {
-        if (!res.destroyed && !res.writableEnded) res.write('{"type":"heartbeat"}\n');
-      }, 15000);
-      res.once('close', () => clearInterval(heartbeat));
-    }
+    const { progress, publishProgress, finish } = annotationResponse(req, res, runContext.requestId, 'extraction');
 
     try {
       const annotationConfig = userAiConfig?.annotation;
@@ -1085,35 +1063,10 @@ async function startServer() {
 
       console.log(`Step 1 Complete: Extracted ${allMentions.length} mentions with polarity, temporality, certainty, experiencer, function, and canonical English names.`);
 
-      // STEP 2: Cluster and organize existing mentions into relevant canonical Entities
-      console.log(`Step 2: Clustering and organizing ${allMentions.length} mentions into canonical Entities...`);
-      progress.stage = 'clustering';
-      publishProgress();
-      const fullTranscriptText = parsedSegments.map((seg, idx) => `[Segment ${idx}] [${seg.speaker}]: ${seg.text}`).join('\n');
-
-      const clusteredResult = await clusterMentionsIntoEntities(
-        client,
-        useGeminiModel,
-        allMentions,
-        activeSchema,
-        fullTranscriptText,
-        userAiConfig?.annotation,
-        encounterTime,
-        runContext
-      );
-
       const finalParsedData = {
-        title: clusteredResult.title || "Annotated Clinical Consultation",
         rawTranscript: transcript || parsedSegments.map(s => `${s.speaker}: ${s.text}`).join("\n"),
-        transcriptSegments: parsedSegments || [],
-        ...normalizeEvidence({
-          mentionContextVersion: 1,
-          observationStatusVersion: 1,
-          entities: clusteredResult.entities,
-          relations: [],
-          clinicalNotes: clusteredResult.clinicalNotes,
-          mentions: allMentions
-        }, activeSchema)
+        transcriptSegments: parsedSegments,
+        mentions: allMentions
       };
 
       logAi({ ...runContext, stage: 'annotation' }, 'annotation_completed', { mentionCount: finalParsedData.mentions?.length });
@@ -1127,7 +1080,7 @@ async function startServer() {
     } catch (error: any) {
       runController.abort();
       logAi({ ...runContext, stage: 'annotation' }, 'annotation_failed', { reason: error.code || 'ANNOTATION_FAILED' });
-      console.error("Error in /api/annotate:", error);
+      console.error("Error in /api/extract-mentions:", error);
       if (res.destroyed) return;
       progress.stage = 'failed';
       progress.error = error.message || 'AI annotation failed.';
@@ -1138,6 +1091,60 @@ async function startServer() {
         code: error.code,
         error: `${error.message || 'An error occurred during medical transcription & annotation processing'} [request ${runContext.requestId}]`
       });
+    }
+  });
+
+  // Map already-extracted mentions. Never invoke extraction or mutate the saved input.
+  app.post('/api/map-entities', async (req, res) => {
+    const runController = new AbortController();
+    const runContext: AiRunContext = { requestId: randomUUID(), signal: runController.signal };
+    res.setHeader('X-Request-ID', runContext.requestId);
+    res.once('close', () => { if (!res.writableEnded) runController.abort(); });
+    let mentions: any[];
+    let segments: any[];
+    let activeSchema: any[];
+    let userAiConfig: any;
+    let encounterTime: TemporalValue | null;
+    try {
+      segments = req.body.transcriptSegments;
+      if (!Array.isArray(segments) || segments.some(s => !s || typeof s.text !== 'string' || typeof s.speaker !== 'string')) {
+        throw new Error('Valid transcript segments are required for entity mapping.');
+      }
+      validateExtractedMentions(req.body.mentions, segments);
+      mentions = structuredClone(req.body.mentions);
+      const schema = typeof req.body.annotationSchema === 'string' ? JSON.parse(req.body.annotationSchema) : req.body.annotationSchema;
+      if (schema != null && !Array.isArray(schema)) throw new Error('Invalid annotation schema.');
+      activeSchema = normalizeAnnotationSchema(schema?.length ? schema : DEFAULT_ANNOTATION_SCHEMA);
+      userAiConfig = typeof req.body.aiConfig === 'string' ? JSON.parse(req.body.aiConfig) : req.body.aiConfig;
+      encounterTime = typeof req.body.encounterTime === 'string' ? JSON.parse(req.body.encounterTime) : req.body.encounterTime ?? null;
+      validateEncounterTime(encounterTime);
+    } catch (error) { return res.status(400).json({ success: false, error: (error as Error).message }); }
+
+    const { progress, publishProgress, finish } = annotationResponse(req, res, runContext.requestId, 'mapping');
+    try {
+      const config = userAiConfig?.annotation;
+      const client = !mentions.length || config?.provider === 'openai' ? null
+        : config?.apiKey ? new GoogleGenAI({ apiKey: config.apiKey }) : getAiClient();
+      progress.stage = 'clustering';
+      publishProgress();
+      const transcript = segments.map((seg, idx) => `[Segment ${idx}] [${seg.speaker}]: ${seg.text}`).join('\n');
+      const clustered = await clusterMentionsIntoEntities(client, config?.model || 'gemini-3.1-flash-lite',
+        mentions, activeSchema, transcript, config, encounterTime, runContext);
+      const data = {
+        title: clustered.title,
+        ...normalizeEvidence({ mentionContextVersion: 1, observationStatusVersion: 1,
+          entities: clustered.entities, relations: [], clinicalNotes: clustered.clinicalNotes, mentions }, activeSchema)
+      };
+      progress.stage = 'complete';
+      logAi({ ...runContext, stage: 'entity-clustering' }, 'mapping_completed', { mentionCount: mentions.length });
+      finish(200, { success: true, data });
+    } catch (error: any) {
+      runController.abort();
+      logAi({ ...runContext, stage: 'entity-clustering' }, 'mapping_failed', { reason: error.code || 'MAPPING_FAILED' });
+      progress.stage = 'failed';
+      progress.error = error.message || 'Entity mapping failed.';
+      finish(error.status || 502, { success: false, code: error.code,
+        error: `${progress.error} [request ${runContext.requestId}]` });
     }
   });
 

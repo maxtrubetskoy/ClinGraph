@@ -105,16 +105,21 @@ test('AI regeneration checkpoints the curated annotation before replacing it', a
   } })).status()).toBe(201);
   const initial = await (await request.get('/api/conversations/' + id)).json();
   let sawCheckpointBeforeModelCall = false;
-  await page.route('**/api/annotate', async route => {
+  await page.route('**/api/extract-mentions', async route => {
     const history = await (await request.get('/api/conversations/' + id + '/checkpoints')).json();
     sawCheckpointBeforeModelCall = history.length === 1 && history[0].reason === 'before-ai';
-    await route.fulfill({ json: { success: true, data: {
+    await route.fulfill({ json: { success: true, progress: { operation: 'extraction', stage: 'complete', utterances: [] }, data: {
       title: 'Synthetic model output', entities: [], mentions: [], transcriptSegments: initial.transcriptSegments,
       clinicalNotes: { symptoms: [], medications: [], followUps: [] }
     } } });
   });
+  await page.route('**/api/map-entities', route => route.fulfill({ json: { success: true,
+    progress: { operation: 'mapping', stage: 'complete', utterances: [] },
+    data: { evidenceVersion: 2, entities: [], mentions: [], relations: [], clinicalNotes: { symptoms: [], medications: [], followUps: [] } }
+  } }));
   await page.goto('/?session=' + id);
-  await page.getByRole('button', { name: 'Generate AI Annotations', exact: true }).click();
+  await page.getByRole('button', { name: 'Extract mentions', exact: true }).click();
+  await page.getByRole('button', { name: 'Map entities', exact: true }).click();
   await expect.poll(async () => (await (await request.get('/api/conversations/' + id)).json()).annotation.entities.length).toBe(0);
   expect(sawCheckpointBeforeModelCall).toBe(true);
   const history = await (await request.get('/api/conversations/' + id + '/checkpoints')).json();

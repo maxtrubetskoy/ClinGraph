@@ -54,7 +54,7 @@ test('frontend concurrency persists and controls live progress while preserving 
       title: 'AI progress browser test', createdAt: '2026-01-02T00:00:00Z', status: 'draft',
       rawTranscript: segments.map(segment => JSON.stringify(segment)).join('\n'), transcriptSegments: segments
     } });
-    await page.route('**/api/annotate', async route => {
+    await page.route(/\/api\/(extract-mentions|map-entities)$/, async route => {
       const input = route.request().postDataJSON();
       const config = typeof input.aiConfig === 'string' ? JSON.parse(input.aiConfig) : input.aiConfig;
       sentConcurrency = config.annotation.concurrency;
@@ -86,7 +86,7 @@ test('frontend concurrency persists and controls live progress while preserving 
     await concurrency.fill('5');
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
     await expect(dialog).toHaveCount(0);
-    await page.getByRole('button', { name: 'Generate AI Annotations', exact: true }).click();
+    await page.getByRole('button', { name: 'Extract mentions', exact: true }).click();
     const panel = page.getByRole('region', { name: 'AI annotation progress' });
     await expect(panel.getByText('3 in progress', { exact: true })).toBeVisible();
     await expect(panel.getByText('3 pending', { exact: true })).toBeVisible();
@@ -108,12 +108,14 @@ test('frontend concurrency persists and controls live progress while preserving 
     await panel.screenshot({ path: 'test-results/annotation-progress-running.png' });
     releaseExtraction();
     await expect(panel.getByText('5 complete', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Mentions extracted with skipped utterances', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Map entities', exact: true }).click();
     await expect(panel.getByText('Organizing clinical entities…', { exact: true })).toBeVisible({ timeout: 15000 });
     await expect(panel.getByText('1 skipped due to an error', { exact: true })).toBeVisible();
     await expect(panel.getByText('AI annotation complete', { exact: true })).toHaveCount(0);
     await expect(panel.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '6');
     releaseClustering();
-    await expect(panel.getByText('AI annotation finished with skipped utterances', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Entity mapping complete', { exact: true })).toBeVisible();
     await expect.poll(async () => (await (await request.get('/api/conversations/' + id)).json()).status).toBe('annotated');
     expect(failedAttempts).toBe(3);
     await page.reload();
@@ -152,19 +154,19 @@ test('interrupted progress stops the spinner and preserves existing annotations'
       annotation: { entities: [{ id: 'curated', name: 'Curated headache', type: 'Symptom', categoryId: 'symptoms' }],
         relations: [], mentions: [], clinicalNotes: { symptoms: [], medications: [], followUps: [] } }
     } });
-    await page.route('**/api/annotate', route => route.fulfill({
+    await page.route('**/api/extract-mentions', route => route.fulfill({
       contentType: 'application/x-ndjson', body: JSON.stringify({ type: 'progress', progress: {
         stage: 'extracting', utterances: [{ lineIndex: 0, status: 'in_progress' }]
       } }) + '\n'
     }));
     await page.goto('/?session=' + id);
-    await page.getByRole('button', { name: 'Generate AI Annotations', exact: true }).click();
+    await page.getByRole('button', { name: 'Extract mentions', exact: true }).click();
     const panel = page.getByRole('region', { name: 'AI annotation progress' });
-    await expect(panel.getByText('AI annotation failed', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Mention extraction failed', { exact: true })).toBeVisible();
     await expect(panel.getByText('0 in progress', { exact: true })).toBeVisible();
     await expect(panel.getByText('1 not processed', { exact: true })).toBeVisible();
     await expect(panel.getByText(/Annotation connection interrupted/)).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Generate AI Annotations', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Extract mentions', exact: true })).toBeEnabled();
     const saved = await (await request.get('/api/conversations/' + id)).json();
     expect(saved.annotation.entities[0].id).toBe('curated');
     expect(saved.annotationProgress.stage).toBe('failed');

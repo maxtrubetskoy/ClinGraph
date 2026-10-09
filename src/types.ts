@@ -789,10 +789,17 @@ export interface AnnotationUtteranceProgress {
 
 export interface AnnotationProgress {
   requestId?: string;
+  operation?: 'extraction' | 'mapping';
   stage: 'preparing' | 'extracting' | 'clustering' | 'complete' | 'failed';
   /** Nonblank utterances only; blank text never triggers an extraction request. */
   utterances: AnnotationUtteranceProgress[];
   error?: string;
+}
+
+/** Raw extraction output, retained independently of the mapped annotation. */
+export interface MentionExtraction {
+  mentions: Mention[];
+  progress: AnnotationProgress;
 }
 
 export interface Conversation {
@@ -808,6 +815,9 @@ export interface Conversation {
   audioDataUrl?: string; // Backup small base64 data url if IndexedDB is not used
   annotation?: AnnotationData;
   annotationProgress?: AnnotationProgress | null;
+  mentionExtraction?: MentionExtraction | null;
+  /** Ownership token for an in-flight request; superseded results cannot be saved. */
+  annotationRunId?: string | null;
   /** Session-local schema on a restored copy; takes precedence over group settings. */
   schemaSnapshot?: AnnotationSchemaSnapshot | null;
   restoredFrom?: { conversationId: string; checkpointId: string; version: number; schemaVersion: string };
@@ -845,7 +855,7 @@ export interface AnnotationCheckpointSummary {
 export interface AnnotationCheckpoint extends AnnotationCheckpointSummary {
   snapshotFormatVersion: 1;
   schema: AnnotationSchemaSnapshot;
-  snapshot: Pick<Conversation, 'title' | 'rawTranscript' | 'transcriptSegments' | 'annotation' |
+  snapshot: Pick<Conversation, 'title' | 'rawTranscript' | 'transcriptSegments' | 'annotation' | 'mentionExtraction' |
     'encounterTime' | 'encounterType' | 'status' | 'createdAt' | 'groupId' | 'restoredFrom'>;
 }
 

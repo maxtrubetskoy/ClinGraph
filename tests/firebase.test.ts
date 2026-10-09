@@ -142,7 +142,7 @@ const read = async (route: string, user = alice) => {
 test('Firebase API requires a verified token for workspace, audio, settings, and model calls', { skip: !enabled }, async () => {
   const runtime = await (await fetch(base + '/api/runtime')).json();
   assert.equal(runtime.storage, 'firebase'); assert.equal(runtime.firebase.projectId, projectId);
-  for (const route of ['/workspace', '/settings', '/conversations/private/audio', '/annotate', '/relations', '/diarize', '/umls/search']) {
+  for (const route of ['/workspace', '/settings', '/conversations/private/audio', '/extract-mentions', '/map-entities', '/relations', '/diarize', '/umls/search']) {
     for (const token of ['', 'invalid-token']) {
       const response = await fetch(base + '/api' + route, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
       assert.equal(response.status, 401, route);
@@ -160,7 +160,10 @@ test('original document layout and current annotation metadata survive writes, c
   assert((await read('/workspace')).conversations.some((row: any) => row.id === id));
   assert.deepEqual((await read('/workspace', bob)).conversations, []);
   const progress = { stage: 'complete', utterances: [{ lineIndex: 0, status: 'complete' }] };
-  assert.equal((await call('/conversations/' + id, 'PATCH', { annotationProgress: progress })).status, 200);
+  const mentionExtraction = { progress, mentions: [{ id: 'm1', entityId: null, entityType: 'Symptom',
+    supportedAttribute: 'severity', textSpan: { lineIndex: 0, startChar: 0, endChar: 8, text: 'Headache' } }] };
+  assert.equal((await call('/conversations/' + id, 'PATCH', { annotationProgress: progress, mentionExtraction })).status, 200);
+  assert.deepEqual((await read('/conversations/' + id)).mentionExtraction, mentionExtraction);
   assert.equal((await read('/conversations/' + id)).hasAudio, true);
   assert.equal((await call('/conversations/' + id + '/audio')).headers.get('content-type'), 'audio/wav');
   assert.equal(await (await call('/conversations/' + id + '/audio')).text(), 'legacy audio');
@@ -170,6 +173,7 @@ test('original document layout and current annotation metadata survive writes, c
   assert.deepEqual(history.map(row => row.version).sort(), [1, 2]);
   const checkpoint = history[0];
   assert.deepEqual(checkpoint.snapshot.annotation, original.annotation);
+  assert.deepEqual(checkpoint.snapshot.mentionExtraction, mentionExtraction);
   assert(!('userId' in checkpoint.snapshot)); assert(!('annotationProgress' in checkpoint.snapshot));
   const invalid = structuredClone(original.annotation);
   invalid.mentions = [{ id: 'broken', target: { kind: 'attribute', entityId: 'e1', attributeId: 'missing' }, textSpan: { lineIndex: 0, startChar: 0, endChar: 8, text: 'Headache' } }];
@@ -177,11 +181,13 @@ test('original document layout and current annotation metadata survive writes, c
   assert.deepEqual((await read('/conversations/' + id)).annotation, original.annotation);
   assert.equal((await call('/conversations/' + id, 'PATCH', { rawTranscript: 'Patient: Changed.' })).status, 200);
   assert.equal((await read('/conversations/' + id)).annotationProgress, null);
+  assert.equal((await read('/conversations/' + id)).mentionExtraction, null);
   assert.deepEqual(await read(`/conversations/${id}/checkpoints/${checkpoint.id}`), checkpoint);
   const restoredResponse = await call(`/conversations/${id}/checkpoints/${checkpoint.id}/restore`, 'POST', {});
   assert.equal(restoredResponse.status, 201, await restoredResponse.clone().text());
   const restored = await restoredResponse.json();
   assert.notEqual(restored.id, id); assert.deepEqual(restored.annotation, checkpoint.snapshot.annotation);
+  assert.deepEqual(restored.mentionExtraction, mentionExtraction);
   assert.deepEqual(restored.schemaSnapshot, checkpoint.schema); assert.equal(restored.rawTranscript, fixture.rawTranscript);
   for (const [route, method, value] of [
     [`/conversations/${id}`, 'GET'], [`/conversations/${id}`, 'PATCH', { title: 'Take over', userId: bob.localId }],
