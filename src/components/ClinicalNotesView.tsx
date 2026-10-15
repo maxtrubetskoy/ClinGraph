@@ -10,7 +10,7 @@ import ProcedureReferenceEditor from './ProcedureReferenceEditor';
 import { temporalError } from '../utils/temporal';
 import type { TemporalValue } from '../utils/temporal';
 import React, { useState, useEffect, useRef } from 'react';
-import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName } from '../types';
+import { ClinicalCategory, Entity, ClinicalSymptom, ClinicalCondition, ClinicalMedication, ClinicalFollowUp, Relation, ClinicalMeasurement, Mention, AnnotationCategory, AnnotationAttribute, DEFAULT_ANNOTATION_SCHEMA, normalizeAnnotationSchema, getPrimaryAttribute, getItemDisplayName, type UmlsMapping } from '../types';
 import { Plus, Trash2, Edit2, Check, X, ShieldAlert, Pill, Activity, CalendarCheck, Link2, Beaker, Search, Settings, Tags, Layers, Syringe, Users, ClipboardCheck, FileCode, HeartHandshake } from 'lucide-react';
 import { getMentionAttributeName, sameEvidenceTarget, mentionLinksToEntity, isAttributeEvidence, retainMentionEntities } from '../utils/evidence';
 import ExportJsonlModal from './ExportJsonlModal';
@@ -1060,37 +1060,42 @@ export default function ClinicalNotesView({
     setActiveUmlsEditEntityId(null);
   };
 
+  const requestUmlsMapping = async (name: string, type: string): Promise<UmlsMapping> => {
+    const response = await apiFetch('/api/umls/map', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, type })
+    });
+
+    if (!response.ok) {
+      const errJson = await response.json().catch(() => ({}));
+      throw new Error(errJson.error || `Server error ${response.status}`);
+    }
+
+    const result = await response.json();
+    if (!result.success) {
+      throw new Error(result.error || 'UMLS mapping failed');
+    }
+
+    return result.data ? {
+      cui: result.data.cui,
+      preferredName: result.data.preferredName,
+      rxnorm: result.data.rxnorm,
+      snomed: result.data.snomed,
+      icd10: result.data.icd10,
+      loinc: result.data.loinc
+    } : {
+      cui: "",
+      preferredName: name,
+      error: "No matching concept found in UMLS"
+    };
+  };
+
   const handleMapEntity = async (entityId: string, name: string, type: string) => {
     setMappingStates(prev => ({ ...prev, [entityId]: 'loading' }));
 
     try {
-      const response = await apiFetch('/api/umls/map', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type })
-      });
-
-      if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.error || `Server error ${response.status}`);
-      }
-
-      const result = await response.json();
-      if (!result.success) {
-        throw new Error(result.error || 'UMLS mapping failed');
-      }
-
-      const umlsMapping = result.data ? {
-        cui: result.data.cui,
-        preferredName: result.data.preferredName,
-        rxnorm: result.data.rxnorm,
-        snomed: result.data.snomed,
-        icd10: result.data.icd10
-      } : {
-        cui: "",
-        preferredName: name,
-        error: "No matching concept found in UMLS"
-      };
+      const umlsMapping = await requestUmlsMapping(name, type);
 
       // Update the entities list
       const updatedEntities = entities.map(ent => {
@@ -1101,7 +1106,7 @@ export default function ClinicalNotesView({
       });
 
       onUpdateNotes(clinicalNotes, updatedEntities, relations);
-      setMappingStates(prev => ({ ...prev, [entityId]: 'success' }));
+      setMappingStates(prev => ({ ...prev, [entityId]: umlsMapping.error ? 'error' : 'success' }));
     } catch (err: any) {
       console.error(`Error mapping ${name}:`, err);
       setMappingStates(prev => ({ ...prev, [entityId]: 'error' }));
@@ -1125,12 +1130,14 @@ export default function ClinicalNotesView({
   };
 
   const handleMapAllEntities = async () => {
-    // Map Symptoms, Conditions, Medications, Measurements, Observations, and Social History
-    const mappableTypes = ['Symptom', 'Condition', 'Medication', 'Measurement', 'Observation', 'SocialHistory', 'SocialStatus'];
-    const targets = entities.filter(ent => mappableTypes.includes(ent.type) && !ent.umlsMapping?.cui);
+    // Match the clinical cards, including schema category IDs and legacy entity types.
+    const clinicalEntities = entities.filter(ent => getCategoryForEntity(ent, activeSchema) !== null);
+    const targets = clinicalEntities.filter(ent => !ent.umlsMapping?.cui);
 
     if (targets.length === 0) {
-      alert("All clinical entities are already mapped or no mappable entities were found!");
+      alert(clinicalEntities.length > 0
+        ? "All clinical entities are already mapped."
+        : "No clinical entities were found to map. Extract mentions and map entities, or add a clinical entity first.");
       return;
     }
 
@@ -1145,37 +1152,16 @@ export default function ClinicalNotesView({
       setMappingStates(prev => ({ ...prev, [ent.id]: 'loading' }));
 
       try {
-        const response = await apiFetch('/api/umls/map', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: ent.name, type: ent.type })
-        });
-
-        if (response.ok) {
-          const result = await response.json();
-          if (result.success && result.data) {
-            const umlsMapping = {
-              cui: result.data.cui,
-              preferredName: result.data.preferredName,
-              rxnorm: result.data.rxnorm,
-              snomed: result.data.snomed,
-              icd10: result.data.icd10
-            };
-            currentEntities = currentEntities.map(e => e.id === ent.id ? { ...e, umlsMapping } : e);
-            setMappingStates(prev => ({ ...prev, [ent.id]: 'success' }));
-          } else {
-            const umlsMapping = {
-              cui: "",
-              preferredName: ent.name,
-              error: "No matching concept found in UMLS"
-            };
-            currentEntities = currentEntities.map(e => e.id === ent.id ? { ...e, umlsMapping } : e);
-            setMappingStates(prev => ({ ...prev, [ent.id]: 'error' }));
-          }
-        } else {
-          setMappingStates(prev => ({ ...prev, [ent.id]: 'error' }));
-        }
+        const umlsMapping = await requestUmlsMapping(ent.name, ent.type);
+        currentEntities = currentEntities.map(e => e.id === ent.id ? { ...e, umlsMapping } : e);
+        setMappingStates(prev => ({ ...prev, [ent.id]: umlsMapping.error ? 'error' : 'success' }));
       } catch (err) {
+        const umlsMapping: UmlsMapping = {
+          cui: "",
+          preferredName: ent.name,
+          error: err instanceof Error ? err.message : "Failed to map to UMLS"
+        };
+        currentEntities = currentEntities.map(e => e.id === ent.id ? { ...e, umlsMapping } : e);
         setMappingStates(prev => ({ ...prev, [ent.id]: 'error' }));
       }
     }
